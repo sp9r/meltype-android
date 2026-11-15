@@ -20,7 +20,11 @@ data class ScoredSegment(
  * Segments mixed strings such as "kyouhagoogledekensaku" -> [JP(きょうは), EN(google), JP(でけんさく)]
  * while preserving full English sentences, model numbers (RTX4090), /commands, @mentions, and $vars.
  */
-class ScoreEngine(private val dictionaries: MeltypeDictionaries) {
+class ScoreEngine(
+    private val dictionaries: MeltypeDictionaries,
+    private val typoCorrectionEnabled: () -> Boolean = { true }
+) {
+    val typoEngine: RomajiTypoEngine = RomajiTypoEngine(dictionaries)
 
     fun segment(
         input: String,
@@ -120,7 +124,8 @@ class ScoreEngine(private val dictionaries: MeltypeDictionaries) {
                     end++
                 }
                 val alphaRun = input.substring(i, end)
-                out.addAll(segmentAlphaRun(alphaRun, i))
+                val followedByDelimiter = end < input.length && (input[end].isWhitespace() || input[end] in "。、.,!?！？")
+                out.addAll(segmentAlphaRun(alphaRun, i, endedByDelimiter = followedByDelimiter))
                 i = end
                 continue
             }
@@ -202,7 +207,7 @@ class ScoreEngine(private val dictionaries: MeltypeDictionaries) {
     /**
      * Viterbi dynamic programming segmentation of a contiguous ASCII letter run into JAPANESE and ENGLISH segments.
      */
-    private fun segmentAlphaRun(run: String, baseOffset: Int): List<ScoredSegment> {
+    private fun segmentAlphaRun(run: String, baseOffset: Int, endedByDelimiter: Boolean = false): List<ScoredSegment> {
         val n = run.length
         if (n == 0) return emptyList()
 
@@ -255,8 +260,12 @@ class ScoreEngine(private val dictionaries: MeltypeDictionaries) {
                 val sub = lowerRun.substring(i, j)
                 val isAtEnd = (j == n)
 
-                // Option A: JAPANESE segment
-                val jpEval = scoreJapaneseSpan(sub, allowPendingTail = isAtEnd, prevWasEnglish = (i > 0 && cur.kind == SegmentKind.ENGLISH))
+                // Option A: JAPANESE segment (keep clean intra-DP free of mid-syllable typo mutations)
+                val jpEval = scoreJapaneseSpan(
+                    sub = sub,
+                    allowPendingTail = isAtEnd && !endedByDelimiter,
+                    prevWasEnglish = (i > 0 && cur.kind == SegmentKind.ENGLISH)
+                )
                 if (jpEval != null) {
                     val mergeBonus = if (i > 0 && cur.kind == SegmentKind.JAPANESE) -2.0 else 0.0
                     val candidateScore = cur.score + jpEval.first + mergeBonus
@@ -304,21 +313,125 @@ class ScoreEngine(private val dictionaries: MeltypeDictionaries) {
             cursor = prev
         }
         reversed.reverse()
-        return reversed
+        return if (typoCorrectionEnabled()) {
+            rescueUnreadableJapaneseSlices(reversed, run, baseOffset, endedByDelimiter)
+        } else {
+            reversed
+        }
+    }
+
+    private fun isWeakEnglishFragment(
+        segments: List<ScoredSegment>,
+        idx: Int
+    ): Boolean {
+        val seg = segments[idx]
+        if (seg.kind != SegmentKind.ENGLISH) return false
+        if (seg.raw.any { it.isUpperCase() }) return false
+        val lower = seg.raw.lowercase()
+        if (!dictionaries.englishAllWords.contains(lower)) return true
+        if (lower.length <= 2) {
+            val nextSeg = segments.getOrNull(idx + 1)
+            val prevSeg = segments.getOrNull(idx - 1)
+            val nextTinyJp = nextSeg != null && nextSeg.kind == SegmentKind.JAPANESE && nextSeg.raw.length <= 2
+            val prevTinyJp = prevSeg != null && prevSeg.kind == SegmentKind.JAPANESE && prevSeg.raw.length <= 2
+            if (!dictionaries.englishFocusedWords.contains(lower) || nextTinyJp || prevTinyJp) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private fun rescueUnreadableJapaneseSlices(
+        segments: List<ScoredSegment>,
+        fullRun: String,
+        baseOffset: Int,
+        endedByDelimiter: Boolean
+    ): List<ScoredSegment> {
+        var hasWeak = false
+        for (idx in segments.indices) {
+            val s = segments[idx]
+            if (isWeakEnglishFragment(segments, idx) ||
+                (s.kind == SegmentKind.JAPANESE &&
+                    typoEngine.firstUnreadableOffset(
+                        s.raw.lowercase(),
+                        final = endedByDelimiter || idx < segments.lastIndex
+                    ) >= 0)
+            ) {
+                hasWeak = true
+                break
+            }
+        }
+        if (!hasWeak) return segments
+
+        val out = ArrayList<ScoredSegment>(segments.size)
+        var i = 0
+        while (i < segments.size) {
+            val s = segments[i]
+            val strongEnglish = (s.kind == SegmentKind.ENGLISH && !isWeakEnglishFragment(segments, i))
+            if (strongEnglish) {
+                out.add(s)
+                i++
+                continue
+            }
+            var j = i + 1
+            while (j < segments.size) {
+                val next = segments[j]
+                if (next.kind == SegmentKind.ENGLISH && !isWeakEnglishFragment(segments, j)) break
+                j++
+            }
+            val startOff = segments[i].startIndex - baseOffset
+            val endOff = segments[j - 1].endIndex - baseOffset
+            val sliceRaw = fullRun.substring(startOff, endOff)
+            val sliceLower = sliceRaw.lowercase()
+            val isFinal = endedByDelimiter || j < segments.size
+            val fix = typoEngine.fixUnreadable(sliceLower, final = isFinal)
+            if (fix != null) {
+                out.add(
+                    ScoredSegment(
+                        kind = SegmentKind.JAPANESE,
+                        raw = sliceRaw,
+                        startIndex = baseOffset + startOff,
+                        endIndex = baseOffset + endOff,
+                        hiragana = fix.kana
+                    )
+                )
+            } else {
+                for (k in i until j) out.add(segments[k])
+            }
+            i = j
+        }
+        return out
     }
 
     private fun scoreJapaneseSpan(
         sub: String,
         allowPendingTail: Boolean,
-        prevWasEnglish: Boolean
+        prevWasEnglish: Boolean,
+        allowTypoRecovery: Boolean = false,
+        allowFinalTypoTrim: Boolean = false
     ): Pair<Double, String>? {
-        val cRead = RomajiDetector.readCRow(sub)
-        val analysis = RomajiDetector.analyze(cRead, strictForDetection = true)
+        var effectiveSub = sub
+        var cRead = RomajiDetector.readCRow(sub)
+        var analysis = RomajiDetector.analyze(cRead, strictForDetection = true)
+        var typoPenalty = 0.0
+
+        if (!analysis.isStrictValid || (analysis.pendingTail.isNotEmpty() && !allowPendingTail)) {
+            if (allowTypoRecovery && sub.length >= 4 && !dictionaries.englishAllWords.contains(sub)) {
+                val fix = typoEngine.fixUnreadable(sub, final = allowFinalTypoTrim)
+                if (fix != null) {
+                    effectiveSub = fix.right
+                    cRead = RomajiDetector.readCRow(fix.right)
+                    analysis = RomajiDetector.analyze(cRead, strictForDetection = true)
+                    typoPenalty = if (fix.isSingleWholeWord) 0.25 else 1.4
+                }
+            }
+        }
+
         if (!analysis.isStrictValid) return null
         if (analysis.pendingTail.isNotEmpty() && !allowPendingTail) return null
 
         val hira = analysis.displayKanaOrTail
-        var score = sub.length * 1.15
+        var score = effectiveSub.length * 1.15 - typoPenalty
 
         // Strong Japanese features boost
         score += analysis.strongYouon * 3.2
@@ -326,38 +439,40 @@ class ScoreEngine(private val dictionaries: MeltypeDictionaries) {
         score += analysis.sokuonCount * 1.6
         score += analysis.longVowels * 1.4
 
-        if (dictionaries.japaneseWords.contains(sub) || dictionaries.japaneseWords.contains(cRead)) {
+        if (dictionaries.japaneseWords.contains(effectiveSub) || dictionaries.japaneseWords.contains(cRead)) {
             score += 4.5
         }
         val finalizedHira = analysis.finalizedHiragana()
         if (finalizedHira.length >= 2 && (dictionaries.readingsSet.contains(finalizedHira) || dictionaries.readingToPhrases.containsKey(finalizedHira))) {
             score += 3.8
+        } else if (typoPenalty > 0.0 && typoPenalty <= 0.3 && finalizedHira.length >= 2 && typoEngine.isKnownWord(finalizedHira)) {
+            score += 3.0
         }
 
         // Particle transitions at boundaries (e.g. "kyouha", "dekensaku", "wotsuika")
-        val leadingParticle = PARTICLES.firstOrNull { sub.startsWith(it) && sub.length > it.length }
+        val leadingParticle = PARTICLES.firstOrNull { effectiveSub.startsWith(it) && effectiveSub.length > it.length }
         if (leadingParticle != null) {
-            val restHira = RomajiDetector.analyze(sub.substring(leadingParticle.length)).finalizedHiragana()
-            if (dictionaries.readingsSet.contains(restHira) || dictionaries.japaneseWords.contains(sub.substring(leadingParticle.length))) {
+            val restHira = RomajiDetector.analyze(effectiveSub.substring(leadingParticle.length)).finalizedHiragana()
+            if (dictionaries.readingsSet.contains(restHira) || dictionaries.japaneseWords.contains(effectiveSub.substring(leadingParticle.length))) {
                 score += if (prevWasEnglish) 5.5 else 3.2
             } else if (prevWasEnglish) {
                 score += 2.2
             }
         }
-        val trailingParticle = PARTICLES.firstOrNull { sub.endsWith(it) && sub.length > it.length }
+        val trailingParticle = PARTICLES.firstOrNull { effectiveSub.endsWith(it) && effectiveSub.length > it.length }
         if (trailingParticle != null) {
-            val stemHira = RomajiDetector.analyze(sub.dropLast(trailingParticle.length)).finalizedHiragana()
-            if (dictionaries.readingsSet.contains(stemHira) || dictionaries.japaneseWords.contains(sub.dropLast(trailingParticle.length))) {
+            val stemHira = RomajiDetector.analyze(effectiveSub.dropLast(trailingParticle.length)).finalizedHiragana()
+            if (dictionaries.readingsSet.contains(stemHira) || dictionaries.japaneseWords.contains(effectiveSub.dropLast(trailingParticle.length))) {
                 score += 4.2
             }
         }
 
         // Penalize long random-looking romaji only if it's ALSO a real English word
-        if (sub.length >= 2 && dictionaries.englishAllWords.contains(sub) &&
-            !dictionaries.japaneseWords.contains(sub) &&
-            sub !in dictionaries.japaneseOriginEnglishWords
+        if (effectiveSub.length >= 2 && dictionaries.englishAllWords.contains(effectiveSub) &&
+            !dictionaries.japaneseWords.contains(effectiveSub) &&
+            effectiveSub !in dictionaries.japaneseOriginEnglishWords
         ) {
-            if (dictionaries.properNounCanonical.containsKey(sub) || dictionaries.englishFocusedWords.contains(sub)) {
+            if (dictionaries.properNounCanonical.containsKey(effectiveSub) || dictionaries.englishFocusedWords.contains(effectiveSub)) {
                 score -= 3.5
             }
         }
@@ -417,10 +532,19 @@ class ScoreEngine(private val dictionaries: MeltypeDictionaries) {
         }
 
         // Very short 2-3 char romaji-valid English words ("to", "ha", "no", "go", "de", "in", "at", "he", "me", "so", "do", "ma", "ai")
-        // should NOT split Japanese strings unless typed with uppercase or surrounded by spaces.
+        // should NOT split Japanese strings unless typed with uppercase or surrounded by particle/space boundaries.
         if (len <= 3 && analysisStrict.isStrictValid && !hasUppercase) {
+            val midRunWithoutParticles = prevIdx > 0 && nextPos < totalLen &&
+                !PARTICLES.any { fullRun.substring(0, prevIdx).endsWith(it) } &&
+                !PARTICLES.any { fullRun.substring(nextPos).startsWith(it) }
+            if (midRunWithoutParticles && !isProper) {
+                return -6.0
+            }
             if (isReadable || sub in SHORT_AMBIGUOUS_STOPWORDS || isProper) {
                 return -4.0
+            }
+            if (!isFocused && (prevIdx > 0 || nextPos < totalLen)) {
+                return -5.5
             }
             return 1.2
         }
@@ -435,7 +559,13 @@ class ScoreEngine(private val dictionaries: MeltypeDictionaries) {
             // Contains non-romaji sequence (th, l, v, x, ng, ck, ld, st, etc.) + in English dict => strong signal
             score += 7.0
         } else {
-            // Valid as both romaji and broad English dictionary (e.g. "time", "banana", "radio", "camera", "hero")
+            // Valid as both romaji and broad English dictionary (e.g. "time", "banana", "radio", "camera", "hero").
+            // Never let obscure broad-dictionary words (!isFocused && !isProper) chop a contiguous Japanese stem
+            // without a preceding particle (e.g. "shumire" -> "shu" + "mire").
+            val precededByParticle = prevIdx > 0 && PARTICLES.any { fullRun.substring(0, prevIdx).endsWith(it) }
+            if (!isFocused && !isProper && !hasUppercase && prevIdx > 0 && !precededByParticle) {
+                return -4.0
+            }
             score += if (isReadable) 1.5 else 3.2
             if (dictionaries.japaneseWords.contains(sub) ||
                 dictionaries.readingsSet.contains(RomajiDetector.analyze(sub).finalizedHiragana())

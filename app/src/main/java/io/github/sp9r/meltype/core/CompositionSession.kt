@@ -47,7 +47,8 @@ data class CompositionSnapshot(
 class CompositionSession(
     private val dictionaries: MeltypeDictionaries,
     private val scoreEngine: ScoreEngine,
-    private val converter: KanjiConverter
+    private val converter: KanjiConverter,
+    private val typoCorrectionEnabled: () -> Boolean = { true }
 ) {
     private val buffer = StringBuilder()
     private val overrides = LinkedHashMap<IntRange, SegmentKind>()
@@ -169,6 +170,19 @@ class CompositionSession(
         clearLastGlideHint()
         focusedClauseIdx = 0
         return recompute(null)
+    }
+
+    fun restoreFromUndo(rawInput: String, surroundingContext: String? = null): CompositionSnapshot {
+        buffer.setLength(0)
+        overrides.clear()
+        selectedClauseTextByKey.clear()
+        customClauseSplits.clear()
+        clearLastGlideHint()
+        focusedClauseIdx = 0
+        if (rawInput.isNotEmpty()) {
+            buffer.append(rawInput)
+        }
+        return recompute(surroundingContext)
     }
 
     fun toggleFocusedSegmentLanguage(surroundingContext: String? = null): CompositionSnapshot {
@@ -349,9 +363,11 @@ class CompositionSession(
                 }
 
                 SegmentKind.LITERAL -> {
-                    val cands = mutableListOf(seg.raw)
+                    val cands = mutableListOf<String>()
                     val calc = UtilityConverter.evaluateCalculator(seg.raw)
-                    if (calc != null) cands.add(0, calc)
+                    if (calc != null) cands.add(calc)
+                    cands.add(seg.raw)
+                    cands.addAll(UtilityConverter.numericCandidates(seg.raw))
                     val tempKey = "$segIdx:${seg.raw}:${seg.raw}"
                     val chosen = selectedClauseTextByKey[tempKey] ?: cands.first()
                     displayClauses.add(
@@ -367,22 +383,81 @@ class CompositionSession(
                 }
 
                 SegmentKind.JAPANESE -> {
-                    val analysis = RomajiDetector.analyze(seg.raw, strictForDetection = false)
+                    val typoEngine = scoreEngine.typoEngine
+                    val useTypoFix = typoCorrectionEnabled()
+                    val rawLower = seg.raw.lowercase()
+                    var effectiveRaw = seg.raw
+                    var rawTypoFallback: String? = null
+                    var unreadableFixApplied = false
+
+                    if (useTypoFix && seg.raw.all { it in 'a'..'z' || it in 'A'..'Z' }) {
+                        val hasUnreadable = typoEngine.firstUnreadableOffset(rawLower, final = false) >= 0
+                        if (hasUnreadable) {
+                            val fix = typoEngine.fixUnreadable(rawLower, final = false)
+                            if (fix != null) {
+                                effectiveRaw = fix.right
+                                rawTypoFallback = RomajiDetector.analyze(rawLower, strictForDetection = false).finalizedHiragana()
+                                unreadableFixApplied = true
+                            }
+                        }
+                    }
+
+                    val analysis = RomajiDetector.analyze(effectiveRaw, strictForDetection = false)
                     val hiraReady = analysis.hiragana
                     val pendingTail = analysis.pendingTail
-
                     val convertibleHira = if (pendingTail == "n") hiraReady + "ん" else hiraReady
-                    if (convertibleHira.isNotEmpty()) {
+
+                    var activeHira = convertibleHira
+                    val didyouMeanForWholeSeg = LinkedHashSet<String>()
+                    if (useTypoFix && !unreadableFixApplied && convertibleHira.isNotEmpty() &&
+                        effectiveRaw.all { it in 'a'..'z' || it in 'A'..'Z' } &&
+                        (pendingTail.isEmpty() || pendingTail == "n")
+                    ) {
+                        val readableFixes = typoEngine.suggestReadableTypos(
+                            rawLower,
+                            convertibleHira,
+                            allowFinalTailTrim = (segIdx < segments.lastIndex)
+                        )
+                        if (readableFixes.isNotEmpty()) {
+                            val top = readableFixes.first()
+                            val (rawSegCost, _) = typoEngine.segmentKana(convertibleHira, -1)
+                            val marginOk = readableFixes.size == 1 ||
+                                readableFixes[1].kana == top.kana ||
+                                readableFixes[1].cost - top.cost >= 0.22 ||
+                                (top.right.length == rawLower.length &&
+                                    readableFixes[1].right.length != rawLower.length &&
+                                    readableFixes[1].cost - top.cost >= 0.12)
+                            val rawNotCohesive = !typoEngine.isKnownReading(convertibleHira) || rawSegCost >= 1.95
+                            if (top.isSingleWholeWord &&
+                                rawLower.length >= 5 &&
+                                marginOk &&
+                                !typoEngine.isKnownWord(convertibleHira) &&
+                                !typoEngine.hasKnownReadingPrefix(convertibleHira) &&
+                                rawNotCohesive
+                            ) {
+                                rawTypoFallback = convertibleHira
+                                activeHira = top.kana
+                            }
+                            for (rf in readableFixes.take(2)) {
+                                converter.convertClauses(rf.kana, surroundingContext)?.joinToString("") { it.text }?.let {
+                                    didyouMeanForWholeSeg.add(it)
+                                }
+                                didyouMeanForWholeSeg.add(rf.kana)
+                            }
+                        }
+                    }
+
+                    if (activeHira.isNotEmpty()) {
                         val customLens = customClauseSplits[segIdx]
                         val clauses: List<ConversionClause> = if (
                             customLens != null &&
                             customLens.isNotEmpty() &&
                             customLens.all { it >= 1 } &&
-                            customLens.sum() == convertibleHira.length
+                            customLens.sum() == activeHira.length
                         ) {
                             var offset = 0
                             customLens.map { sliceLen ->
-                                val sliceReading = convertibleHira.substring(offset, offset + sliceLen)
+                                val sliceReading = activeHira.substring(offset, offset + sliceLen)
                                 offset += sliceLen
                                 val bestCand = converter.candidates(sliceReading).firstOrNull()
                                     ?: converter.convertClauses(sliceReading, surroundingContext)?.joinToString("") { it.text }
@@ -391,23 +466,40 @@ class CompositionSession(
                             }
                         } else {
                             if (customLens != null) customClauseSplits.remove(segIdx)
-                            converter.convertClauses(convertibleHira, surroundingContext)
-                                ?: listOf(ConversionClause(convertibleHira, convertibleHira))
+                            converter.convertClauses(activeHira, surroundingContext)
+                                ?: listOf(ConversionClause(activeHira, activeHira))
                         }
 
                         for ((cIdx, c) in clauses.withIndex()) {
                             val rawCands = converter.candidates(c.reading)
                             val utilCands = UtilityConverter.utilityCandidates(c.reading, seg.raw)
-                            val clauseRom = if (clauses.size == 1) seg.raw else (GlideDecoder.kanaToRomaji(c.reading) ?: seg.raw)
+                            val misspellingCands = if (useTypoFix) dictionaries.resolveMisspelling(c.reading) else emptyList()
+                            val clauseRom = if (clauses.size == 1) effectiveRaw else (GlideDecoder.kanaToRomaji(c.reading) ?: effectiveRaw)
                             val kata = RomajiDetector.toKatakana(c.reading)
                             val halfKata = toHalfWidthKatakana(kata)
-                            val allCands = (utilCands + rawCands + listOf(c.text, c.reading, kata, halfKata, clauseRom))
+                            val isExactMisspelling = misspellingCands.isNotEmpty() &&
+                                (c.text == RomajiDetector.toKatakana(c.reading) || c.text == c.reading) &&
+                                dictionaries.misspellingExact.containsKey(RomajiDetector.toKatakana(c.reading))
+                            val preferredText = if (isExactMisspelling) misspellingCands.first() else c.text
+                            val typoList = if (cIdx == 0) didyouMeanForWholeSeg.toList() else emptyList()
+                            val rawFbList = if (cIdx == 0 && rawTypoFallback != null) listOf(rawTypoFallback) else emptyList()
+
+                            val allCands = (
+                                (if (isExactMisspelling) misspellingCands else emptyList()) +
+                                    utilCands +
+                                    rawCands +
+                                    misspellingCands +
+                                    typoList +
+                                    listOf(preferredText, c.text, c.reading, kata, halfKata) +
+                                    rawFbList +
+                                    listOf(clauseRom)
+                                )
                                 .filter { it.isNotEmpty() }
                                 .distinct()
                             val tempKey = "$segIdx:${seg.raw}:${c.reading}"
                             val isLastSubClause = (cIdx == clauses.lastIndex)
                             val tailSuffix = if (isLastSubClause && pendingTail != "n") pendingTail else ""
-                            val chosen = (selectedClauseTextByKey[tempKey] ?: c.text) + tailSuffix
+                            val chosen = (selectedClauseTextByKey[tempKey] ?: preferredText) + tailSuffix
                             displayClauses.add(
                                 DisplayClause(
                                     segmentIndex = segIdx,
@@ -444,12 +536,15 @@ class CompositionSession(
         val focused = displayClauses.getOrNull(focusedClauseIdx)
         val barCandidates = ArrayList<CandidateItem>()
         if (focused != null) {
+            val focusedMisspellings = if (!focused.isEnglish) dictionaries.resolveMisspelling(focused.reading).toSet() else emptySet()
             for (cand in focused.candidates.take(36)) {
                 val isEmoji = dictionaries.emojiCandidates[focused.reading]?.contains(cand) == true
+                val isMisspellFix = cand in focusedMisspellings
                 barCandidates.add(
                     CandidateItem(
                         text = cand,
                         subtitle = when {
+                            isMisspellFix -> "もしかして"
                             isEmoji -> "絵文字"
                             focused.isEnglish && dictionaries.properNounCanonical.containsValue(cand) -> "固有名"
                             else -> ""
@@ -458,6 +553,29 @@ class CompositionSession(
                         targetClauseIndex = focusedClauseIdx
                     )
                 )
+            }
+            // Also surface prefix-matched emoji suggestions when typing 2+ kana
+            if (!focused.isEnglish && focused.reading.length >= 2) {
+                var addedPrefixEmoji = 0
+                for ((rKey, eList) in dictionaries.emojiCandidates) {
+                    if (rKey != focused.reading && rKey.startsWith(focused.reading) && rKey.length <= focused.reading.length + 3) {
+                        for (e in eList.take(2)) {
+                            if (barCandidates.none { it.text == e }) {
+                                barCandidates.add(
+                                    CandidateItem(
+                                        text = e,
+                                        subtitle = "絵文字($rKey)",
+                                        kind = CandidateKind.EMOJI,
+                                        targetClauseIndex = focusedClauseIdx
+                                    )
+                                )
+                                addedPrefixEmoji++
+                                if (addedPrefixEmoji >= 4) break
+                            }
+                        }
+                    }
+                    if (addedPrefixEmoji >= 4) break
+                }
             }
         }
 

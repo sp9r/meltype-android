@@ -96,6 +96,46 @@ class MeltypeSettings(context: Context) {
         get() = prefs.getBoolean(KEY_LEARNING, true)
         set(value) = prefs.edit().putBoolean(KEY_LEARNING, value).apply()
 
+    var typoCorrectionEnabled: Boolean
+        get() = prefs.getBoolean(KEY_TYPO_CORRECTION, true)
+        set(value) = prefs.edit().putBoolean(KEY_TYPO_CORRECTION, value).apply()
+
+    fun getRecentEmojis(): List<String> = readStringList(KEY_RECENT_EMOJIS)
+
+    fun addRecentEmoji(emoji: String) {
+        val clean = emoji.trim()
+        if (clean.isEmpty()) return
+        val next = (listOf(clean) + getRecentEmojis().filterNot { it == clean }).take(24)
+        saveStringList(KEY_RECENT_EMOJIS, next)
+    }
+
+    fun getClipboardHistory(): List<String> = readStringList(KEY_CLIPBOARD_HISTORY)
+
+    fun addClipboardItem(text: String) {
+        if (text.isBlank() || text.length > 500) return
+        val next = (listOf(text) + getClipboardHistory().filterNot { it == text }).take(12)
+        saveStringList(KEY_CLIPBOARD_HISTORY, next)
+    }
+
+    private fun readStringList(key: String): List<String> {
+        val raw = prefs.getString(key, null) ?: return emptyList()
+        return runCatching {
+            val arr = JSONArray(raw)
+            buildList {
+                for (i in 0 until arr.length()) {
+                    val v = arr.optString(i)
+                    if (v.isNotEmpty()) add(v)
+                }
+            }
+        }.getOrDefault(emptyList())
+    }
+
+    private fun saveStringList(key: String, items: List<String>) {
+        val arr = JSONArray()
+        for (item in items) arr.put(item)
+        prefs.edit().putString(key, arr.toString()).apply()
+    }
+
     fun getUserDictionary(): List<UserDictEntry> {
         val raw = prefs.getString(KEY_USER_DICT, null) ?: return emptyList()
         return runCatching {
@@ -153,6 +193,9 @@ class MeltypeSettings(context: Context) {
         private const val KEY_HAPTIC = "haptic_feedback"
         private const val KEY_SUB_LABELS = "show_sub_labels"
         private const val KEY_LEARNING = "learning_enabled"
+        private const val KEY_TYPO_CORRECTION = "typo_correction_enabled"
+        private const val KEY_RECENT_EMOJIS = "recent_emojis"
+        private const val KEY_CLIPBOARD_HISTORY = "clipboard_history"
         private const val KEY_USER_DICT = "user_dictionary"
     }
 }

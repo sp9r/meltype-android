@@ -196,6 +196,165 @@ object KeyLayoutGeometry {
         return resamplePolyline(rawPts, n)
     }
 
+    /**
+     * Generates a biomechanically smoothed template that models human corner-rounding
+     * and interior reversal undershoot while keeping endpoints anchored.
+     */
+    fun smoothedTemplateForWord(word: String, n: Int = RESAMPLE_N): Pair<FloatArray, Float> {
+        val rawPts = ArrayList<TouchPoint>(word.length)
+        for (c in word) {
+            val kc = centerOf(c) ?: continue
+            rawPts.add(TouchPoint(kc.x, kc.y))
+        }
+        if (rawPts.size <= 2) {
+            return resamplePolyline(rawPts, n)
+        }
+        val smoothed = ArrayList<TouchPoint>(rawPts.size)
+        smoothed.add(rawPts[0])
+        for (i in 1 until rawPts.lastIndex) {
+            val prev = rawPts[i - 1]
+            val cur = rawPts[i]
+            val next = rawPts[i + 1]
+            val v1x = cur.x - prev.x
+            val v1y = cur.y - prev.y
+            val v2x = next.x - cur.x
+            val v2y = next.y - cur.y
+            val l1 = kotlin.math.hypot(v1x, v1y)
+            val l2 = kotlin.math.hypot(v2x, v2y)
+            val cosTheta = if (l1 > 1e-5f && l2 > 1e-5f) {
+                ((v1x * v2x + v1y * v2y) / (l1 * l2)).coerceIn(-1f, 1f)
+            } else {
+                1f
+            }
+            val alpha = 0.21f - 0.11f * cosTheta
+            val midX = (prev.x + next.x) * 0.5f
+            val midY = (prev.y + next.y) * 0.5f
+            smoothed.add(
+                TouchPoint(
+                    cur.x + (midX - cur.x) * alpha,
+                    cur.y + (midY - cur.y) * alpha
+                )
+            )
+        }
+        smoothed.add(rawPts[rawPts.lastIndex])
+        return resamplePolyline(smoothed, n)
+    }
+
+    /**
+     * Returns cumulative normalized Euclidean arc fraction [0f..1f] for each key in [word].
+     */
+    fun keyArcFractionsForWord(word: String): FloatArray {
+        val rawPts = ArrayList<TouchPoint>(word.length)
+        for (c in word) {
+            val kc = centerOf(c) ?: continue
+            rawPts.add(TouchPoint(kc.x, kc.y))
+        }
+        val m = rawPts.size
+        if (m == 0) return FloatArray(0)
+        if (m == 1) return floatArrayOf(0f)
+        val cum = FloatArray(m)
+        var total = 0f
+        for (i in 1 until m) {
+            val d = kotlin.math.hypot(rawPts[i].x - rawPts[i - 1].x, rawPts[i].y - rawPts[i - 1].y)
+            total += d
+            cum[i] = total
+        }
+        if (total < 1e-5f) {
+            return FloatArray(m) { idx -> idx.toFloat() / (m - 1).toFloat() }
+        }
+        for (i in 0 until m) {
+            cum[i] /= total
+        }
+        return cum
+    }
+
+    /**
+     * Flags interior keys that lie nearly straight along the segment between adjacent keys.
+     */
+    fun collinearFlagsForWord(word: String): BooleanArray {
+        val rawPts = ArrayList<TouchPoint>(word.length)
+        for (c in word) {
+            val kc = centerOf(c) ?: continue
+            rawPts.add(TouchPoint(kc.x, kc.y))
+        }
+        val m = rawPts.size
+        val flags = BooleanArray(m)
+        if (m < 3) return flags
+        for (i in 1 until m - 1) {
+            val prev = rawPts[i - 1]
+            val cur = rawPts[i]
+            val next = rawPts[i + 1]
+            val v1x = cur.x - prev.x
+            val v1y = cur.y - prev.y
+            val v2x = next.x - cur.x
+            val v2y = next.y - cur.y
+            val l1 = kotlin.math.hypot(v1x, v1y)
+            val l2 = kotlin.math.hypot(v2x, v2y)
+            if (l1 < 1e-4f || l2 < 1e-4f) continue
+            val cosTheta = (v1x * v2x + v1y * v2y) / (l1 * l2)
+            if (cosTheta < 0.88f) continue
+            val segDx = next.x - prev.x
+            val segDy = next.y - prev.y
+            val segLen = kotlin.math.hypot(segDx, segDy)
+            if (segLen < 1e-4f) continue
+            val perp = kotlin.math.abs(segDx * (cur.y - prev.y) - segDy * (cur.x - prev.x)) / segLen
+            if (perp <= 0.14f) {
+                flags[i] = true
+            }
+        }
+        return flags
+    }
+
+    /**
+     * Centroid-and-scale normalized polyline (SHARK2 Shape Channel) from resampled [2*n] coords.
+     */
+    fun normalizeShape(resampledPath: FloatArray, n: Int = RESAMPLE_N): FloatArray {
+        if (resampledPath.size < 2 * n || n <= 0) return FloatArray(0)
+        var cx = 0f
+        var cy = 0f
+        var minX = Float.POSITIVE_INFINITY
+        var maxX = Float.NEGATIVE_INFINITY
+        var minY = Float.POSITIVE_INFINITY
+        var maxY = Float.NEGATIVE_INFINITY
+        for (i in 0 until n) {
+            val x = resampledPath[i * 2]
+            val y = resampledPath[i * 2 + 1]
+            cx += x
+            cy += y
+            if (x < minX) minX = x
+            if (x > maxX) maxX = x
+            if (y < minY) minY = y
+            if (y > maxY) maxY = y
+        }
+        cx /= n.toFloat()
+        cy /= n.toFloat()
+        val scale = kotlin.math.max(kotlin.math.max(maxX - minX, maxY - minY), 0.22f)
+        val out = FloatArray(2 * n)
+        for (i in 0 until n) {
+            out[i * 2] = (resampledPath[i * 2] - cx) / scale
+            out[i * 2 + 1] = (resampledPath[i * 2 + 1] - cy) / scale
+        }
+        return out
+    }
+
+    /**
+     * Normalized step direction vectors (length 2*(n-1)) for translation/scale-invariant matching.
+     */
+    fun directionVectors(resampledPath: FloatArray, n: Int = RESAMPLE_N): FloatArray {
+        if (resampledPath.size < 2 * n || n <= 1) return FloatArray(0)
+        val dirs = FloatArray(2 * (n - 1))
+        for (i in 0 until n - 1) {
+            val dx = resampledPath[(i + 1) * 2] - resampledPath[i * 2]
+            val dy = resampledPath[(i + 1) * 2 + 1] - resampledPath[i * 2 + 1]
+            val len = kotlin.math.hypot(dx, dy)
+            if (len > 1e-5f) {
+                dirs[i * 2] = dx / len
+                dirs[i * 2 + 1] = dy / len
+            }
+        }
+        return dirs
+    }
+
     fun collapseConsecutiveLetters(word: String): String {
         if (word.length <= 1) return word
         val sb = StringBuilder(word.length)

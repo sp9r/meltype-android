@@ -34,17 +34,40 @@ class GlideDecoder(private val dictionaries: MeltypeDictionaries) {
         val kanaHint: String?,
         val template: FloatArray,
         val arcLen: Float,
+        val smoothedTemplate: FloatArray,
+        val smoothedArcLen: Float,
         val collapsedTrace: String,
         val collapsedTemplate: FloatArray?,
-        val collapsedArcLen: Float
+        val collapsedArcLen: Float,
+        val arcFractions: FloatArray,
+        val collapsedArcFractions: FloatArray,
+        val collinearMask: Int,
+        val collapsedCollinearMask: Int
+    )
+
+    private data class SuffixEntry(
+        val romaji: String,
+        val kana: String,
+        val template: FloatArray,
+        val arcLen: Float
     )
 
     // 26 x 26 bucket index keyed by (firstChar - 'a') * 26 + (lastChar - 'a')
     private val buckets = Array<MutableList<LexiconEntry>>(26 * 26) { ArrayList() }
+    private val compoundSuffixes = ArrayList<SuffixEntry>(16)
 
     init {
-        val seen = HashMap<String, LexiconEntry>(48000)
-        val japaneseTraceSet = HashSet<String>(36000)
+        val seen = HashMap<String, LexiconEntry>(56000)
+        val japaneseTraceSet = HashSet<String>(40000)
+
+        fun flagsToMask(flags: BooleanArray): Int {
+            var mask = 0
+            val limit = min(flags.size, 30)
+            for (i in 0 until limit) {
+                if (flags[i]) mask = mask or (1 shl i)
+            }
+            return mask
+        }
 
         fun registerTemplate(
             rawTrace: String,
@@ -87,6 +110,16 @@ class GlideDecoder(private val dictionaries: MeltypeDictionaries) {
             } else {
                 null to 0f
             }
+            val smoothBase = if (collapsed != trace && collapsed.length >= 2) collapsed else trace
+            val (sTpl, sArc) = KeyLayoutGeometry.smoothedTemplateForWord(smoothBase)
+            val arcFracs = KeyLayoutGeometry.keyArcFractionsForWord(trace)
+            val colMask = flagsToMask(KeyLayoutGeometry.collinearFlagsForWord(trace))
+            val (cArcFracs, cColMask) = if (collapsed != trace && collapsed.length >= 2) {
+                KeyLayoutGeometry.keyArcFractionsForWord(collapsed) to
+                    flagsToMask(KeyLayoutGeometry.collinearFlagsForWord(collapsed))
+            } else {
+                arcFracs to colMask
+            }
 
             val entry = LexiconEntry(
                 traceWord = trace,
@@ -97,9 +130,15 @@ class GlideDecoder(private val dictionaries: MeltypeDictionaries) {
                 kanaHint = kanaHint,
                 template = tpl,
                 arcLen = arc,
+                smoothedTemplate = sTpl,
+                smoothedArcLen = sArc,
                 collapsedTrace = collapsed,
                 collapsedTemplate = cTpl,
-                collapsedArcLen = cArc
+                collapsedArcLen = cArc,
+                arcFractions = arcFracs,
+                collapsedArcFractions = cArcFracs,
+                collinearMask = colMask,
+                collapsedCollinearMask = cColMask
             )
             seen[dedupKey] = entry
             val idx = (trace.first() - 'a') * 26 + (trace.last() - 'a')
@@ -111,42 +150,73 @@ class GlideDecoder(private val dictionaries: MeltypeDictionaries) {
             if (canonical.length !in 2..18) return
             registerTemplate(canonical, canonical, isEnglish = false, freqBonus = freqBonus, kanaHint = hira)
 
+            // Human single-n trace alias when canonical uses double-n before vowel/y/n ("konnichiwa" -> "konichiwa")
+            if (canonical.contains("nn")) {
+                val singleN = canonical.replace("nn", "n")
+                if (singleN.length >= 2) {
+                    registerTemplate(singleN, canonical, isEnglish = false, freqBonus = freqBonus - 0.01f, kanaHint = hira)
+                }
+            }
+
             // Kunrei-shiki swipe trace (si, ti, tu, hu, zi, sya, tya, zya) mapped to canonical Hepburn output
             val kunrei = kanaToRomaji(hira, kunrei = true)
             if (kunrei != null && kunrei != canonical && kunrei.length in 2..18) {
                 registerTemplate(kunrei, canonical, isEnglish = false, freqBonus = freqBonus - 0.01f, kanaHint = hira)
             }
 
-            // Long vowel shorthand (arigato -> arigatou, tokyo -> toukyou, futsu -> futsuu)
-            if (canonical.contains("ou") || canonical.contains("uu")) {
-                val shortVowel = canonical.replace("ou", "o").replace("uu", "u")
+            // Long vowel shorthand (arigato -> arigatou, tokyo -> toukyou, futsu -> futsuu, toru -> tooru)
+            if (canonical.contains("ou") || canonical.contains("uu") || canonical.contains("oo")) {
+                val shortVowel = canonical.replace("ou", "o").replace("uu", "u").replace("oo", "o")
                 if (shortVowel != canonical && shortVowel.length >= 2) {
                     registerTemplate(shortVowel, canonical, isEnglish = false, freqBonus = freqBonus - 0.025f, kanaHint = hira)
                 }
             }
-            if (kunrei != null && kunrei != canonical && (kunrei.contains("ou") || kunrei.contains("uu"))) {
-                val shortKunrei = kunrei.replace("ou", "o").replace("uu", "u")
+            if (kunrei != null && kunrei != canonical && (kunrei.contains("ou") || kunrei.contains("uu") || kunrei.contains("oo"))) {
+                val shortKunrei = kunrei.replace("ou", "o").replace("uu", "u").replace("oo", "o")
                 if (shortKunrei != kunrei && shortKunrei.length >= 2) {
                     registerTemplate(shortKunrei, canonical, isEnglish = false, freqBonus = freqBonus - 0.03f, kanaHint = hira)
+                }
+            }
+
+            // Spoken particle & phonetic aliases on high-value entries (wa->ha, o->wo, ei->e, m->n)
+            if (freqBonus >= 0.36f) {
+                if (hira.length >= 3 && hira.endsWith("は") && canonical.endsWith("ha") && canonical.length >= 4) {
+                    val waAlias = canonical.dropLast(2) + "wa"
+                    registerTemplate(waAlias, canonical, isEnglish = false, freqBonus = freqBonus - 0.015f, kanaHint = hira)
+                }
+                if (canonical.startsWith("wo") && hira.startsWith("を") && canonical.length >= 4) {
+                    registerTemplate("o" + canonical.drop(2), canonical, isEnglish = false, freqBonus = freqBonus - 0.02f, kanaHint = hira)
+                }
+                if (canonical.endsWith("wo") && hira.endsWith("を") && canonical.length >= 4) {
+                    registerTemplate(canonical.dropLast(2) + "o", canonical, isEnglish = false, freqBonus = freqBonus - 0.02f, kanaHint = hira)
+                }
+                if (canonical.length >= 5 && canonical.contains("ei")) {
+                    val eAlias = canonical.replace("ei", "e")
+                    if (eAlias.length >= 4) {
+                        registerTemplate(eAlias, canonical, isEnglish = false, freqBonus = freqBonus - 0.045f, kanaHint = hira)
+                    }
+                }
+                if (canonical.contains("nb") || canonical.contains("np") || canonical.contains("nm")) {
+                    val mAlias = canonical.replace("nb", "mb").replace("np", "mp").replace("nm", "mm")
+                    registerTemplate(mAlias, canonical, isEnglish = false, freqBonus = freqBonus - 0.025f, kanaHint = hira)
                 }
             }
         }
 
         // Tier 1: Core everyday Japanese romaji & particles
         for ((rom, hiraHint) in CORE_JAPANESE_PAIRS) {
-            registerJapaneseHira(hiraHint, freqBonus = 0.28f, explicitRomaji = rom)
+            registerJapaneseHira(hiraHint, freqBonus = 0.56f, explicitRomaji = rom)
             if (!rom.endsWith("ha") && !rom.endsWith("wo")) {
-                // Keep explicit kunrei/vowel variants generated cleanly from hiraHint when consistent
-                registerJapaneseHira(hiraHint, freqBonus = 0.27f)
+                registerJapaneseHira(hiraHint, freqBonus = 0.54f)
             }
         }
         for (jp in dictionaries.japaneseCanonicalWords) {
             val hira = RomajiDetector.analyze(jp).finalizedHiragana()
-            registerJapaneseHira(hira, freqBonus = 0.24f, explicitRomaji = jp)
+            registerJapaneseHira(hira, freqBonus = 0.52f, explicitRomaji = jp)
             for (p in TOP_PARTICLES) {
                 if (jp.length + p.length <= 15) {
                     val pKana = RomajiDetector.analyze(p).finalizedHiragana()
-                    registerJapaneseHira(hira + pKana, freqBonus = 0.17f, explicitRomaji = jp + p)
+                    registerJapaneseHira(hira + pKana, freqBonus = 0.38f, explicitRomaji = jp + p)
                 }
             }
         }
@@ -154,19 +224,19 @@ class GlideDecoder(private val dictionaries: MeltypeDictionaries) {
             val stemHira = RomajiDetector.analyze(stem).finalizedHiragana()
             for (p in TOP_PARTICLES) {
                 val pHira = RomajiDetector.analyze(p).finalizedHiragana()
-                registerJapaneseHira(stemHira + pHira, freqBonus = 0.24f, explicitRomaji = stem + p)
+                registerJapaneseHira(stemHira + pHira, freqBonus = 0.48f, explicitRomaji = stem + p)
             }
         }
 
-        // Tier 1.5: Expand phrases, curated candidates, and JMdict readings + inflections
+        // Tier 2: Phrases, curated candidates, JMdict inflections (medium positive priors)
         for (hira in dictionaries.readingToPhrases.keys) {
             if (hira.length in 2..12) {
-                registerJapaneseHira(hira, freqBonus = 0.19f)
+                registerJapaneseHira(hira, freqBonus = 0.40f)
             }
         }
         for (hira in dictionaries.extraCandidates.keys) {
             if (hira.length in 2..10) {
-                registerJapaneseHira(hira, freqBonus = 0.17f)
+                registerJapaneseHira(hira, freqBonus = 0.24f)
             }
         }
         for ((baseHira, tags) in dictionaries.readingWithTags) {
@@ -174,42 +244,48 @@ class GlideDecoder(private val dictionaries: MeltypeDictionaries) {
             for (tag in tags) {
                 for (inflected in expandInflections(baseHira, tag)) {
                     if (inflected.length in 2..11) {
-                        registerJapaneseHira(inflected, freqBonus = 0.14f)
+                        registerJapaneseHira(inflected, freqBonus = 0.20f)
                     }
                 }
             }
         }
+        // Tier 4: Untagged JMdict readings (negative prior so obscure readings do not hijack curved traces)
         for (hira in dictionaries.readingsSet) {
             if (hira.length in 2..9) {
-                registerJapaneseHira(hira, freqBonus = 0.12f)
+                registerJapaneseHira(hira, freqBonus = -0.06f)
             }
         }
 
-        // Tier 1 English: Core everyday English, proper nouns, curated English list
+        // Tier 1-3 English
         for (w in CORE_ENGLISH_WORDS) {
-            registerTemplate(w, w, isEnglish = true, freqBonus = 0.26f)
+            registerTemplate(w, w, isEnglish = true, freqBonus = 0.34f)
         }
         for (w in dictionaries.properNounCanonical.keys) {
-            registerTemplate(w, w, isEnglish = true, freqBonus = 0.24f)
+            registerTemplate(w, w, isEnglish = true, freqBonus = 0.30f)
         }
         for (w in dictionaries.commonLatinWordsForGlide) {
             val isJpOrigin = w in dictionaries.japaneseOriginEnglishWords
-            registerTemplate(w, w, isEnglish = !isJpOrigin, freqBonus = if (isJpOrigin) 0.10f else 0.18f)
+            registerTemplate(w, w, isEnglish = !isJpOrigin, freqBonus = if (isJpOrigin) 0.14f else 0.24f)
         }
         for (w in dictionaries.englishReadableWords.allWords()) {
-            registerTemplate(w, w, isEnglish = true, freqBonus = 0.10f)
+            registerTemplate(w, w, isEnglish = true, freqBonus = 0.12f)
         }
 
-        // Tier 3 English (39k SCOWL): only allow medium-long words (>= 5 chars) that do NOT look like
+        // Tier 5 English (39k SCOWL): only allow medium-long words (>= 5 chars) that do NOT look like
         // valid Japanese romaji, with negative prior so rare English words never hijack Japanese glides.
         for (w in dictionaries.englishAllWords.allWords()) {
             if (w.length in 5..14 && w !in japaneseTraceSet && !dictionaries.japaneseWords.contains(w)) {
                 val rom = RomajiDetector.analyze(w, strictForDetection = true)
                 val looksLikeJp = rom.isStrictValid && rom.pendingTail.isEmpty() && rom.chunks.size >= 2
                 if (!looksLikeJp) {
-                    registerTemplate(w, w, isEnglish = true, freqBonus = -0.22f)
+                    registerTemplate(w, w, isEnglish = true, freqBonus = -0.35f)
                 }
             }
+        }
+
+        for ((sRom, sKana) in COMPOUND_SUFFIX_PAIRS) {
+            val (tpl, arc) = KeyLayoutGeometry.smoothedTemplateForWord(sRom)
+            compoundSuffixes.add(SuffixEntry(sRom, sKana, tpl, arc))
         }
     }
 
@@ -226,103 +302,149 @@ class GlideDecoder(private val dictionaries: MeltypeDictionaries) {
         maxResults: Int = 8,
         preferJapanese: Boolean = true
     ): List<GlideCandidate> {
+        return decodeInternal(normalizedPoints, maxResults, preferJapanese, allowCompoundSplit = true)
+    }
+
+    private fun decodeInternal(
+        normalizedPoints: List<TouchPoint>,
+        maxResults: Int,
+        preferJapanese: Boolean,
+        allowCompoundSplit: Boolean
+    ): List<GlideCandidate> {
         if (normalizedPoints.size < 2) return emptyList()
 
         val (path, pathLen) = KeyLayoutGeometry.resamplePolyline(normalizedPoints)
         if (pathLen < 0.08f) return emptyList()
+
+        val n = KeyLayoutGeometry.RESAMPLE_N
+        val nFloat = n.toFloat()
+        val pathShape = KeyLayoutGeometry.normalizeShape(path, n)
+        val pathDirs = KeyLayoutGeometry.directionVectors(path, n)
 
         val startX = normalizedPoints.first().x
         val startY = normalizedPoints.first().y
         val endX = normalizedPoints.last().x
         val endY = normalizedPoints.last().y
 
-        val startKeys = KeyLayoutGeometry.nearestKeys(startX, startY, limit = 3)
-        val endKeys = KeyLayoutGeometry.nearestKeys(endX, endY, limit = 3)
+        val startKeys = KeyLayoutGeometry.nearestKeys(startX, startY, limit = 10)
+        val endKeys = KeyLayoutGeometry.nearestKeys(endX, endY, limit = 10)
 
-        val stage1 = ArrayList<Stage1Hit>(48)
-        val n = KeyLayoutGeometry.RESAMPLE_N
-        val nFloat = n.toFloat()
+        val stage1 = ArrayList<Stage1Hit>(80)
 
         for ((sChar, sDist) in startKeys) {
-            if (sDist > 0.68f && startKeys.first().first != sChar) continue
+            if (sDist > 0.78f && startKeys.first().first != sChar) continue
+            val effSDist = max(0f, sDist - 0.13f)
             val sIdx = (sChar - 'a') * 26
             for ((eChar, eDist) in endKeys) {
-                if (eDist > 0.68f && endKeys.first().first != eChar) continue
+                if (eDist > 0.78f && endKeys.first().first != eChar) continue
+                val effEDist = max(0f, eDist - 0.13f)
+                val endpointCost = (effSDist + effEDist) * 0.72f
                 val bucket = buckets[sIdx + (eChar - 'a')]
                 for (entry in bucket) {
                     val lenDiff = abs(pathLen - entry.arcLen)
-                    val maxLenBound = maxOf(pathLen, entry.arcLen) * 0.72f + 0.55f
+                    val maxLenBound = maxOf(pathLen, entry.arcLen) * 0.85f + 0.65f
                     if (lenDiff > maxLenBound) continue
 
-                    val endpointCost = sDist * 1.32f + eDist * 1.32f
-
-                    var sumD = 0f
-                    val tpl = entry.template
-                    var j = 0
-                    while (j < n * 2) {
-                        val dx = path[j] - tpl[j]
-                        val dy = path[j + 1] - tpl[j + 1]
-                        sumD += hypot(dx.toDouble(), dy.toDouble()).toFloat()
-                        j += 2
-                    }
-                    var shapeDist = sumD / nFloat
+                    var rawLocDist = meanPointDist(path, entry.template, n, nFloat)
                     var effArcDiff = lenDiff
+
+                    val smoothLocDist = meanPointDist(path, entry.smoothedTemplate, n, nFloat) - 0.005f
+                    if (smoothLocDist < rawLocDist) {
+                        rawLocDist = smoothLocDist
+                        effArcDiff = min(effArcDiff, abs(pathLen - entry.smoothedArcLen) + 0.02f)
+                    }
 
                     val cTpl = entry.collapsedTemplate
                     if (cTpl != null) {
-                        var cSum = 0f
-                        var cj = 0
-                        while (cj < n * 2) {
-                            val dx = path[cj] - cTpl[cj]
-                            val dy = path[cj + 1] - cTpl[cj + 1]
-                            cSum += hypot(dx.toDouble(), dy.toDouble()).toFloat()
-                            cj += 2
-                        }
-                        val cShape = cSum / nFloat + 0.015f
-                        if (cShape < shapeDist) {
-                            shapeDist = cShape
+                        val cLoc = meanPointDist(path, cTpl, n, nFloat) + 0.01f
+                        if (cLoc < rawLocDist) {
+                            rawLocDist = cLoc
                             effArcDiff = min(effArcDiff, abs(pathLen - entry.collapsedArcLen) + 0.04f)
                         }
                     }
 
-                    val langPrior = if (preferJapanese && !entry.isEnglish) 0.13f else 0f
-                    val baseCost = endpointCost + shapeDist * 2.05f + effArcDiff * 0.24f - entry.freqBonus - langPrior
-                    if (baseCost < 2.05f) {
-                        insertTopStage1(stage1, Stage1Hit(entry, baseCost), limit = 56)
+                    val shapeDist = min(
+                        templateShapeDist(pathShape, entry.template, n),
+                        templateShapeDist(pathShape, entry.smoothedTemplate, n)
+                    )
+                    val langPrior = when {
+                        preferJapanese && !entry.isEnglish -> 0.22f
+                        !preferJapanese && entry.isEnglish -> 0.18f
+                        else -> 0f
+                    }
+                    val baseCost = endpointCost +
+                        rawLocDist * 0.78f +
+                        shapeDist * 2.15f +
+                        effArcDiff * 0.10f -
+                        entry.freqBonus -
+                        langPrior
+
+                    if (baseCost < 2.65f) {
+                        insertTopStage1(stage1, Stage1Hit(entry, baseCost), limit = 80)
                     }
                 }
             }
         }
 
-        // Stage 2 reranking: corner-anchor hit verification + monotonic waypoint pass check on top shortlist
+        // Stage 2 reranking: corner anchors + direction channel + arc-fraction waypoint penalty
         val anchors = KeyLayoutGeometry.extractAnchorPoints(normalizedPoints)
         val interiorAnchors = anchors.filter { !it.isEndpoint }.map { a ->
             val near2 = KeyLayoutGeometry.nearestKeys(a.x, a.y, limit = 2)
             var nearMask = 0
             for ((kch, d) in near2) {
-                if (d < 0.34f) {
+                if (d < 0.36f) {
                     nearMask = nearMask or (1 shl (kch - 'a'))
                 }
             }
             a to nearMask
         }
 
-        val candidates = ArrayList<GlideCandidate>(stage1.size + 4)
+        val candidates = ArrayList<GlideCandidate>(stage1.size + 8)
         for (hit in stage1) {
             val e = hit.entry
             var cornerAdj = 0f
             for ((anchor, nearMask) in interiorAnchors) {
                 if (nearMask != 0) {
                     if ((e.letterMask and nearMask) == 0) {
-                        cornerAdj += 0.12f * anchor.sharpness
+                        cornerAdj += 0.10f * anchor.sharpness
                     } else {
                         cornerAdj -= 0.03f * anchor.sharpness
                     }
                 }
             }
-            val waypointPenalty = computeWaypointPenalty(e.collapsedTrace, path, n)
-            val finalCost = hit.baseCost + cornerAdj + waypointPenalty * 0.55f
+            val d1 = templateDirDist(pathDirs, e.template, n)
+            val d2 = templateDirDist(pathDirs, e.smoothedTemplate, n)
+            val dirDist = min(d1, d2)
+
+            var wpPenalty = computeWaypointPenalty(
+                trace = e.traceWord,
+                arcFractions = e.arcFractions,
+                collinearMask = e.collinearMask,
+                resampledPath = path,
+                pathShape = pathShape,
+                tpl = e.template,
+                n = n
+            )
+            if (e.collapsedTrace != e.traceWord && e.collapsedTrace.length >= 2 && e.collapsedTemplate != null) {
+                val cWp = computeWaypointPenalty(
+                    trace = e.collapsedTrace,
+                    arcFractions = e.collapsedArcFractions,
+                    collinearMask = e.collapsedCollinearMask,
+                    resampledPath = path,
+                    pathShape = pathShape,
+                    tpl = e.collapsedTemplate,
+                    n = n
+                ) + 0.01f
+                if (cWp < wpPenalty) wpPenalty = cWp
+            }
+
+            val finalCost = hit.baseCost + cornerAdj + dirDist * 1.40f + wpPenalty * 0.55f
             candidates.add(GlideCandidate(e.outputWord, e.isEnglish, finalCost, e.kanaHint))
+        }
+
+        // Compound suffix split rescue for single-stroke Stem + masu/desu/shimasu/gozaimasu/etc.
+        if (allowCompoundSplit && preferJapanese && pathLen >= 1.35f && normalizedPoints.size >= 6) {
+            decodeCompoundSplits(normalizedPoints, pathLen, endKeys, n, candidates)
         }
 
         // Syllable lattice fallback if trajectory anchors themselves form strict valid romaji
@@ -351,34 +473,215 @@ class GlideDecoder(private val dictionaries: MeltypeDictionaries) {
         return candidates.distinctBy { it.word }.take(maxResults)
     }
 
-    private fun computeWaypointPenalty(trace: String, resampledPath: FloatArray, n: Int): Float {
+    private fun decodeCompoundSplits(
+        normalizedPoints: List<TouchPoint>,
+        totalLen: Float,
+        endKeys: List<Pair<Char, Float>>,
+        n: Int,
+        out: MutableList<GlideCandidate>
+    ) {
+        val m = normalizedPoints.size
+        val cum = FloatArray(m)
+        var acc = 0f
+        for (i in 1 until m) {
+            acc += hypot(
+                (normalizedPoints[i].x - normalizedPoints[i - 1].x).toDouble(),
+                (normalizedPoints[i].y - normalizedPoints[i - 1].y).toDouble()
+            ).toFloat()
+            cum[i] = acc
+        }
+        val endChars = endKeys.take(3).map { it.first }.toSet()
+
+        var bestSuf: SuffixEntry? = null
+        var bestSplitIdx = -1
+        var bestTailCost = Float.MAX_VALUE
+
+        for (suf in compoundSuffixes) {
+            if (suf.romaji.last() !in endChars) continue
+            val sufStartKey = KeyLayoutGeometry.centerOf(suf.romaji.first()) ?: continue
+            var splitIdx = -1
+            var bestStartD = 0.45f
+            for (i in 2 until m - 2) {
+                val frac = cum[i] / totalLen
+                if (frac !in 0.30f..0.85f) continue
+                val d = hypot(
+                    (normalizedPoints[i].x - sufStartKey.x).toDouble(),
+                    (normalizedPoints[i].y - sufStartKey.y).toDouble()
+                ).toFloat()
+                if (d < bestStartD) {
+                    bestStartD = d
+                    splitIdx = i
+                }
+            }
+            if (splitIdx < 2) continue
+
+            val tailPts = normalizedPoints.subList(splitIdx, m)
+            val (tailPath, tailLen) = KeyLayoutGeometry.resamplePolyline(tailPts, n)
+            if (tailLen < 0.25f) continue
+            val lenRatioDiff = abs(tailLen - suf.arcLen) / max(suf.arcLen, 0.3f)
+            if (lenRatioDiff > 0.65f) continue
+
+            val tailShape = KeyLayoutGeometry.normalizeShape(tailPath, n)
+            val tailDirs = KeyLayoutGeometry.directionVectors(tailPath, n)
+            val loc = meanPointDist(tailPath, suf.template, n, n.toFloat())
+            val shp = templateShapeDist(tailShape, suf.template, n)
+            val dir = templateDirDist(tailDirs, suf.template, n)
+            val cost = loc * 0.55f + shp * 0.65f + dir * 0.45f + bestStartD * 0.25f
+            if (cost < bestTailCost) {
+                bestTailCost = cost
+                bestSuf = suf
+                bestSplitIdx = splitIdx
+            }
+        }
+
+        val suf = bestSuf ?: return
+        if (bestTailCost > 0.30f || bestSplitIdx < 2) return
+
+        val headPts = normalizedPoints.subList(0, bestSplitIdx + 1)
+        val stems = decodeInternal(headPts, maxResults = 3, preferJapanese = true, allowCompoundSplit = false)
+        for (stem in stems) {
+            if (stem.isEnglish || stem.word.length < 2 || stem.scoreCost > 1.15f) continue
+            val joined = stem.word + suf.romaji
+            val joinedKana = (stem.kanaHint ?: RomajiDetector.analyze(stem.word).finalizedHiragana()) + suf.kana
+            val combinedCost = stem.scoreCost + bestTailCost * 0.95f + 0.25f
+            if (out.none { it.word == joined }) {
+                out.add(GlideCandidate(joined, isEnglish = false, scoreCost = combinedCost, kanaHint = joinedKana))
+            }
+        }
+    }
+
+    private fun meanPointDist(a: FloatArray, b: FloatArray, n: Int, nFloat: Float): Float {
+        var sum = 0f
+        var j = 0
+        val limit = n * 2
+        while (j < limit) {
+            val dx = a[j] - b[j]
+            val dy = a[j + 1] - b[j + 1]
+            sum += hypot(dx.toDouble(), dy.toDouble()).toFloat()
+            j += 2
+        }
+        return sum / nFloat
+    }
+
+    private fun templateCentroidAndScale(tpl: FloatArray, n: Int): Triple<Float, Float, Float> {
+        var cx = 0f
+        var cy = 0f
+        var minX = Float.POSITIVE_INFINITY
+        var maxX = Float.NEGATIVE_INFINITY
+        var minY = Float.POSITIVE_INFINITY
+        var maxY = Float.NEGATIVE_INFINITY
+        var i = 0
+        val limit = n * 2
+        while (i < limit) {
+            val x = tpl[i]
+            val y = tpl[i + 1]
+            cx += x
+            cy += y
+            if (x < minX) minX = x
+            if (x > maxX) maxX = x
+            if (y < minY) minY = y
+            if (y > maxY) maxY = y
+            i += 2
+        }
+        cx /= n.toFloat()
+        cy /= n.toFloat()
+        val scale = max(max(maxX - minX, maxY - minY), 0.22f)
+        return Triple(cx, cy, scale)
+    }
+
+    private fun templateShapeDist(pathShape: FloatArray, tpl: FloatArray, n: Int): Float {
+        val (cx, cy, scale) = templateCentroidAndScale(tpl, n)
+        var sum = 0f
+        var i = 0
+        val limit = n * 2
+        while (i < limit) {
+            val sx = (tpl[i] - cx) / scale
+            val sy = (tpl[i + 1] - cy) / scale
+            sum += hypot((pathShape[i] - sx).toDouble(), (pathShape[i + 1] - sy).toDouble()).toFloat()
+            i += 2
+        }
+        return sum / n.toFloat()
+    }
+
+    private fun templateDirDist(pathDirs: FloatArray, tpl: FloatArray, n: Int): Float {
+        var sum = 0f
+        var count = 0
+        for (i in 0 until n - 1) {
+            val px = pathDirs[i * 2]
+            val py = pathDirs[i * 2 + 1]
+            if (px == 0f && py == 0f) continue
+            val tx = tpl[(i + 1) * 2] - tpl[i * 2]
+            val ty = tpl[(i + 1) * 2 + 1] - tpl[i * 2 + 1]
+            val tLen = hypot(tx.toDouble(), ty.toDouble()).toFloat()
+            if (tLen > 1e-5f) {
+                val dot = ((px * tx + py * ty) / tLen).coerceIn(-1f, 1f)
+                sum += 0.5f * (1f - dot)
+                count++
+            }
+        }
+        return if (count > 0) sum / count.toFloat() else 0.5f
+    }
+
+    private fun computeWaypointPenalty(
+        trace: String,
+        arcFractions: FloatArray,
+        collinearMask: Int,
+        resampledPath: FloatArray,
+        pathShape: FloatArray,
+        tpl: FloatArray,
+        n: Int
+    ): Float {
         val len = trace.length
         if (len <= 2) return 0f
-        var sumMinDist = 0f
-        var maxDist = 0f
+        val (tCx, tCy, tScale) = templateCentroidAndScale(tpl, n)
+        var rawWeightedSum = 0f
+        var normWeightedSum = 0f
+        var totalWeight = 0f
+        var rawMaxCornerDist = 0f
+        var normMaxCornerDist = 0f
         var minSearchIdx = 0
+        var fracIdx = 0
         for (k in 0 until len) {
             val kc = KeyLayoutGeometry.centerOf(trace[k]) ?: continue
-            val expectedIdx = if (len > 1) (k * (n - 1)) / (len - 1) else 0
+            val frac = if (fracIdx < arcFractions.size) arcFractions[fracIdx] else (k.toFloat() / max(1, len - 1))
+            val expectedIdx = (frac * (n - 1).toFloat()).toInt().coerceIn(0, n - 1)
             val lo = max(minSearchIdx, expectedIdx - 6).coerceIn(0, n - 1)
-            val hi = (expectedIdx + 7).coerceIn(lo, n - 1)
-            var bestD = Float.MAX_VALUE
+            val hi = (expectedIdx + 6).coerceIn(lo, n - 1)
+            var bestRawD = Float.MAX_VALUE
+            var bestNormD = Float.MAX_VALUE
             var bestIdx = lo
             for (pIdx in lo..hi) {
-                val dx = resampledPath[pIdx * 2] - kc.x
-                val dy = resampledPath[pIdx * 2 + 1] - kc.y
-                val d = hypot(dx.toDouble(), dy.toDouble()).toFloat()
-                if (d < bestD) {
-                    bestD = d
+                val rdx = resampledPath[pIdx * 2] - kc.x
+                val rdy = resampledPath[pIdx * 2 + 1] - kc.y
+                val rd = hypot(rdx.toDouble(), rdy.toDouble()).toFloat()
+                if (rd < bestRawD) {
+                    bestRawD = rd
                     bestIdx = pIdx
+                }
+                val ax = pathShape[pIdx * 2] * tScale + tCx
+                val ay = pathShape[pIdx * 2 + 1] * tScale + tCy
+                val nd = hypot((ax - kc.x).toDouble(), (ay - kc.y).toDouble()).toFloat()
+                if (nd < bestNormD) {
+                    bestNormD = nd
                 }
             }
             minSearchIdx = max(minSearchIdx, bestIdx - 2)
-            sumMinDist += bestD
-            if (bestD > maxDist) maxDist = bestD
+            val isCollinear = fracIdx < 30 && ((collinearMask and (1 shl fracIdx)) != 0)
+            val weight = if (isCollinear) 0.35f else 1.0f
+            rawWeightedSum += bestRawD * weight
+            normWeightedSum += bestNormD * weight
+            totalWeight += weight
+            if (!isCollinear) {
+                if (bestRawD > rawMaxCornerDist) rawMaxCornerDist = bestRawD
+                if (bestNormD > normMaxCornerDist) normMaxCornerDist = bestNormD
+            }
+            fracIdx++
         }
-        val avg = sumMinDist / len.toFloat()
-        return avg * 0.65f + maxDist * 0.35f
+        val rawAvg = if (totalWeight > 0f) rawWeightedSum / totalWeight else 0f
+        val normAvg = if (totalWeight > 0f) normWeightedSum / totalWeight else 0f
+        val rawWp = rawAvg * 0.65f + rawMaxCornerDist * 0.35f
+        val normWp = normAvg * 0.65f + normMaxCornerDist * 0.35f
+        return min(rawWp, normWp + 0.04f)
     }
 
     private fun insertTopStage1(list: MutableList<Stage1Hit>, item: Stage1Hit, limit: Int) {
@@ -665,6 +968,22 @@ class GlideDecoder(private val dictionaries: MeltypeDictionaries) {
             "settings", "config", "theme", "light", "dark", "layout", "design", "style", "input",
             "output", "text", "word", "words", "japanese", "english", "romaji", "hiragana", "katakana",
             "kanji", "mozc", "linux", "windows", "macos", "python", "kotlin", "java", "gradle"
+        )
+
+        private val COMPOUND_SUFFIX_PAIRS = listOf(
+            "gozaimasu" to "ございます",
+            "shimasen" to "しません",
+            "shimashita" to "しました",
+            "shimasu" to "します",
+            "deshita" to "でした",
+            "mashita" to "ました",
+            "masen" to "ません",
+            "kudasai" to "ください",
+            "shite" to "して",
+            "desu" to "です",
+            "masu" to "ます",
+            "nai" to "ない",
+            "tai" to "たい"
         )
     }
 }

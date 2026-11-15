@@ -270,6 +270,10 @@ class MainActivity : AppCompatActivity() {
             settings.hapticFeedback = it
         }
         addDivider(settingsCard)
+        addSwitchRow(settingsCard, "ローマ字ミスタイプ自動補正", "打鍵ミス・隣接キー・撥音m・カタカナ誤綴りを自動補正", settings.typoCorrectionEnabled) {
+            settings.typoCorrectionEnabled = it
+        }
+        addDivider(settingsCard)
         addSwitchRow(settingsCard, "Mozc 変換学習を有効にする", "確定した変換候補を端末内に記憶", settings.learningEnabled) {
             settings.learningEnabled = it
         }
@@ -525,6 +529,92 @@ class MainActivity : AppCompatActivity() {
         val highOk = kotlin.math.abs(settings.keyboardHeightScale - 1.42f) < 0.01f
         settings.keyboardHeightScale = savedScale
         check("FreeHeightScale", lowOk && highOk, "range=0.65..1.55")
+
+        // 6. Romaji typo tolerance, misspellings & bilabial m ("mb"/"mp"/"mm" -> ん)
+        val typoCases = listOf(
+            "onegaishimsu" to listOf("お願いします", "おねがいします"),
+            "sumimasne" to listOf("すみません"),
+            "shimbun" to listOf("新聞", "しんぶん")
+        )
+        for ((raw, wants) in typoCases) {
+            val s = CompositionSession(dicts, engine, converter)
+            for (ch in raw) s.appendChar(ch)
+            val prev = s.snapshot.previewText
+            val cands = s.snapshot.candidates.map { it.text }
+            val hit = wants.any { prev.contains(it) || cands.any { c -> c.contains(it) } }
+            check("TypoFix($raw)", hit, "prev='$prev' cands=${cands.take(4)}")
+        }
+        val readableTypo = CompositionSession(dicts, engine, converter)
+        for (ch in "arigatoi ") readableTypo.appendChar(ch)
+        val rPrev = readableTypo.snapshot.previewText
+        val rCands = readableTypo.snapshot.candidates.map { it.text }
+        check(
+            "ReadableTypo(arigatoi)",
+            rPrev.contains("ありがとう") || rPrev.contains("有り難う") || rCands.any { it.contains("ありがとう") || it.contains("有り難う") },
+            "prev='$rPrev' cands=${rCands.take(4)}"
+        )
+
+        val misspellSess = CompositionSession(dicts, engine, converter)
+        for (ch in "shumire-shon") misspellSess.appendChar(ch)
+        val mPrev = misspellSess.snapshot.previewText
+        val mCands = misspellSess.snapshot.candidates.map { it.text }
+        check(
+            "KatakanaMisspell",
+            mPrev.contains("シミュレーション") || mCands.contains("シミュレーション"),
+            "prev='$mPrev' cands=${mCands.take(4)}"
+        )
+
+        // 7. Biomechanically curved/undershot/shifted Japanese glide + compound suffix split
+        fun buildHumanTrace(word: String, scale: Float, dx: Float, dy: Float): List<io.github.sp9r.meltype.glide.TouchPoint> {
+            val centers = word.mapNotNull { KeyLayoutGeometry.centerOf(it) }
+            if (centers.size <= 1) return centers.map { io.github.sp9r.meltype.glide.TouchPoint(it.x, it.y) }
+            val rounded = ArrayList<io.github.sp9r.meltype.glide.TouchPoint>(centers.size)
+            rounded.add(io.github.sp9r.meltype.glide.TouchPoint(centers.first().x, centers.first().y))
+            for (i in 1 until centers.lastIndex) {
+                val p = centers[i - 1]
+                val c = centers[i]
+                val n = centers[i + 1]
+                val mx = (p.x + n.x) * 0.5f
+                val my = (p.y + n.y) * 0.5f
+                rounded.add(io.github.sp9r.meltype.glide.TouchPoint(c.x + (mx - c.x) * 0.24f, c.y + (my - c.y) * 0.24f))
+            }
+            rounded.add(io.github.sp9r.meltype.glide.TouchPoint(centers.last().x, centers.last().y))
+            val cx = rounded.map { it.x }.average().toFloat()
+            val cy = rounded.map { it.y }.average().toFloat()
+            val scaled = rounded.map {
+                io.github.sp9r.meltype.glide.TouchPoint(cx + (it.x - cx) * scale + dx, cy + (it.y - cy) * scale + dy)
+            }
+            val dense = ArrayList<io.github.sp9r.meltype.glide.TouchPoint>()
+            for (i in 0 until scaled.lastIndex) {
+                val a = scaled[i]
+                val b = scaled[i + 1]
+                for (step in 0 until 4) {
+                    val t = step / 4f
+                    dense.add(io.github.sp9r.meltype.glide.TouchPoint(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t))
+                }
+            }
+            dense.add(scaled.last())
+            return dense
+        }
+        val curvedGlideCases = listOf(
+            "watashi" to "watashi",
+            "arigatou" to "arigatou",
+            "konichiwa" to "konnichiwa",
+            "kakuninshimasu" to "kakuninshimasu"
+        )
+        for ((trace, want) in curvedGlideCases) {
+            val hPath = buildHumanTrace(trace, scale = 0.72f, dx = 0.10f, dy = -0.05f)
+            val top5 = decoder.decode(hPath, maxResults = 5).map { it.word }
+            check("HumanGlide($trace->$want)", want in top5.take(3), "top5=$top5")
+        }
+
+        // 8. Calculator (without '=') + Commit Undo restore
+        check("BareCalc(128*16)", io.github.sp9r.meltype.core.UtilityConverter.evaluateCalculator("128*16") == "2048", "eval=2048")
+        val uCommitSess = CompositionSession(dicts, engine, converter)
+        uCommitSess.appendText("kyou")
+        val uSaved = uCommitSess.commitAndLearn()
+        val restored = uCommitSess.restoreFromUndo("kyou")
+        check("UndoCommitRestore", uSaved.isNotEmpty() && restored.rawInput == "kyou" && restored.isComposing, "prev='${restored.previewText}'")
 
         val header = if (allPassed) "PASS\n" else "FAIL\n"
         val report = header + sb.toString()

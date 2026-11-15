@@ -221,6 +221,14 @@ object RomajiDetector {
                 }
             }
 
+            // Bilabial 'm' before b/p/m acts as moraic nasal 'ん' (e.g. shimbun, sampo, tempura, ammari)
+            if (ch == 'm' && i + 1 < raw.length && raw[i + 1] in charArrayOf('b', 'p', 'm')) {
+                chunks.add(RomajiChunk(i, i + 1, "m", "ん"))
+                kanaOut.append("ん")
+                i += 1
+                continue
+            }
+
             // Sokuon (double consonant like kk, tt, ss, pp, cc, tch)
             if (i + 1 < raw.length) {
                 val next = raw[i + 1]
@@ -297,6 +305,18 @@ object RomajiDetector {
         for (ch in hiragana) {
             if (ch in '\u3041'..'\u3096') {
                 sb.append((ch.code + 0x60).toChar())
+            } else {
+                sb.append(ch)
+            }
+        }
+        return sb.toString()
+    }
+
+    fun toHiragana(text: String): String {
+        val sb = StringBuilder(text.length)
+        for (ch in text) {
+            if (ch in '\u30A1'..'\u30F6') {
+                sb.append((ch.code - 0x60).toChar())
             } else {
                 sb.append(ch)
             }

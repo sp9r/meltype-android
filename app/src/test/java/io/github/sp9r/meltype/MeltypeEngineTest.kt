@@ -66,9 +66,10 @@ class MeltypeEngineTest {
     @Test
     fun scoreEngineSegmentsMixedJapaneseAndEnglishCorrectly() {
         val seg1 = scoreEngine.segment("kyouhagoogledekensaku")
-        assertEquals(3, seg1.size)
-        assertEquals(SegmentKind.JAPANESE, seg1[0].kind)
-        assertEquals("きょうは", seg1[0].hiragana)
+        val seg1Desc = seg1.joinToString { "${it.kind}:${it.raw}->${it.hiragana}" }
+        assertEquals(seg1Desc, 3, seg1.size)
+        assertEquals(seg1Desc, SegmentKind.JAPANESE, seg1[0].kind)
+        assertEquals(seg1Desc, "きょうは", seg1[0].hiragana)
         assertEquals(SegmentKind.ENGLISH, seg1[1].kind)
         assertEquals("google", seg1[1].raw)
         assertEquals(SegmentKind.JAPANESE, seg1[2].kind)
@@ -213,6 +214,144 @@ class MeltypeEngineTest {
 
         // Utility checks
         assertEquals("2048", UtilityConverter.evaluateCalculator("128*16="))
+        assertEquals("2048", UtilityConverter.evaluateCalculator("128*16"))
         assertTrue(UtilityConverter.utilityCandidates("きょう", "kyou").isNotEmpty())
+        assertTrue(UtilityConverter.numericCandidates("1234").contains("1,234"))
+    }
+
+    @Test
+    fun romajiTypoToleranceAndBilabialAndMisspellings() {
+        val converter = AndroidMozcConverter(dictionaries)
+
+        // 1. Bilabial m -> ん before b/p/m
+        assertEquals("しんぶん", RomajiDetector.analyze("shimbun").finalizedHiragana())
+        assertEquals("さんぽ", RomajiDetector.analyze("sampo").finalizedHiragana())
+        assertEquals("てんぷら", RomajiDetector.analyze("tempura").finalizedHiragana())
+
+        // 2. Unreadable cluster auto-repair (skipped vowel / adjacent hit / transposition)
+        val unrepaired = listOf(
+            "onegaishimsu" to listOf("お願いします", "おねがいします"),
+            "arigatpu" to listOf("ありがとう", "有り難う"),
+            "sumimasne" to listOf("すみません")
+        )
+        for ((raw, expects) in unrepaired) {
+            val s = CompositionSession(dictionaries, scoreEngine, converter)
+            for (ch in raw) s.appendChar(ch)
+            val prev = s.snapshot.previewText
+            val cands = s.snapshot.candidates.map { it.text }
+            assertTrue(
+                "Expected one of $expects for mistyped '$raw', got preview='$prev' cands=$cands",
+                expects.any { prev.contains(it) || cands.any { c -> c.contains(it) } }
+            )
+        }
+
+        // 3. Accidentally readable neighbor slips with word boundary
+        val readableSlips = listOf(
+            "arigatoi " to listOf("ありがとう", "有り難う"),
+            "arigayou " to listOf("ありがとう", "有り難う"),
+            "ohayoi " to listOf("おはよう"),
+            "watashu " to listOf("わたし", "私")
+        )
+        for ((raw, expects) in readableSlips) {
+            val s = CompositionSession(dictionaries, scoreEngine, converter)
+            for (ch in raw) s.appendChar(ch)
+            val prev = s.snapshot.previewText
+            val cands = s.snapshot.candidates.map { it.text }
+            assertTrue(
+                "Expected correction for readable slip '$raw' -> $expects, got preview='$prev' cands=$cands",
+                expects.any { prev.contains(it) || cands.any { c -> c.contains(it) } }
+            )
+        }
+
+        // 4. Katakana misspellings resolution (misspellings.txt)
+        val misspell = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "shumire-shon") misspell.appendChar(ch)
+        assertTrue(
+            "Expected シュミレーション -> シミュレーション candidate, got preview='${misspell.snapshot.previewText}' cands=${misspell.snapshot.candidates.map { it.text }}",
+            misspell.snapshot.previewText.contains("シミュレーション") ||
+                misspell.snapshot.candidates.any { it.text == "シミュレーション" }
+        )
+
+        // 5. Commit undo restore
+        val undoSess = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "arigatou") undoSess.appendChar(ch)
+        val committed = undoSess.commitAndLearn()
+        assertTrue(committed.isNotEmpty() && undoSess.isEmpty)
+        val restored = undoSess.restoreFromUndo("arigatou")
+        assertTrue(restored.isComposing && restored.rawInput == "arigatou")
+    }
+
+    @Test
+    fun humanCurvedScaledAndCompoundJapaneseGlideAccuracy() {
+        fun humanSwipePath(
+            word: String,
+            cornerRoundAlpha: Float,
+            scale: Float,
+            shiftX: Float,
+            shiftY: Float
+        ): List<io.github.sp9r.meltype.glide.TouchPoint> {
+            val centers = word.mapNotNull { KeyLayoutGeometry.centerOf(it) }
+            val rounded = ArrayList<io.github.sp9r.meltype.glide.TouchPoint>(centers.size)
+            rounded.add(io.github.sp9r.meltype.glide.TouchPoint(centers.first().x, centers.first().y))
+            for (i in 1 until centers.lastIndex) {
+                val p = centers[i - 1]
+                val c = centers[i]
+                val n = centers[i + 1]
+                val mx = (p.x + n.x) * 0.5f
+                val my = (p.y + n.y) * 0.5f
+                rounded.add(
+                    io.github.sp9r.meltype.glide.TouchPoint(
+                        c.x + (mx - c.x) * cornerRoundAlpha,
+                        c.y + (my - c.y) * cornerRoundAlpha
+                    )
+                )
+            }
+            rounded.add(io.github.sp9r.meltype.glide.TouchPoint(centers.last().x, centers.last().y))
+
+            val cx = rounded.map { it.x }.average().toFloat()
+            val cy = rounded.map { it.y }.average().toFloat()
+            val transformed = rounded.map {
+                io.github.sp9r.meltype.glide.TouchPoint(
+                    cx + (it.x - cx) * scale + shiftX,
+                    cy + (it.y - cy) * scale + shiftY
+                )
+            }
+            val dense = ArrayList<io.github.sp9r.meltype.glide.TouchPoint>(transformed.size * 5)
+            for (i in 0 until transformed.lastIndex) {
+                val a = transformed[i]
+                val b = transformed[i + 1]
+                for (step in 0 until 5) {
+                    val t = step / 5f
+                    dense.add(
+                        io.github.sp9r.meltype.glide.TouchPoint(
+                            a.x + (b.x - a.x) * t,
+                            a.y + (b.y - a.y) * t
+                        )
+                    )
+                }
+            }
+            dense.add(transformed.last())
+            return dense
+        }
+
+        val humanCases = listOf(
+            "watashi" to "watashi",
+            "watasiwa" to "watashiha",
+            "arigatou" to "arigatou",
+            "arigato" to "arigatou",
+            "konichiwa" to "konnichiwa",
+            "ohayou" to "ohayou",
+            "onegaishimasu" to "onegaishimasu",
+            "kakuninshimasu" to "kakuninshimasu",
+            "arigatougozaimasu" to "arigatougozaimasu"
+        )
+        for ((traceWord, expectedOut) in humanCases) {
+            val path = humanSwipePath(traceWord, cornerRoundAlpha = 0.25f, scale = 0.72f, shiftX = 0.11f, shiftY = -0.05f)
+            val decoded = glideDecoder.decode(path, maxResults = 6).map { it.word }
+            assertTrue(
+                "Expected '$expectedOut' in top-3 for human curved+scaled trace '$traceWord', got $decoded",
+                decoded.take(3).contains(expectedOut)
+            )
+        }
     }
 }

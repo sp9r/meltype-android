@@ -2,6 +2,7 @@ package io.github.sp9r.meltype.core
 
 import android.content.Context
 import java.io.File
+import java.text.Normalizer
 import java.util.Arrays
 
 interface DictionarySource {
@@ -67,6 +68,10 @@ class MeltypeDictionaries(source: DictionarySource) {
     val readingToPhrases: Map<String, String>
     val extraCandidates: Map<String, List<String>>
     val emojiCandidates: Map<String, List<String>>
+    val kaomojiList: List<String>
+    val misspellingExact: Map<String, String>
+    val misspellingRightSet: Set<String>
+    val misspellingByShape: Map<String, List<String>>
     val readingsSet: Set<String>
     val readingWithTags: List<Pair<String, List<String>>>
     val commonLatinWordsForGlide: List<String>
@@ -205,7 +210,9 @@ class MeltypeDictionaries(source: DictionarySource) {
 
         // 9. emoji.txt + emoji-cldr.txt (reading\temoji1\temoji2...)
         val emojiMap = LinkedHashMap<String, MutableList<String>>()
+        val kaomojis = LinkedHashSet<String>()
         for (file in listOf("emoji.txt", "emoji-cldr.txt")) {
+            val isCuratedEmojiFile = (file == "emoji.txt")
             for (rawLine in readLines(file)) {
                 if (rawLine.isBlank() || rawLine.lstripStartsWithHash()) continue
                 val parts = rawLine.split('\t')
@@ -215,14 +222,52 @@ class MeltypeDictionaries(source: DictionarySource) {
                     val list = emojiMap.getOrPut(r) { ArrayList() }
                     for (idx in 1 until parts.size) {
                         val e = parts[idx].trim()
-                        if (e.isNotEmpty() && e !in list && list.size < 16) list.add(e)
+                        if (e.isNotEmpty() && e !in list && list.size < 16) {
+                            list.add(e)
+                        }
+                        if (isCuratedEmojiFile && e.isNotEmpty() && looksLikeKaomoji(e)) {
+                            kaomojis.add(e)
+                        }
                     }
                 }
             }
         }
         emojiCandidates = emojiMap
+        kaomojiList = kaomojis.toList()
 
-        // 10. readings.txt (reading[\tpos])
+        // 10. misspellings.txt (wrong\tright or right-only)
+        val misExact = LinkedHashMap<String, String>()
+        val misRight = HashSet<String>()
+        val misShape = LinkedHashMap<String, MutableList<String>>()
+        fun registerRightMisspelling(rightKata: String) {
+            if (rightKata.isEmpty()) return
+            misRight.add(rightKata)
+            if (rightKata.length >= 5) {
+                val shape = katakanaShapeKey(rightKata)
+                val bucket = misShape.getOrPut(shape) { ArrayList(2) }
+                if (rightKata !in bucket) bucket.add(rightKata)
+            }
+        }
+        for (rawLine in readLines("misspellings.txt")) {
+            val line = stripHashComment(rawLine)
+            if (line.isEmpty()) continue
+            val parts = line.split('\t').map { it.trim() }.filter { it.isNotEmpty() }
+            if (parts.size == 1) {
+                registerRightMisspelling(RomajiDetector.toKatakana(parts[0]))
+            } else if (parts.size >= 2) {
+                val wrongKata = RomajiDetector.toKatakana(parts[0])
+                val rightKata = RomajiDetector.toKatakana(parts[1])
+                if (wrongKata.isNotEmpty() && rightKata.isNotEmpty()) {
+                    misExact.putIfAbsent(wrongKata, rightKata)
+                    registerRightMisspelling(rightKata)
+                }
+            }
+        }
+        misspellingExact = misExact
+        misspellingRightSet = misRight
+        misspellingByShape = misShape
+
+        // 11. readings.txt (reading[\tpos])
         val rSet = HashSet<String>()
         val rTagged = ArrayList<Pair<String, List<String>>>()
         for (rawLine in readLines("readings.txt")) {
@@ -262,7 +307,55 @@ class MeltypeDictionaries(source: DictionarySource) {
         loadedFileCount = count
     }
 
+    /**
+     * Resolves common katakana/loanword misspellings (e.g. しゅみれーしょん -> シミュレーション,
+     * ぶれすれっど -> ブレスレット) from misspellings.txt.
+     */
+    fun resolveMisspelling(readingHiragana: String): List<String> {
+        if (readingHiragana.length < 3) return emptyList()
+        val kata = RomajiDetector.toKatakana(readingHiragana)
+        val out = LinkedHashSet<String>(2)
+        misspellingExact[kata]?.let { out.add(it) }
+        if (kata.length >= 4 && kata !in misspellingRightSet) {
+            val shape = katakanaShapeKey(kata)
+            misspellingByShape[shape]?.forEach { cand ->
+                if (cand != kata) out.add(cand)
+            }
+        }
+        return out.toList()
+    }
+
     companion object {
+        private fun looksLikeKaomoji(token: String): Boolean {
+            if (token.length <= 1) return false
+            return token.any { ch ->
+                ch in ' '..'~' || ch in listOf('ω', '∀', 'Д', 'ﾟ', '▽', '≧', '≦', '・', '｀', '´', 'ノ', '￣', '∩', '•', 'ᴥ')
+            }
+        }
+
+        internal fun katakanaShapeKey(katakana: String): String {
+            val decomposed = Normalizer.normalize(katakana, Normalizer.Form.NFD)
+            val sb = StringBuilder(decomposed.length)
+            for (ch in decomposed) {
+                if (ch == 'ッ' || ch == 'ー' || Character.getType(ch) == Character.NON_SPACING_MARK.toInt()) continue
+                sb.append(
+                    when (ch) {
+                        'ァ' -> 'ア'
+                        'ィ' -> 'イ'
+                        'ゥ' -> 'ウ'
+                        'ェ' -> 'エ'
+                        'ォ' -> 'オ'
+                        'ャ' -> 'ヤ'
+                        'ュ' -> 'ユ'
+                        'ョ' -> 'ヨ'
+                        'ヮ' -> 'ワ'
+                        else -> ch
+                    }
+                )
+            }
+            return sb.toString()
+        }
+
         private fun String.lstripStartsWithHash(): Boolean = trimStart().startsWith('#')
 
         private fun stripHashComment(line: String): String {
