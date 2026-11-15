@@ -1,27 +1,32 @@
 package io.github.sp9r.meltype
 
 import android.content.Intent
+import android.content.res.ColorStateList
 import android.content.res.Configuration
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
 import android.provider.Settings
+import android.text.Editable
 import android.text.InputType
+import android.text.TextWatcher
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.view.inputmethod.InputMethodManager
-import android.widget.Button
 import android.widget.EditText
+import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.SeekBar
-import android.widget.Switch
 import android.widget.TextView
-import kotlin.math.roundToInt
 import androidx.appcompat.app.AppCompatActivity
+import androidx.appcompat.widget.SwitchCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
@@ -33,33 +38,69 @@ import io.github.sp9r.meltype.core.MozcRuntime
 import io.github.sp9r.meltype.core.ScoreEngine
 import io.github.sp9r.meltype.glide.GlideDecoder
 import io.github.sp9r.meltype.glide.KeyLayoutGeometry
+import io.github.sp9r.meltype.glide.TouchPoint
+import io.github.sp9r.meltype.ui.GlideTraceLabView
+import io.github.sp9r.meltype.ui.KeyboardBlueprintView
 import java.io.File
 import java.util.concurrent.Executors
+import kotlin.math.roundToInt
 
 class MainActivity : AppCompatActivity() {
+
+    private enum class WorkspaceTab(val label: String) {
+        STUDIO("スタジオ"),
+        LAYOUT("レイアウト・設定"),
+        LEXICON("辞書・操作")
+    }
 
     private lateinit var settings: MeltypeSettings
     private val executor = Executors.newSingleThreadExecutor()
 
-    private lateinit var statusImeEnabledVal: TextView
-    private lateinit var statusImeDefaultVal: TextView
-    private lateinit var statusMozcVal: TextView
-    private lateinit var statusDictVal: TextView
+    private var activeTab: WorkspaceTab = WorkspaceTab.STUDIO
+    private var logExpanded: Boolean = false
+    private var dictionaries: MeltypeDictionaries? = null
+    private var scoreEngine: ScoreEngine? = null
+    private var converter: AndroidMozcConverter? = null
+    private var glideDecoder: GlideDecoder? = null
+
+    private lateinit var rootScroll: ScrollView
+    private lateinit var setupStrip: LinearLayout
+    private lateinit var setupHintText: TextView
+    private lateinit var setupEnableBtn: TextView
+    private lateinit var setupSwitchBtn: TextView
+    private lateinit var headerStatusDot: View
+    private lateinit var headerStatusText: TextView
+    private lateinit var headerStatusPill: LinearLayout
+
+    private val tabButtons = ArrayList<TextView>()
+    private val workspaceContainers = ArrayList<LinearLayout>()
+
+    private lateinit var sandboxInput: EditText
+    private lateinit var probeResultBanner: TextView
+    private lateinit var glideLabView: GlideTraceLabView
+    private lateinit var blueprintView: KeyboardBlueprintView
+
+    private lateinit var engineSpecLabel: TextView
+    private lateinit var selfTestBadgeDot: View
+    private lateinit var selfTestBadgeText: TextView
+    private lateinit var selfTestToggleBtn: TextView
+    private lateinit var selfTestLogDrawer: LinearLayout
     private lateinit var selfTestLogView: TextView
     private lateinit var userDictContainer: LinearLayout
 
-    private var dictionaries: MeltypeDictionaries? = null
-    private var glideDecoder: GlideDecoder? = null
-
     private var cPage = 0
+    private var cRail = 0
     private var cSurface = 0
     private var cSurfaceSubtle = 0
     private var cText = 0
     private var cMuted = 0
+    private var cFaint = 0
     private var cBorder = 0
+    private var cBorderStrong = 0
     private var cPrimary = 0
     private var cPrimaryText = 0
     private var cAccent = 0
+    private var cAccentTint = 0
     private var cSuccess = 0
     private var cWarning = 0
     private var isDarkPalette = false
@@ -67,10 +108,16 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         settings = MeltypeSettings(this)
+        val savedIdx = savedInstanceState?.getInt(KEY_ACTIVE_TAB, 0) ?: 0
+        activeTab = WorkspaceTab.entries.getOrElse(savedIdx) { WorkspaceTab.STUDIO }
         resolvePalette()
-
         buildUi()
         initEngineAsync(runSelfTest = intent.getBooleanExtra("selftest", false))
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putInt(KEY_ACTIVE_TAB, activeTab.ordinal)
     }
 
     override fun onResume() {
@@ -93,289 +140,41 @@ class MainActivity : AppCompatActivity() {
         }
         isDarkPalette = dark
         if (dark) {
-            cPage = Color.parseColor("#121417")
-            cSurface = Color.parseColor("#1B1E23")
-            cSurfaceSubtle = Color.parseColor("#23272D")
+            cPage = Color.parseColor("#111317")
+            cRail = Color.parseColor("#16191F")
+            cSurface = Color.parseColor("#1B1E25")
+            cSurfaceSubtle = Color.parseColor("#22262E")
             cText = Color.parseColor("#ECEEF0")
-            cMuted = Color.parseColor("#9BA1A8")
-            cBorder = Color.parseColor("#2F343D")
+            cMuted = Color.parseColor("#8F96A0")
+            cFaint = Color.parseColor("#606772")
+            cBorder = Color.parseColor("#2C313A")
+            cBorderStrong = Color.parseColor("#3B414D")
             cPrimary = Color.parseColor("#ECEEF0")
-            cPrimaryText = Color.parseColor("#181B20")
+            cPrimaryText = Color.parseColor("#15181D")
             cAccent = Color.parseColor("#5C8AC4")
+            cAccentTint = Color.argb(38, 92, 138, 196)
             cSuccess = Color.parseColor("#5E9E75")
             cWarning = Color.parseColor("#D49542")
         } else {
             cPage = Color.parseColor("#F5F6F7")
+            cRail = Color.parseColor("#ECEEF1")
             cSurface = Color.parseColor("#FFFFFF")
-            cSurfaceSubtle = Color.parseColor("#F7F8F9")
+            cSurfaceSubtle = Color.parseColor("#F7F8FA")
             cText = Color.parseColor("#202328")
-            cMuted = Color.parseColor("#737A84")
+            cMuted = Color.parseColor("#6D747E")
+            cFaint = Color.parseColor("#969BA2")
             cBorder = Color.parseColor("#DFE2E6")
+            cBorderStrong = Color.parseColor("#CFD4DA")
             cPrimary = Color.parseColor("#25282D")
             cPrimaryText = Color.parseColor("#FFFFFF")
             cAccent = Color.parseColor("#4A6F9E")
+            cAccentTint = Color.argb(26, 74, 111, 158)
             cSuccess = Color.parseColor("#4C835F")
             cWarning = Color.parseColor("#A66B1F")
         }
     }
 
     private fun buildUi() {
-        val scroll = ScrollView(this).apply {
-            setBackgroundColor(cPage)
-            layoutParams = ViewGroup.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT
-            )
-        }
-
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(16), dp(14), dp(16), dp(28))
-        }
-        scroll.addView(root)
-
-        // Quiet Header
-        val header = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(4), 0, dp(14))
-        }
-        val titleCol = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-        }
-        titleCol.addView(TextView(this).apply {
-            text = "Meltype"
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 22f)
-            setTypeface(null, Typeface.BOLD)
-            setTextColor(cText)
-        })
-        titleCol.addView(TextView(this).apply {
-            text = "QWERTY + グライド入力対応 日英ライブ変換IME"
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
-            setTextColor(cMuted)
-        })
-        header.addView(titleCol)
-        header.addView(TextView(this).apply {
-            text = "v${BuildConfig.VERSION_NAME}"
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-            setTextColor(cMuted)
-            setPadding(dp(8), dp(4), dp(8), dp(4))
-            background = cardBorderBg(cSurface, cBorder, 4)
-        })
-        root.addView(header)
-
-        // Section 1: Setup & Engine Status
-        root.addView(sectionLabel("セットアップと状態"))
-        val statusCard = makeCard()
-        statusImeEnabledVal = addStatusRow(statusCard, "システムIME設定", "確認中")
-        addDivider(statusCard)
-        statusImeDefaultVal = addStatusRow(statusCard, "現在の入力方法", "確認中")
-        addDivider(statusCard)
-        statusMozcVal = addStatusRow(statusCard, "Mozc 変換エンジン", "初期化中...")
-        addDivider(statusCard)
-        statusDictVal = addStatusRow(statusCard, "辞書データ", "読み込み中...")
-
-        val btnRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            setPadding(dp(12), dp(12), dp(12), dp(12))
-        }
-        val enableBtn = makePrimaryButton("1. IMEを有効にする").apply {
-            layoutParams = LinearLayout.LayoutParams(0, dp(40), 1f).apply { marginEnd = dp(8) }
-            setOnClickListener {
-                startActivity(Intent(Settings.ACTION_INPUT_METHOD_SETTINGS))
-            }
-        }
-        val pickBtn = makeSecondaryButton("2. IMEを切り替え").apply {
-            layoutParams = LinearLayout.LayoutParams(0, dp(40), 1f)
-            setOnClickListener {
-                val imm = getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager
-                imm.showInputMethodPicker()
-            }
-        }
-        btnRow.addView(enableBtn)
-        btnRow.addView(pickBtn)
-        addDivider(statusCard)
-        statusCard.addView(btnRow)
-        root.addView(statusCard)
-
-        // Section 2: Sandbox Test Field & Automated Verification
-        root.addView(sectionLabel("入力テストと動作確認"))
-        val testCard = makeCard()
-        val testBox = EditText(this).apply {
-            hint = "ここをタップして文字キーのタップやグライド入力を試せます"
-            setHintTextColor(cMuted)
-            setTextColor(cText)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
-            minLines = 2
-            gravity = Gravity.TOP or Gravity.START
-            setPadding(dp(12), dp(10), dp(12), dp(10))
-            background = cardBorderBg(cSurfaceSubtle, cBorder, 5)
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply {
-                setMargins(dp(12), dp(12), dp(12), dp(10))
-            }
-        }
-        testCard.addView(testBox)
-
-        val runTestBtn = makeSecondaryButton("ライブ変換・グライドデコード検証を実行").apply {
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                dp(38)
-            ).apply {
-                setMargins(dp(12), 0, dp(12), dp(10))
-            }
-            setOnClickListener {
-                executor.execute { runEngineSelfTest(writeFile = false) }
-            }
-        }
-        testCard.addView(runTestBtn)
-
-        selfTestLogView = TextView(this).apply {
-            text = "エンジン準備中..."
-            typeface = Typeface.MONOSPACE
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
-            setTextColor(cMuted)
-            setPadding(dp(12), dp(8), dp(12), dp(12))
-        }
-        testCard.addView(selfTestLogView)
-        root.addView(testCard)
-
-        // Section 3: Keyboard Settings
-        root.addView(sectionLabel("キーボード設定"))
-        val settingsCard = makeCard()
-        addSwitchRow(settingsCard, "グライド入力（スワイプ入力）", "QWERTYキー上を滑らせて日英単語を入力", settings.glideEnabled) {
-            settings.glideEnabled = it
-        }
-        addDivider(settingsCard)
-        addSwitchRow(settingsCard, "数字段（1〜0）を常時表示", "QWERTY最上段に1〜0の数字キー列を固定表示", settings.showNumberRow) {
-            settings.showNumberRow = it
-        }
-        addDivider(settingsCard)
-        addSwitchRow(settingsCard, "記号入力後に文字キーへ自動復帰", "?123記号キーを1文字入力すると自動でQWERTYへ戻す", settings.autoReturnFromSymbols) {
-            settings.autoReturnFromSymbols = it
-        }
-        addDivider(settingsCard)
-        addSwitchRow(settingsCard, "句読点（。、）で自動確定", "日本語文末の句読点入力時に変換を即確定", settings.autoCommitOnPunctuation) {
-            settings.autoCommitOnPunctuation = it
-        }
-        addDivider(settingsCard)
-        addSwitchRow(settingsCard, "キー右上の数字・記号ヒントを表示", "長押し（0.22秒）または縦フリックで数字・記号を入力", settings.showSubLabels) {
-            settings.showSubLabels = it
-        }
-        addDivider(settingsCard)
-        addSwitchRow(settingsCard, "キータップ時の振動フィードバック", "タップやカーソル移動時に短く振動", settings.hapticFeedback) {
-            settings.hapticFeedback = it
-        }
-        addDivider(settingsCard)
-        addSwitchRow(settingsCard, "ローマ字ミスタイプ自動補正", "打鍵ミス・隣接キー・撥音m・カタカナ誤綴りを自動補正", settings.typoCorrectionEnabled) {
-            settings.typoCorrectionEnabled = it
-        }
-        addDivider(settingsCard)
-        addSwitchRow(settingsCard, "Mozc 変換学習を有効にする", "確定した変換候補を端末内に記憶", settings.learningEnabled) {
-            settings.learningEnabled = it
-        }
-
-        addDivider(settingsCard)
-        addOptionGroup(
-            settingsCard,
-            "外観テーマ",
-            listOf(
-                ThemeMode.SYSTEM.labelJa to (settings.themeMode == ThemeMode.SYSTEM),
-                ThemeMode.LIGHT.labelJa to (settings.themeMode == ThemeMode.LIGHT),
-                ThemeMode.DARK.labelJa to (settings.themeMode == ThemeMode.DARK)
-            )
-        ) { idx ->
-            settings.themeMode = ThemeMode.entries[idx]
-            recreate()
-        }
-
-        addDivider(settingsCard)
-        addOptionGroup(
-            settingsCard,
-            "片手モード",
-            listOf(
-                OneHandedMode.FULL.labelJa to (settings.oneHandedMode == OneHandedMode.FULL),
-                OneHandedMode.LEFT.labelJa to (settings.oneHandedMode == OneHandedMode.LEFT),
-                OneHandedMode.RIGHT.labelJa to (settings.oneHandedMode == OneHandedMode.RIGHT)
-            )
-        ) { idx ->
-            settings.oneHandedMode = OneHandedMode.entries[idx]
-        }
-
-        addDivider(settingsCard)
-        addFreeHeightControl(settingsCard)
-
-        addDivider(settingsCard)
-        addOptionGroup(
-            settingsCard,
-            "句読点スタイル",
-            listOf(
-                PunctuationStyle.JAPANESE.labelJa to (settings.punctuationStyle == PunctuationStyle.JAPANESE),
-                PunctuationStyle.WIDE_LATIN.labelJa to (settings.punctuationStyle == PunctuationStyle.WIDE_LATIN),
-                PunctuationStyle.HALF.labelJa to (settings.punctuationStyle == PunctuationStyle.HALF)
-            )
-        ) { idx ->
-            settings.punctuationStyle = PunctuationStyle.entries[idx]
-        }
-        root.addView(settingsCard)
-
-        // Section 4: User Dictionary
-        root.addView(sectionLabel("ユーザー辞書"))
-        val dictCard = makeCard()
-        val addRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(12), dp(12), dp(12), dp(10))
-        }
-        val readingInput = EditText(this).apply {
-            hint = "よみ (例: める)"
-            inputType = InputType.TYPE_CLASS_TEXT
-            setHintTextColor(cMuted)
-            setTextColor(cText)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
-            setPadding(dp(8), dp(6), dp(8), dp(6))
-            background = cardBorderBg(cSurfaceSubtle, cBorder, 5)
-            layoutParams = LinearLayout.LayoutParams(0, dp(38), 1f).apply { marginEnd = dp(6) }
-        }
-        val wordInput = EditText(this).apply {
-            hint = "単語 (例: Meltype)"
-            inputType = InputType.TYPE_CLASS_TEXT
-            setHintTextColor(cMuted)
-            setTextColor(cText)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
-            setPadding(dp(8), dp(6), dp(8), dp(6))
-            background = cardBorderBg(cSurfaceSubtle, cBorder, 5)
-            layoutParams = LinearLayout.LayoutParams(0, dp(38), 1.2f).apply { marginEnd = dp(6) }
-        }
-        val addDictBtn = makeSecondaryButton("登録").apply {
-            layoutParams = LinearLayout.LayoutParams(dp(64), dp(38))
-            setOnClickListener {
-                val r = readingInput.text.toString().trim()
-                val w = wordInput.text.toString().trim()
-                if (r.isNotEmpty() && w.isNotEmpty()) {
-                    settings.addUserDictEntry(r, w)
-                    readingInput.setText("")
-                    wordInput.setText("")
-                    renderUserDictList()
-                }
-            }
-        }
-        addRow.addView(readingInput)
-        addRow.addView(wordInput)
-        addRow.addView(addDictBtn)
-        dictCard.addView(addRow)
-
-        userDictContainer = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-        }
-        dictCard.addView(userDictContainer)
-        root.addView(dictCard)
-
-        renderUserDictList()
-
         val outer = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(cPage)
@@ -383,12 +182,155 @@ class MainActivity : AppCompatActivity() {
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT
             )
-            addView(scroll)
         }
+
+        // Architectural Quiet Header Bar (52dp)
+        val topBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setBackgroundColor(cSurface)
+            setPadding(dp(14), dp(8), dp(14), dp(8))
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(54))
+        }
+
+        topBar.addView(MeltypeLogoMarkView().apply {
+            layoutParams = LinearLayout.LayoutParams(dp(28), dp(28)).apply { marginEnd = dp(10) }
+        })
+
+        val titleRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        titleRow.addView(TextView(this).apply {
+            text = "Meltype"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 17.5f)
+            setTypeface(null, Typeface.BOLD)
+            setTextColor(cText)
+        })
+        titleRow.addView(TextView(this).apply {
+            text = "v${BuildConfig.VERSION_NAME}"
+            typeface = Typeface.MONOSPACE
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.5f)
+            setTextColor(cMuted)
+            setPadding(dp(6), dp(2), dp(6), dp(2))
+            background = boxBg(cSurfaceSubtle, cBorder, 4)
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { marginStart = dp(8) }
+        })
+        topBar.addView(titleRow)
+
+        headerStatusPill = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(10), dp(6), dp(10), dp(6))
+            background = boxBg(cSurfaceSubtle, cBorder, 5)
+            setOnClickListener { handleImeStatusAction() }
+        }
+        headerStatusDot = View(this).apply {
+            layoutParams = LinearLayout.LayoutParams(dp(7), dp(7)).apply { marginEnd = dp(6) }
+        }
+        headerStatusText = TextView(this).apply {
+            text = "確認中"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setTypeface(null, Typeface.BOLD)
+            setTextColor(cText)
+        }
+        headerStatusPill.addView(headerStatusDot)
+        headerStatusPill.addView(headerStatusText)
+        topBar.addView(headerStatusPill)
+        outer.addView(topBar)
+        outer.addView(hairline())
+
+        // Conditional Setup Onboarding Bar (collapses completely once enabled & active)
+        setupStrip = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setBackgroundColor(cAccentTint)
+            setPadding(dp(14), dp(8), dp(14), dp(8))
+            visibility = View.GONE
+        }
+        setupHintText = TextView(this).apply {
+            text = "Meltype を有効化して既定のキーボードに設定してください"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setTextColor(cText)
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                marginEnd = dp(8)
+            }
+        }
+        setupEnableBtn = makeCompactChip("1. 有効化", filled = true) {
+            startActivity(Intent(Settings.ACTION_INPUT_METHOD_SETTINGS))
+        }.apply {
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(30)).apply {
+                marginEnd = dp(6)
+            }
+        }
+        setupSwitchBtn = makeCompactChip("2. 切替", filled = false) {
+            val imm = getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager
+            imm.showInputMethodPicker()
+        }.apply {
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(30))
+        }
+        setupStrip.addView(setupHintText)
+        setupStrip.addView(setupEnableBtn)
+        setupStrip.addView(setupSwitchBtn)
+        outer.addView(setupStrip)
+
+        // Precision 3-Segment Workspace Switcher Rail
+        val railBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setBackgroundColor(cRail)
+            setPadding(dp(10), dp(6), dp(10), dp(6))
+        }
+        tabButtons.clear()
+        for (tab in WorkspaceTab.entries) {
+            val btn = TextView(this).apply {
+                text = tab.label
+                gravity = Gravity.CENTER
+                maxLines = 1
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
+                layoutParams = LinearLayout.LayoutParams(0, dp(34), 1f).apply {
+                    if (tab.ordinal < WorkspaceTab.entries.lastIndex) marginEnd = dp(4)
+                }
+                setOnClickListener { switchWorkspace(tab) }
+            }
+            tabButtons.add(btn)
+            railBar.addView(btn)
+        }
+        outer.addView(railBar)
+        outer.addView(hairline())
+
+        // Main Workspace Scroll Viewport
+        rootScroll = ScrollView(this).apply {
+            setBackgroundColor(cPage)
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
+        }
+        val workspaceHost = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(14), dp(12), dp(14), dp(24))
+        }
+        rootScroll.addView(workspaceHost)
+        outer.addView(rootScroll)
+
+        workspaceContainers.clear()
+        val studioPane = buildStudioWorkspace()
+        val layoutPane = buildLayoutWorkspace()
+        val lexiconPane = buildLexiconWorkspace()
+        workspaceContainers.addAll(listOf(studioPane, layoutPane, lexiconPane))
+        for (pane in workspaceContainers) {
+            workspaceHost.addView(pane)
+        }
+
+        switchWorkspace(activeTab)
+        refreshSystemStatus()
+
         ViewCompat.setOnApplyWindowInsetsListener(outer) { v, insets ->
             val sys = insets.getInsets(WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout())
             v.setPadding(sys.left, sys.top, sys.right, 0)
-            root.setPadding(dp(16), dp(14), dp(16), dp(28) + sys.bottom)
+            workspaceHost.setPadding(dp(14), dp(12), dp(14), dp(24) + sys.bottom)
             insets
         }
         setContentView(outer)
@@ -398,17 +340,539 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun buildStudioWorkspace(): LinearLayout {
+        val pane = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        }
+
+        // 1. Live Conversion & Typo Repair Sandbox
+        val sandboxCard = makePanelFrame()
+        val sandboxHead = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(12), dp(10), dp(12), dp(6))
+        }
+        sandboxHead.addView(microHeading("LIVE CONVERSION SANDBOX").apply {
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        })
+        sandboxHead.addView(TextView(this).apply {
+            text = "消去"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+            setTextColor(cMuted)
+            setPadding(dp(8), dp(2), dp(4), dp(2))
+            setOnClickListener {
+                sandboxInput.setText("")
+                probeResultBanner.visibility = View.GONE
+            }
+        })
+        sandboxCard.addView(sandboxHead)
+
+        sandboxInput = EditText(this).apply {
+            hint = "ここをタップして文字キーのタップやグライド入力を試せます"
+            setHintTextColor(cFaint)
+            setTextColor(cText)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14.5f)
+            minLines = 2
+            gravity = Gravity.TOP or Gravity.START
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            background = boxBg(cSurfaceSubtle, cBorder, 5)
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                setMargins(dp(12), 0, dp(12), dp(8))
+            }
+            addTextChangedListener(object : TextWatcher {
+                override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+                override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+                override fun afterTextChanged(s: Editable?) {
+                    val raw = s?.toString()?.trim().orEmpty()
+                    if (raw.isEmpty()) {
+                        probeResultBanner.visibility = View.GONE
+                    }
+                }
+            })
+        }
+        sandboxCard.addView(sandboxInput)
+
+        // 1-tap sample probes to showcase live Japanese/English conversion + typo correction
+        val sampleScroll = HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+            setPadding(dp(12), 0, dp(12), dp(10))
+        }
+        val sampleRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val probes = listOf(
+            "onegaishimsu" to "誤字: onegaishimsu",
+            "arigatoi " to "隣接: arigatoi",
+            "shumire-shon" to "誤綴: shumire-shon",
+            "kyouhagoogledekensaku" to "日英混在: kyouha+google",
+            "128*16" to "計算: 128*16"
+        )
+        for ((input, label) in probes) {
+            val chip = TextView(this).apply {
+                text = label
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+                setTextColor(cMuted)
+                gravity = Gravity.CENTER
+                setPadding(dp(9), dp(5), dp(9), dp(5))
+                background = boxBg(cSurfaceSubtle, cBorder, 4)
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    dp(28)
+                ).apply { marginEnd = dp(6) }
+                setOnClickListener { runSandboxProbe(input) }
+            }
+            sampleRow.addView(chip)
+        }
+        sampleScroll.addView(sampleRow)
+        sandboxCard.addView(sampleScroll)
+
+        probeResultBanner = TextView(this).apply {
+            visibility = View.GONE
+            typeface = Typeface.MONOSPACE
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setTextColor(cAccent)
+            setBackgroundColor(cAccentTint)
+            setPadding(dp(12), dp(8), dp(12), dp(8))
+        }
+        sandboxCard.addView(probeResultBanner)
+        pane.addView(sandboxCard)
+
+        // 2. Interactive Glide Trace Lab
+        val labCard = makePanelFrame().apply {
+            (layoutParams as LinearLayout.LayoutParams).topMargin = dp(12)
+        }
+        val labHead = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(12), dp(10), dp(12), dp(8))
+        }
+        labHead.addView(microHeading("GLIDE GEOMETRY LAB").apply {
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        })
+        labHead.addView(TextView(this).apply {
+            text = "実線デコード実験"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            setTextColor(cMuted)
+        })
+        labCard.addView(labHead)
+
+        glideLabView = GlideTraceLabView(this).apply {
+            darkTheme = isDarkPalette
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                setMargins(dp(12), 0, dp(12), dp(8))
+            }
+            onTraceSampled = { normPts, isFinal ->
+                val dec = glideDecoder
+                if (dec != null && normPts.size >= 2) {
+                    val results = dec.decode(normPts, maxResults = 3)
+                    val label = if (isFinal) "実指スワイプ解析" else "軌道を解析中..."
+                    updateResultsOnly(label, results)
+                }
+            }
+        }
+        labCard.addView(glideLabView)
+
+        val demoScroll = HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+            setPadding(dp(12), 0, dp(12), dp(12))
+        }
+        val demoRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val demoWords = listOf("watashi", "arigatou", "konichiwa", "kakuninshimasu", "google")
+        for (w in demoWords) {
+            val chip = TextView(this).apply {
+                text = "なぞる: $w"
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+                setTextColor(cText)
+                gravity = Gravity.CENTER
+                setPadding(dp(9), dp(5), dp(9), dp(5))
+                background = boxBg(cSurfaceSubtle, cBorder, 4)
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    dp(28)
+                ).apply { marginEnd = dp(6) }
+                setOnClickListener { showGlideDemo(w) }
+            }
+            demoRow.addView(chip)
+        }
+        demoScroll.addView(demoRow)
+        labCard.addView(demoScroll)
+        pane.addView(labCard)
+
+        // 3. Engine Telemetry & Collapsible Diagnostics Drawer
+        val diagCard = makePanelFrame().apply {
+            (layoutParams as LinearLayout.LayoutParams).topMargin = dp(12)
+        }
+        val diagHeader = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+        }
+        val diagInfo = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                marginEnd = dp(8)
+            }
+        }
+        val statusRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        selfTestBadgeDot = View(this).apply {
+            layoutParams = LinearLayout.LayoutParams(dp(7), dp(7)).apply { marginEnd = dp(6) }
+            background = circleDrawable(cMuted)
+        }
+        selfTestBadgeText = TextView(this).apply {
+            text = "エンジン準備中..."
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            setTypeface(null, Typeface.BOLD)
+            setTextColor(cText)
+        }
+        statusRow.addView(selfTestBadgeDot)
+        statusRow.addView(selfTestBadgeText)
+        diagInfo.addView(statusRow)
+
+        engineSpecLabel = TextView(this).apply {
+            text = "Mozc · 辞書ロード中..."
+            typeface = Typeface.MONOSPACE
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            setTextColor(cMuted)
+            setPadding(0, dp(2), 0, 0)
+        }
+        diagInfo.addView(engineSpecLabel)
+        diagHeader.addView(diagInfo)
+
+        val runTestBtn = makeCompactChip("検証実行", filled = false) {
+            selfTestBadgeText.text = "検証中..."
+            selfTestBadgeDot.background = circleDrawable(cAccent)
+            executor.execute { runEngineSelfTest(writeFile = false) }
+        }.apply {
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(30)).apply {
+                marginEnd = dp(6)
+            }
+        }
+        selfTestToggleBtn = makeCompactChip("詳細 ▾", filled = false) {
+            logExpanded = !logExpanded
+            syncSelfTestDrawerVisibility()
+        }.apply {
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(30))
+        }
+        diagHeader.addView(runTestBtn)
+        diagHeader.addView(selfTestToggleBtn)
+        diagCard.addView(diagHeader)
+
+        selfTestLogDrawer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+        }
+        selfTestLogDrawer.addView(hairline())
+        selfTestLogView = TextView(this).apply {
+            text = "待機中"
+            typeface = Typeface.MONOSPACE
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            setTextColor(cMuted)
+            setPadding(dp(12), dp(10), dp(12), dp(12))
+        }
+        selfTestLogDrawer.addView(selfTestLogView)
+        diagCard.addView(selfTestLogDrawer)
+        pane.addView(diagCard)
+
+        return pane
+    }
+
+    private fun buildLayoutWorkspace(): LinearLayout {
+        val pane = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        }
+
+        // 1. Real-Time Proportional Keyboard Blueprint + Free Height Control
+        val previewCard = makePanelFrame()
+        val pHead = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(12), dp(10), dp(12), dp(6))
+        }
+        pHead.addView(microHeading("PROPORTIONAL BLUEPRINT").apply {
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        })
+        previewCard.addView(pHead)
+
+        blueprintView = KeyboardBlueprintView(this).apply {
+            previewDark = isDarkPalette
+            heightScale = settings.keyboardHeightScale
+            showNumberRow = settings.showNumberRow
+            showSubLabels = settings.showSubLabels
+            oneHandedMode = settings.oneHandedMode
+            punctuationStyle = settings.punctuationStyle
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { setMargins(dp(12), 0, dp(12), dp(6)) }
+        }
+        previewCard.addView(blueprintView)
+        addFreeHeightControl(previewCard)
+        pane.addView(previewCard)
+
+        // 2. Segmented Appearance & Mode Controls
+        val modeCard = makePanelFrame().apply {
+            (layoutParams as LinearLayout.LayoutParams).topMargin = dp(12)
+        }
+        addOptionGroup(
+            modeCard,
+            "外観テーマ",
+            listOf(
+                "自動" to (settings.themeMode == ThemeMode.SYSTEM),
+                "ライト" to (settings.themeMode == ThemeMode.LIGHT),
+                "ダーク" to (settings.themeMode == ThemeMode.DARK)
+            )
+        ) { idx ->
+            settings.themeMode = ThemeMode.entries[idx]
+            recreate()
+        }
+        modeCard.addView(hairline())
+        addOptionGroup(
+            modeCard,
+            "片手配置",
+            listOf(
+                OneHandedMode.FULL.labelJa to (settings.oneHandedMode == OneHandedMode.FULL),
+                OneHandedMode.LEFT.labelJa to (settings.oneHandedMode == OneHandedMode.LEFT),
+                OneHandedMode.RIGHT.labelJa to (settings.oneHandedMode == OneHandedMode.RIGHT)
+            )
+        ) { idx ->
+            val mode = OneHandedMode.entries[idx]
+            settings.oneHandedMode = mode
+            blueprintView.oneHandedMode = mode
+        }
+        modeCard.addView(hairline())
+        addOptionGroup(
+            modeCard,
+            "句読点スタイル",
+            listOf(
+                PunctuationStyle.JAPANESE.labelJa to (settings.punctuationStyle == PunctuationStyle.JAPANESE),
+                PunctuationStyle.WIDE_LATIN.labelJa to (settings.punctuationStyle == PunctuationStyle.WIDE_LATIN),
+                PunctuationStyle.HALF.labelJa to (settings.punctuationStyle == PunctuationStyle.HALF)
+            )
+        ) { idx ->
+            val style = PunctuationStyle.entries[idx]
+            settings.punctuationStyle = style
+            blueprintView.punctuationStyle = style
+        }
+        pane.addView(modeCard)
+
+        // 3. Engine & Key Interaction Switch Matrix
+        val switchCard = makePanelFrame().apply {
+            (layoutParams as LinearLayout.LayoutParams).topMargin = dp(12)
+        }
+        switchCard.addView(microHeading("INPUT & KEY BEHAVIOUR").apply {
+            setPadding(dp(12), dp(10), dp(12), dp(4))
+        })
+        addSwitchRow(switchCard, "グライド入力（スワイプ入力）", "QWERTYキー上を滑らせて日英単語をデコード", settings.glideEnabled) {
+            settings.glideEnabled = it
+        }
+        switchCard.addView(hairline())
+        addSwitchRow(switchCard, "ローマ字ミスタイプ自動補正", "打鍵ミス・隣接誤打・mb/mp→ん・カタカナ誤綴りを補正", settings.typoCorrectionEnabled) {
+            settings.typoCorrectionEnabled = it
+        }
+        switchCard.addView(hairline())
+        addSwitchRow(switchCard, "数字段（1〜0）を常時表示", "最上段に1〜0列を固定（3段グライド領域と分離）", settings.showNumberRow) {
+            settings.showNumberRow = it
+            blueprintView.showNumberRow = it
+        }
+        switchCard.addView(hairline())
+        addSwitchRow(switchCard, "キー右上の数字・記号ヒントを表示", "0.22秒長押し・縦フリックで数字と記号を入力", settings.showSubLabels) {
+            settings.showSubLabels = it
+            blueprintView.showSubLabels = it
+        }
+        switchCard.addView(hairline())
+        addSwitchRow(switchCard, "記号入力後に文字キーへ自動復帰", "?123から1文字入力した直後にQWERTYへ戻る", settings.autoReturnFromSymbols) {
+            settings.autoReturnFromSymbols = it
+        }
+        switchCard.addView(hairline())
+        addSwitchRow(switchCard, "句読点（。、）で自動確定", "文末記号の入力と同時に現在の変換を確定", settings.autoCommitOnPunctuation) {
+            settings.autoCommitOnPunctuation = it
+        }
+        switchCard.addView(hairline())
+        addSwitchRow(switchCard, "キータップ時の振動フィードバック", "打鍵とカーソルキー操作で短く振動", settings.hapticFeedback) {
+            settings.hapticFeedback = it
+        }
+        switchCard.addView(hairline())
+        addSwitchRow(switchCard, "Mozc 変換学習を有効にする", "選択した変換候補を端末内に記憶", settings.learningEnabled) {
+            settings.learningEnabled = it
+        }
+        pane.addView(switchCard)
+
+        return pane
+    }
+
+    private fun buildLexiconWorkspace(): LinearLayout {
+        val pane = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        }
+
+        // 1. User Dictionary Editor
+        val dictCard = makePanelFrame()
+        dictCard.addView(microHeading("USER DICTIONARY").apply {
+            setPadding(dp(12), dp(10), dp(12), dp(6))
+        })
+        val addRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(12), 0, dp(12), dp(10))
+        }
+        val readingInput = EditText(this).apply {
+            hint = "よみ (例: める)"
+            inputType = InputType.TYPE_CLASS_TEXT
+            setHintTextColor(cFaint)
+            setTextColor(cText)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            setPadding(dp(9), dp(6), dp(9), dp(6))
+            background = boxBg(cSurfaceSubtle, cBorder, 5)
+            layoutParams = LinearLayout.LayoutParams(0, dp(36), 1f).apply { marginEnd = dp(6) }
+        }
+        val wordInput = EditText(this).apply {
+            hint = "単語 (例: Meltype)"
+            inputType = InputType.TYPE_CLASS_TEXT
+            setHintTextColor(cFaint)
+            setTextColor(cText)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            setPadding(dp(9), dp(6), dp(9), dp(6))
+            background = boxBg(cSurfaceSubtle, cBorder, 5)
+            layoutParams = LinearLayout.LayoutParams(0, dp(36), 1.2f).apply { marginEnd = dp(6) }
+        }
+        val addDictBtn = makeCompactChip("+ 登録", filled = true) {
+            val r = readingInput.text.toString().trim()
+            val w = wordInput.text.toString().trim()
+            if (r.isNotEmpty() && w.isNotEmpty()) {
+                settings.addUserDictEntry(r, w)
+                readingInput.setText("")
+                wordInput.setText("")
+                renderUserDictList()
+            }
+        }.apply {
+            layoutParams = LinearLayout.LayoutParams(dp(64), dp(36))
+        }
+        addRow.addView(readingInput)
+        addRow.addView(wordInput)
+        addRow.addView(addDictBtn)
+        dictCard.addView(addRow)
+
+        userDictContainer = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        dictCard.addView(userDictContainer)
+        renderUserDictList()
+        pane.addView(dictCard)
+
+        // 2. Gesture & Conversion Reference Table
+        val refCard = makePanelFrame().apply {
+            (layoutParams as LinearLayout.LayoutParams).topMargin = dp(12)
+        }
+        refCard.addView(microHeading("GESTURES & ENGINE SHORTCUTS").apply {
+            setPadding(dp(12), dp(10), dp(12), dp(6))
+        })
+        val shortcuts = listOf(
+            "◀ / ▶ 長押し" to "全レイヤー最下段から高速カーソル移動",
+            "空白キー左右スライド" to "入力中は文節移動・未入力時はカーソル移動",
+            "⌫ 左スワイプ" to "入力中の文字や直前単語を一括クリア",
+            "縦フリック / 長押し" to "右上の数字・記号を切り替えなしで入力",
+            "mb / mp / mm" to "先行する m を自動的に撥音「ん」へ変換",
+            "= なしの四則演算" to "例 128*16 で候補欄に計算結果 2048 を提示",
+            "確定直後の「↩ 戻す」" to "誤確定した文字列を再び未確定の変換状態へ戻す"
+        )
+        for (item in shortcuts) {
+            refCard.addView(hairline())
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(12), dp(9), dp(12), dp(9))
+            }
+            row.addView(TextView(this).apply {
+                text = item.first
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
+                setTypeface(null, Typeface.BOLD)
+                setTextColor(cText)
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 0.95f).apply {
+                    marginEnd = dp(8)
+                }
+            })
+            row.addView(TextView(this).apply {
+                text = item.second
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                setTextColor(cMuted)
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.35f)
+            })
+            refCard.addView(row)
+        }
+        pane.addView(refCard)
+
+        return pane
+    }
+
+    private fun switchWorkspace(tab: WorkspaceTab) {
+        activeTab = tab
+        WorkspaceTab.entries.forEachIndexed { idx, item ->
+            val selected = item == tab
+            tabButtons[idx].apply {
+                setTextColor(if (selected) cText else cMuted)
+                setTypeface(null, if (selected) Typeface.BOLD else Typeface.NORMAL)
+                background = if (selected) boxBg(cSurface, cBorder, 5) else null
+            }
+            workspaceContainers[idx].visibility = if (selected) View.VISIBLE else View.GONE
+        }
+        rootScroll.scrollTo(0, 0)
+    }
+
+    private fun handleImeStatusAction() {
+        val imm = getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager
+        val enabled = imm.enabledInputMethodList.any { it.packageName == packageName }
+        if (!enabled) {
+            startActivity(Intent(Settings.ACTION_INPUT_METHOD_SETTINGS))
+        } else {
+            imm.showInputMethodPicker()
+        }
+    }
+
     private fun refreshSystemStatus() {
         val imm = getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager
         val enabled = imm.enabledInputMethodList.any { it.packageName == packageName }
         val defaultIme = Settings.Secure.getString(contentResolver, Settings.Secure.DEFAULT_INPUT_METHOD) ?: ""
         val isDefault = defaultIme.startsWith("$packageName/")
 
-        statusImeEnabledVal.text = if (enabled) "有効" else "未設定（下の1を押してください）"
-        statusImeEnabledVal.setTextColor(if (enabled) cSuccess else cWarning)
-
-        statusImeDefaultVal.text = if (isDefault) "Meltype 使用中" else "別キーボード"
-        statusImeDefaultVal.setTextColor(if (isDefault) cSuccess else cMuted)
+        if (enabled && isDefault) {
+            headerStatusDot.background = circleDrawable(cSuccess)
+            headerStatusText.text = "Meltype 使用中"
+            headerStatusText.setTextColor(cSuccess)
+            setupStrip.visibility = View.GONE
+        } else if (enabled) {
+            headerStatusDot.background = circleDrawable(cWarning)
+            headerStatusText.text = "IME切替"
+            headerStatusText.setTextColor(cWarning)
+            setupHintText.text = "ステップ2: 入力方法を Meltype に切り替えてください"
+            setupEnableBtn.visibility = View.GONE
+            setupSwitchBtn.visibility = View.VISIBLE
+            setupStrip.visibility = View.VISIBLE
+        } else {
+            headerStatusDot.background = circleDrawable(cWarning)
+            headerStatusText.text = "未有効化"
+            headerStatusText.setTextColor(cWarning)
+            setupHintText.text = "ステップ1: システム設定で Meltype を有効化してください"
+            setupEnableBtn.visibility = View.VISIBLE
+            setupSwitchBtn.visibility = View.VISIBLE
+            setupStrip.visibility = View.VISIBLE
+        }
     }
 
     private fun initEngineAsync(runSelfTest: Boolean) {
@@ -416,27 +880,95 @@ class MainActivity : AppCompatActivity() {
             val dicts = MeltypeDictionaries(AssetDictionarySource(applicationContext))
             dictionaries = dicts
             val mozcOk = MozcRuntime.ensureInitialized(applicationContext)
+            scoreEngine = ScoreEngine(dicts)
+            converter = AndroidMozcConverter(dicts)
             val decoder = GlideDecoder(dicts)
             glideDecoder = decoder
 
             runOnUiThread {
-                statusMozcVal.text = if (mozcOk) {
-                    "準備完了 (${MozcRuntime.dataVersion})"
-                } else {
-                    "フォールバック (${MozcRuntime.lastError ?: "N/A"})"
-                }
-                statusMozcVal.setTextColor(if (mozcOk) cSuccess else cWarning)
-                statusDictVal.text = "${dicts.loadedFileCount}種ロード済 / 英単語${dicts.englishAllWords.size}"
-                statusDictVal.setTextColor(cText)
+                val verStr = if (mozcOk) MozcRuntime.dataVersion else "fallback"
+                engineSpecLabel.text = "Mozc $verStr · ${dicts.loadedFileCount}辞書 / 英単語${dicts.englishAllWords.size}"
                 if (!runSelfTest) {
-                    selfTestLogView.text = "準備完了。テスト欄にそのまま入力するか、上のボタンで検証できます。"
+                    selfTestBadgeDot.background = circleDrawable(if (mozcOk) cSuccess else cWarning)
+                    selfTestBadgeText.text = if (mozcOk) "準備完了" else "フォールバック動作"
+                    selfTestLogView.text = "テスト欄に入力するか「検証実行」で32項目の自己診断を実行できます。"
                 }
+                showGlideDemo("watashi")
             }
 
             if (runSelfTest) {
                 runEngineSelfTest(writeFile = true)
             }
         }
+    }
+
+    private fun runSandboxProbe(sampleInput: String) {
+        sandboxInput.setText(sampleInput)
+        sandboxInput.setSelection(sampleInput.length)
+        executor.execute {
+            val dicts = dictionaries ?: MeltypeDictionaries(AssetDictionarySource(applicationContext)).also { dictionaries = it }
+            MozcRuntime.ensureInitialized(applicationContext)
+            val eng = scoreEngine ?: ScoreEngine(dicts).also { scoreEngine = it }
+            val conv = converter ?: AndroidMozcConverter(dicts).also { converter = it }
+            val sess = CompositionSession(dicts, eng, conv)
+            for (ch in sampleInput) sess.appendChar(ch)
+            val snap = sess.snapshot
+            val clausesText = snap.clauses.joinToString(" | ") { it.text }
+            val topCand = snap.candidates.firstOrNull()?.text.orEmpty()
+            val outShown = if (clausesText.isNotEmpty()) clausesText else topCand
+            runOnUiThread {
+                probeResultBanner.visibility = View.VISIBLE
+                probeResultBanner.text = "入力: $sampleInput\n変換: $outShown"
+            }
+        }
+    }
+
+    private fun showGlideDemo(word: String) {
+        val trace = buildHumanTrace(word, scale = 0.94f, dx = 0.0f, dy = 0.0f)
+        val dec = glideDecoder
+        if (dec != null) {
+            val res = dec.decode(trace, maxResults = 3)
+            glideLabView.setDecodedState("例: $word", trace, res, highlightWord = word)
+        } else {
+            glideLabView.setDecodedState("辞書準備中: $word", trace, emptyList(), highlightWord = word)
+        }
+    }
+
+    private fun buildHumanTrace(word: String, scale: Float, dx: Float, dy: Float): List<TouchPoint> {
+        val centers = word.mapNotNull { KeyLayoutGeometry.centerOf(it) }
+        if (centers.size <= 1) return centers.map { TouchPoint(it.x, it.y) }
+        val rounded = ArrayList<TouchPoint>(centers.size)
+        rounded.add(TouchPoint(centers.first().x, centers.first().y))
+        for (i in 1 until centers.lastIndex) {
+            val p = centers[i - 1]
+            val c = centers[i]
+            val n = centers[i + 1]
+            val mx = (p.x + n.x) * 0.5f
+            val my = (p.y + n.y) * 0.5f
+            rounded.add(TouchPoint(c.x + (mx - c.x) * 0.24f, c.y + (my - c.y) * 0.24f))
+        }
+        rounded.add(TouchPoint(centers.last().x, centers.last().y))
+        val cx = rounded.map { it.x }.average().toFloat()
+        val cy = rounded.map { it.y }.average().toFloat()
+        val scaled = rounded.map {
+            TouchPoint(cx + (it.x - cx) * scale + dx, cy + (it.y - cy) * scale + dy)
+        }
+        val dense = ArrayList<TouchPoint>()
+        for (i in 0 until scaled.lastIndex) {
+            val a = scaled[i]
+            val b = scaled[i + 1]
+            for (step in 0 until 4) {
+                val t = step / 4f
+                dense.add(TouchPoint(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t))
+            }
+        }
+        dense.add(scaled.last())
+        return dense
+    }
+
+    private fun syncSelfTestDrawerVisibility() {
+        selfTestLogDrawer.visibility = if (logExpanded) View.VISIBLE else View.GONE
+        selfTestToggleBtn.text = if (logExpanded) "閉じる ▴" else "詳細 ▾"
     }
 
     private fun runEngineSelfTest(writeFile: Boolean) {
@@ -448,16 +980,18 @@ class MainActivity : AppCompatActivity() {
 
         val sb = StringBuilder()
         var allPassed = true
+        var passCount = 0
+        var totalCount = 0
 
         fun check(label: String, condition: Boolean, detail: String) {
-            if (!condition) allPassed = false
+            totalCount++
+            if (condition) passCount++ else allPassed = false
             sb.append(if (condition) "[PASS] " else "[FAIL] ")
                 .append(label).append(": ").append(detail).append('\n')
         }
 
         check("MozcRuntime", mozcOk && MozcRuntime.dataVersion.isNotEmpty(), "version=${MozcRuntime.dataVersion} err=${MozcRuntime.lastError}")
 
-        // 1. Live mixed JP/EN conversion tests using real Mozc JNI
         val convCases = listOf(
             "kyouhagoogledekensaku" to "google",
             "ashitanomeetingwotsuika" to "meeting",
@@ -471,7 +1005,6 @@ class MainActivity : AppCompatActivity() {
             check("LiveConvert($input)", ok, out)
         }
 
-        // 2. Dual-language glide decoding tests (Hebon + Kunrei + inflected Japanese + English)
         val glideWords = listOf(
             "google" to "google",
             "meeting" to "meeting",
@@ -495,7 +1028,6 @@ class MainActivity : AppCompatActivity() {
             check("Glide($traceWord->$expectOut)", hit, "top3=$top3")
         }
 
-        // 3. Glide + Live conversion combined flow ("kyouha" glide -> "google" glide -> "dekensaku" tap)
         val combo = CompositionSession(dicts, engine, converter)
         val g1 = decoder.decode(KeyLayoutGeometry.syntheticPathForWord("kyouha")).firstOrNull()?.word ?: "kyouha"
         val g2 = decoder.decode(KeyLayoutGeometry.syntheticPathForWord("google")).firstOrNull()?.word ?: "google"
@@ -505,7 +1037,6 @@ class MainActivity : AppCompatActivity() {
         val comboText = combo.snapshot.previewText
         check("GlideCombo(kyouha+google+dekensaku)", comboText.contains("google") && comboText.length >= 8, comboText)
 
-        // 4. 1-tap glide undo + Clause resize tests
         val undoSession = CompositionSession(dicts, engine, converter)
         undoSession.appendGlideResult("watashi", false, listOf("watashi" to false))
         val beforeUndoLen = undoSession.snapshot.rawInput.length
@@ -521,7 +1052,6 @@ class MainActivity : AppCompatActivity() {
         val shrunkSnap = resizeSession.resizeFocusedClause(-1)
         check("ClauseResize", shrunkSnap.clauses.isNotEmpty() && initClauses.isNotEmpty(), "before=${initClauses.map { it.reading }} after=${shrunkSnap.clauses.map { it.reading }}")
 
-        // 5. Free keyboard height scale bounds check (non-destructive)
         val savedScale = settings.keyboardHeightScale
         settings.keyboardHeightScale = 0.72f
         val lowOk = kotlin.math.abs(settings.keyboardHeightScale - 0.72f) < 0.01f
@@ -530,7 +1060,6 @@ class MainActivity : AppCompatActivity() {
         settings.keyboardHeightScale = savedScale
         check("FreeHeightScale", lowOk && highOk, "range=0.65..1.55")
 
-        // 6. Romaji typo tolerance, misspellings & bilabial m ("mb"/"mp"/"mm" -> ん)
         val typoCases = listOf(
             "onegaishimsu" to listOf("お願いします", "おねがいします"),
             "sumimasne" to listOf("すみません"),
@@ -564,38 +1093,6 @@ class MainActivity : AppCompatActivity() {
             "prev='$mPrev' cands=${mCands.take(4)}"
         )
 
-        // 7. Biomechanically curved/undershot/shifted Japanese glide + compound suffix split
-        fun buildHumanTrace(word: String, scale: Float, dx: Float, dy: Float): List<io.github.sp9r.meltype.glide.TouchPoint> {
-            val centers = word.mapNotNull { KeyLayoutGeometry.centerOf(it) }
-            if (centers.size <= 1) return centers.map { io.github.sp9r.meltype.glide.TouchPoint(it.x, it.y) }
-            val rounded = ArrayList<io.github.sp9r.meltype.glide.TouchPoint>(centers.size)
-            rounded.add(io.github.sp9r.meltype.glide.TouchPoint(centers.first().x, centers.first().y))
-            for (i in 1 until centers.lastIndex) {
-                val p = centers[i - 1]
-                val c = centers[i]
-                val n = centers[i + 1]
-                val mx = (p.x + n.x) * 0.5f
-                val my = (p.y + n.y) * 0.5f
-                rounded.add(io.github.sp9r.meltype.glide.TouchPoint(c.x + (mx - c.x) * 0.24f, c.y + (my - c.y) * 0.24f))
-            }
-            rounded.add(io.github.sp9r.meltype.glide.TouchPoint(centers.last().x, centers.last().y))
-            val cx = rounded.map { it.x }.average().toFloat()
-            val cy = rounded.map { it.y }.average().toFloat()
-            val scaled = rounded.map {
-                io.github.sp9r.meltype.glide.TouchPoint(cx + (it.x - cx) * scale + dx, cy + (it.y - cy) * scale + dy)
-            }
-            val dense = ArrayList<io.github.sp9r.meltype.glide.TouchPoint>()
-            for (i in 0 until scaled.lastIndex) {
-                val a = scaled[i]
-                val b = scaled[i + 1]
-                for (step in 0 until 4) {
-                    val t = step / 4f
-                    dense.add(io.github.sp9r.meltype.glide.TouchPoint(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t))
-                }
-            }
-            dense.add(scaled.last())
-            return dense
-        }
         val curvedGlideCases = listOf(
             "watashi" to "watashi",
             "arigatou" to "arigatou",
@@ -608,7 +1105,6 @@ class MainActivity : AppCompatActivity() {
             check("HumanGlide($trace->$want)", want in top5.take(3), "top5=$top5")
         }
 
-        // 8. Calculator (without '=') + Commit Undo restore
         check("BareCalc(128*16)", io.github.sp9r.meltype.core.UtilityConverter.evaluateCalculator("128*16") == "2048", "eval=2048")
         val uCommitSess = CompositionSession(dicts, engine, converter)
         uCommitSess.appendText("kyou")
@@ -622,8 +1118,14 @@ class MainActivity : AppCompatActivity() {
             File(filesDir, "selftest.txt").writeText(report, Charsets.UTF_8)
         }
         runOnUiThread {
+            selfTestBadgeDot.background = circleDrawable(if (allPassed) cSuccess else cWarning)
+            selfTestBadgeText.text = if (allPassed) "自己診断 ${passCount}/${totalCount} PASS" else "一部失敗 ${passCount}/${totalCount}"
             selfTestLogView.setTextColor(if (allPassed) cSuccess else cWarning)
             selfTestLogView.text = report.trimEnd()
+            if (!allPassed || !writeFile) {
+                logExpanded = true
+                syncSelfTestDrawerVisibility()
+            }
         }
     }
 
@@ -631,16 +1133,17 @@ class MainActivity : AppCompatActivity() {
         userDictContainer.removeAllViews()
         val entries = settings.getUserDictionary()
         if (entries.isEmpty()) {
+            userDictContainer.addView(hairline())
             userDictContainer.addView(TextView(this).apply {
                 text = "登録された単語はありません"
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
                 setTextColor(cMuted)
-                setPadding(dp(12), dp(4), dp(12), dp(12))
+                setPadding(dp(12), dp(12), dp(12), dp(12))
             })
             return
         }
         for (entry in entries) {
-            addDivider(userDictContainer)
+            userDictContainer.addView(hairline())
             val row = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
@@ -652,20 +1155,21 @@ class MainActivity : AppCompatActivity() {
             }
             labelCol.addView(TextView(this).apply {
                 text = entry.word
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f)
+                setTypeface(null, Typeface.BOLD)
                 setTextColor(cText)
             })
             labelCol.addView(TextView(this).apply {
                 text = entry.reading
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                typeface = Typeface.MONOSPACE
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
                 setTextColor(cMuted)
             })
-            val delBtn = makeSecondaryButton("削除").apply {
-                layoutParams = LinearLayout.LayoutParams(dp(64), dp(32))
-                setOnClickListener {
-                    settings.removeUserDictEntry(entry.reading, entry.word)
-                    renderUserDictList()
-                }
+            val delBtn = makeCompactChip("削除", filled = false) {
+                settings.removeUserDictEntry(entry.reading, entry.word)
+                renderUserDictList()
+            }.apply {
+                layoutParams = LinearLayout.LayoutParams(dp(60), dp(30))
             }
             row.addView(labelCol)
             row.addView(delBtn)
@@ -673,22 +1177,12 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // --- Compact Rail UI Helpers ---
+    // --- Compact Rail Precision Components ---
 
-    private fun sectionLabel(title: String): TextView {
-        return TextView(this).apply {
-            text = title
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
-            setTypeface(null, Typeface.BOLD)
-            setTextColor(cMuted)
-            setPadding(dp(2), dp(14), dp(2), dp(6))
-        }
-    }
-
-    private fun makeCard(): LinearLayout {
+    private fun makePanelFrame(): LinearLayout {
         return LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            background = cardBorderBg(cSurface, cBorder, 6)
+            background = boxBg(cSurface, cBorder, 6)
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
@@ -696,27 +1190,15 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun addStatusRow(parent: LinearLayout, label: String, initialValue: String): TextView {
-        val row = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(12), dp(10), dp(12), dp(10))
-        }
-        val lbl = TextView(this).apply {
+    private fun microHeading(label: String): TextView {
+        return TextView(this).apply {
             text = label
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f)
-            setTextColor(cText)
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-        }
-        val valView = TextView(this).apply {
-            text = initialValue
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            typeface = Typeface.MONOSPACE
+            letterSpacing = 0.05f
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.5f)
+            setTypeface(typeface, Typeface.BOLD)
             setTextColor(cMuted)
         }
-        row.addView(lbl)
-        row.addView(valView)
-        parent.addView(row)
-        return valView
     }
 
     private fun addSwitchRow(
@@ -734,22 +1216,32 @@ class MainActivity : AppCompatActivity() {
         val col = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-            setPadding(0, 0, dp(8), 0)
+            setPadding(0, 0, dp(10), 0)
         }
         col.addView(TextView(this).apply {
             text = title
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f)
+            setTypeface(null, Typeface.BOLD)
             setTextColor(cText)
         })
         col.addView(TextView(this).apply {
             text = subtitle
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
             setTextColor(cMuted)
         })
-        val sw = Switch(this).apply {
+        val sw = SwitchCompat(this).apply {
             isChecked = initial
+            trackTintList = ColorStateList(
+                arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()),
+                intArrayOf(cAccent, cBorderStrong)
+            )
+            thumbTintList = ColorStateList(
+                arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()),
+                intArrayOf(Color.WHITE, cSurface)
+            )
             setOnCheckedChangeListener { _, checked -> onToggle(checked) }
         }
+        row.setOnClickListener { sw.toggle() }
         row.addView(col)
         row.addView(sw)
         parent.addView(row)
@@ -767,18 +1259,24 @@ class MainActivity : AppCompatActivity() {
         }
         container.addView(TextView(this).apply {
             text = title
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            setTypeface(null, Typeface.BOLD)
             setTextColor(cText)
-            setPadding(0, 0, 0, dp(6))
+            setPadding(0, 0, 0, dp(8))
         })
-        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val rail = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            background = boxBg(cRail, cBorder, 6)
+            setPadding(dp(3), dp(3), dp(3), dp(3))
+        }
         val buttons = ArrayList<TextView>(options.size)
 
         fun applySelection(selectedIdx: Int) {
             buttons.forEachIndexed { idx, tv ->
                 val sel = idx == selectedIdx
-                tv.setTextColor(if (sel) cPrimaryText else cText)
-                tv.background = cardBorderBg(if (sel) cPrimary else cSurfaceSubtle, if (sel) cPrimary else cBorder, 5)
+                tv.setTextColor(if (sel) cText else cMuted)
+                tv.setTypeface(null, if (sel) Typeface.BOLD else Typeface.NORMAL)
+                tv.background = if (sel) boxBg(cSurface, cBorder, 4) else null
             }
         }
 
@@ -787,9 +1285,8 @@ class MainActivity : AppCompatActivity() {
                 text = label
                 gravity = Gravity.CENTER
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
-                setPadding(dp(8), dp(8), dp(8), dp(8))
-                layoutParams = LinearLayout.LayoutParams(0, dp(36), 1f).apply {
-                    if (idx < options.lastIndex) marginEnd = dp(6)
+                layoutParams = LinearLayout.LayoutParams(0, dp(32), 1f).apply {
+                    if (idx < options.lastIndex) marginEnd = dp(3)
                 }
                 setOnClickListener {
                     applySelection(idx)
@@ -797,18 +1294,17 @@ class MainActivity : AppCompatActivity() {
                 }
             }
             buttons.add(btn)
-            row.addView(btn)
+            rail.addView(btn)
         }
-        val initIdx = options.indexOfFirst { it.second }.coerceAtLeast(0)
-        applySelection(initIdx)
-        container.addView(row)
+        applySelection(options.indexOfFirst { it.second }.coerceAtLeast(0))
+        container.addView(rail)
         parent.addView(container)
     }
 
     private fun addFreeHeightControl(parent: LinearLayout) {
         val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(12), dp(10), dp(12), dp(12))
+            setPadding(dp(12), dp(6), dp(12), dp(12))
         }
         val topRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -816,21 +1312,25 @@ class MainActivity : AppCompatActivity() {
             setPadding(0, 0, 0, dp(4))
         }
         topRow.addView(TextView(this).apply {
-            text = "キーボード高さ（自由調整）"
+            text = "高さスケール"
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f)
+            setTypeface(null, Typeface.BOLD)
             setTextColor(cText)
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         })
         val valueLabel = TextView(this).apply {
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
-            setTypeface(null, Typeface.BOLD)
+            typeface = Typeface.MONOSPACE
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
+            setTypeface(typeface, Typeface.BOLD)
             setTextColor(cAccent)
         }
         topRow.addView(valueLabel)
         container.addView(topRow)
 
         val seekBar = SeekBar(this).apply {
-            max = 90 // 65% .. 155%
+            max = 90
+            progressTintList = ColorStateList.valueOf(cAccent)
+            thumbTintList = ColorStateList.valueOf(cAccent)
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
@@ -843,7 +1343,8 @@ class MainActivity : AppCompatActivity() {
             val pct = (scale * 100f).roundToInt().coerceIn(65, 155)
             val baseDp = if (settings.showNumberRow) 252f else 224f
             val approxDp = (baseDp * scale).roundToInt()
-            valueLabel.text = "${pct}% (約${approxDp}dp)"
+            valueLabel.text = "${pct}% · ${approxDp}dp"
+            blueprintView.heightScale = scale
             if (updateSeek) {
                 val targetProg = (pct - 65).coerceIn(0, 90)
                 if (seekBar.progress != targetProg) {
@@ -870,20 +1371,21 @@ class MainActivity : AppCompatActivity() {
             setPadding(0, dp(2), 0, 0)
         }
         val stepSpecs = listOf(
-            "-5%" to { (settings.keyboardHeightScale - 0.05f) },
-            "-1%" to { (settings.keyboardHeightScale - 0.01f) },
+            "-5%" to { settings.keyboardHeightScale - 0.05f },
+            "-1%" to { settings.keyboardHeightScale - 0.01f },
             "100%" to { 1.0f },
-            "+1%" to { (settings.keyboardHeightScale + 0.01f) },
-            "+5%" to { (settings.keyboardHeightScale + 0.05f) }
+            "+1%" to { settings.keyboardHeightScale + 0.01f },
+            "+5%" to { settings.keyboardHeightScale + 0.05f }
         )
         stepSpecs.forEachIndexed { idx, (label, calc) ->
             val btn = TextView(this).apply {
                 text = label
                 gravity = Gravity.CENTER
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                typeface = Typeface.MONOSPACE
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
                 setTextColor(cText)
-                background = cardBorderBg(cSurfaceSubtle, cBorder, 5)
-                layoutParams = LinearLayout.LayoutParams(0, dp(34), 1f).apply {
+                background = boxBg(cSurfaceSubtle, cBorder, 4)
+                layoutParams = LinearLayout.LayoutParams(0, dp(32), 1f).apply {
                     if (idx < stepSpecs.lastIndex) marginEnd = dp(5)
                 }
                 setOnClickListener {
@@ -900,40 +1402,29 @@ class MainActivity : AppCompatActivity() {
         updatingProgrammatically = true
         updateUiFromScale(settings.keyboardHeightScale, updateSeek = true)
         updatingProgrammatically = false
-
         parent.addView(container)
     }
 
-    private fun makePrimaryButton(label: String): Button {
-        return Button(this).apply {
+    private fun makeCompactChip(label: String, filled: Boolean, onClick: () -> Unit): TextView {
+        return TextView(this).apply {
             text = label
-            isAllCaps = false
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
-            setTextColor(cPrimaryText)
-            background = cardBorderBg(cPrimary, cPrimary, 5)
-            stateListAnimator = null
+            gravity = Gravity.CENTER
+            maxLines = 1
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setTypeface(null, if (filled) Typeface.BOLD else Typeface.NORMAL)
+            setTextColor(if (filled) cPrimaryText else cText)
+            setPadding(dp(10), 0, dp(10), 0)
+            background = boxBg(if (filled) cPrimary else cSurface, if (filled) cPrimary else cBorder, 5)
+            setOnClickListener { onClick() }
         }
     }
 
-    private fun makeSecondaryButton(label: String): Button {
-        return Button(this).apply {
-            text = label
-            isAllCaps = false
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
-            setTextColor(cText)
-            background = cardBorderBg(cSurface, cBorder, 5)
-            stateListAnimator = null
-        }
+    private fun hairline(): View = View(this).apply {
+        setBackgroundColor(cBorder)
+        layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(1))
     }
 
-    private fun addDivider(parent: LinearLayout) {
-        parent.addView(View(this).apply {
-            setBackgroundColor(cBorder)
-            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(1))
-        })
-    }
-
-    private fun cardBorderBg(fill: Int, stroke: Int, radiusDp: Int): GradientDrawable {
+    private fun boxBg(fill: Int, stroke: Int, radiusDp: Int): GradientDrawable {
         return GradientDrawable().apply {
             setColor(fill)
             cornerRadius = dp(radiusDp).toFloat()
@@ -941,5 +1432,52 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun circleDrawable(color: Int): GradientDrawable {
+        return GradientDrawable().apply {
+            shape = GradientDrawable.OVAL
+            setColor(color)
+        }
+    }
+
+    private inner class MeltypeLogoMarkView : View(this@MainActivity) {
+        private val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+        private val strokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
+        private val glyphPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeCap = Paint.Cap.ROUND
+            strokeJoin = Paint.Join.ROUND
+        }
+        private val glyphPath = Path()
+
+        override fun onDraw(canvas: Canvas) {
+            val d = resources.displayMetrics.density
+            val r = 5f * d
+            bgPaint.color = cPrimary
+            canvas.drawRoundRect(0f, 0f, width.toFloat(), height.toFloat(), r, r, bgPaint)
+            strokePaint.color = cBorderStrong
+            strokePaint.strokeWidth = 0.8f * d
+            canvas.drawRoundRect(0.4f * d, 0.4f * d, width - 0.4f * d, height - 0.4f * d, r, r, strokePaint)
+
+            // Crisp M-shaped glide curve inside keycap mark
+            val pad = width * 0.23f
+            glyphPath.reset()
+            glyphPath.moveTo(pad, height - pad)
+            glyphPath.lineTo(pad, pad + height * 0.05f)
+            glyphPath.lineTo(width * 0.5f, height * 0.58f)
+            glyphPath.lineTo(width - pad, pad + height * 0.05f)
+            glyphPath.lineTo(width - pad, height - pad)
+            glyphPaint.color = cAccent
+            glyphPaint.strokeWidth = 2.4f * d
+            canvas.drawPath(glyphPath, glyphPaint)
+
+            bgPaint.color = cPrimaryText
+            canvas.drawCircle(width - pad, height - pad, 1.8f * d, bgPaint)
+        }
+    }
+
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+    companion object {
+        private const val KEY_ACTIVE_TAB = "meltype_active_tab"
+    }
 }

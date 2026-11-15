@@ -105,7 +105,7 @@ class MeltypeSettings(context: Context) {
     fun addRecentEmoji(emoji: String) {
         val clean = emoji.trim()
         if (clean.isEmpty()) return
-        val next = (listOf(clean) + getRecentEmojis().filterNot { it == clean }).take(24)
+        val next = (listOf(clean) + getRecentEmojis().filterNot { it == clean }).take(27)
         saveStringList(KEY_RECENT_EMOJIS, next)
     }
 

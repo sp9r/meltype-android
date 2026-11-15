@@ -7,7 +7,9 @@ import android.content.res.Configuration
 import android.graphics.Color
 import android.graphics.RectF
 import android.graphics.Typeface
+import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.StateListDrawable
 import android.inputmethodservice.InputMethodService
 import android.os.Build
 import android.text.SpannableString
@@ -55,10 +57,10 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
 
     private enum class ExpandedTab(val label: String) {
         CANDIDATES("候補・設定"),
-        EMOJI("😀 絵文字"),
-        KAOMOJI("(^^) 顔文字"),
-        TEMPLATES("📋 定型/履歴"),
-        EDIT("✥ 編集")
+        EMOJI("絵文字"),
+        KAOMOJI("顔文字"),
+        TEMPLATES("定型/履歴"),
+        EDIT("編集")
     }
 
     private lateinit var settings: MeltypeSettings
@@ -93,8 +95,10 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
     private lateinit var dividerView: View
     private lateinit var keyboardView: QwertyKeyboardView
     private lateinit var expandedPanel: LinearLayout
+    private lateinit var expandedHeader: LinearLayout
     private lateinit var expandedScroll: ScrollView
     private lateinit var expandedContent: LinearLayout
+    private lateinit var expandedFooter: LinearLayout
 
     private var isExpandedPanelOpen: Boolean = false
     private var expandedTab: ExpandedTab = ExpandedTab.CANDIDATES
@@ -263,7 +267,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             )
         }
 
-        // Expandable overlay panel replacing keyboardView bounds for full candidate grid, script switches & quick height adjust
+        // Expandable overlay panel replacing keyboardView bounds for candidates, wide emoji grid, kaomoji & tools
         expandedPanel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             visibility = View.GONE
@@ -271,6 +275,9 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 dp(250)
             )
+        }
+        expandedHeader = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
         }
         expandedScroll = ScrollView(this).apply {
             layoutParams = LinearLayout.LayoutParams(
@@ -281,10 +288,15 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         }
         expandedContent = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(8), dp(6), dp(8), dp(10))
+            setPadding(dp(8), dp(6), dp(8), dp(8))
         }
         expandedScroll.addView(expandedContent)
+        expandedFooter = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+        expandedPanel.addView(expandedHeader)
         expandedPanel.addView(expandedScroll)
+        expandedPanel.addView(expandedFooter)
 
         rootContainer.addView(clauseBar)
         rootContainer.addView(topBar)
@@ -403,10 +415,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         keyboardView.refreshAppearance()
         oneHandBtn.text = shortHandLabel(settings.oneHandedMode)
 
-        val panelHeightPx = dp((keyboardView.currentBaseHeightDp() * settings.keyboardHeightScale).roundToInt().coerceIn(200, 420))
-        expandedPanel.layoutParams = (expandedPanel.layoutParams as LinearLayout.LayoutParams).apply {
-            height = panelHeightPx
-        }
+        updateExpandedPanelHeight()
 
         val dark = isDarkTheme()
         lastDark = dark
@@ -953,7 +962,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             val chip = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
                 gravity = Gravity.CENTER_VERTICAL
-                setPadding(dp(10), dp(3), dp(10), dp(3))
+                setPadding(dp(10), dp(2), dp(10), dp(2))
                 val isSelected = item.kind == CandidateKind.CONVERSION && item.text == focusedText && idx == 0
                 val isGlide = item.kind == CandidateKind.GLIDE_ALT
                 background = GradientDrawable().apply {
@@ -963,7 +972,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
                 }
                 layoutParams = LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.WRAP_CONTENT,
-                    dp(34)
+                    dp(36)
                 ).apply {
                     marginEnd = dp(5)
                 }
@@ -1006,32 +1015,71 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         }
     }
 
+    private fun updateExpandedPanelHeight() {
+        if (!::keyboardView.isInitialized || !::expandedPanel.isInitialized) return
+        val baseDp = keyboardView.currentBaseHeightDp() * settings.keyboardHeightScale
+        val isWidePicker = isExpandedPanelOpen &&
+            (expandedTab == ExpandedTab.EMOJI || expandedTab == ExpandedTab.KAOMOJI)
+        val screenHeightDp = resources.displayMetrics.heightPixels / resources.displayMetrics.density
+        val maxSafeDp = (screenHeightDp * 0.50f).roundToInt().coerceAtLeast(320)
+        val targetDp = if (isWidePicker) {
+            maxOf((baseDp + 104f).roundToInt(), 364).coerceAtMost(maxSafeDp)
+        } else {
+            baseDp.roundToInt().coerceIn(220, 420)
+        }
+        val targetPx = dp(targetDp)
+        val lp = expandedPanel.layoutParams as LinearLayout.LayoutParams
+        if (lp.height != targetPx) {
+            lp.height = targetPx
+            expandedPanel.layoutParams = lp
+        }
+    }
+
     private fun syncExpandedPanelState(snap: CompositionSnapshot) {
         expandPanelBtn.text = if (isExpandedPanelOpen) "▲" else "▼"
         if (!isExpandedPanelOpen) {
+            topBar.visibility = View.VISIBLE
+            dividerView.visibility = View.VISIBLE
             expandedPanel.visibility = View.GONE
             keyboardView.visibility = View.VISIBLE
             return
         }
+        val hideIdleTopBar = !snap.isComposing &&
+            (expandedTab == ExpandedTab.EMOJI || expandedTab == ExpandedTab.KAOMOJI)
+        topBar.visibility = if (hideIdleTopBar) View.GONE else View.VISIBLE
+        dividerView.visibility = if (hideIdleTopBar) View.GONE else View.VISIBLE
         keyboardView.visibility = View.GONE
         expandedPanel.visibility = View.VISIBLE
+        updateExpandedPanelHeight()
         populateExpandedPanel(snap)
     }
 
     private fun populateExpandedPanel(snap: CompositionSnapshot) {
+        expandedHeader.removeAllViews()
         expandedContent.removeAllViews()
+        expandedFooter.removeAllViews()
+
         val dark = isDarkTheme()
         val accent = if (dark) Color.parseColor("#5C8AC4") else Color.parseColor("#4A6F9E")
+        val barBg = if (dark) Color.parseColor("#181B20") else Color.parseColor("#F5F6F7")
         val cardBg = if (dark) Color.parseColor("#23272D") else Color.parseColor("#FFFFFF")
-        val border = if (dark) Color.parseColor("#323741") else Color.parseColor("#D5DAE0")
+        val border = if (dark) Color.parseColor("#2E333C") else Color.parseColor("#DFE2E6")
         val textCol = if (dark) Color.parseColor("#ECEEF0") else Color.parseColor("#202328")
-        val mutedCol = if (dark) Color.parseColor("#9BA1A8") else Color.parseColor("#737A84")
+        val mutedCol = if (dark) Color.parseColor("#8D95A0") else Color.parseColor("#737A84")
 
-        // Tab strip + close button
+        val wideGrid = expandedTab == ExpandedTab.EMOJI || expandedTab == ExpandedTab.KAOMOJI
+        if (wideGrid) {
+            expandedContent.setPadding(dp(4), dp(4), dp(4), dp(4))
+        } else {
+            expandedContent.setPadding(dp(8), dp(6), dp(8), dp(8))
+        }
+
+        // Fixed top underline-tab rail
+        expandedHeader.setBackgroundColor(barBg)
         val tabBarRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, 0, 0, dp(6))
+            setPadding(dp(6), dp(4), dp(6), 0)
         }
         val tabScroll = HorizontalScrollView(this).apply {
             isHorizontalScrollBarEnabled = false
@@ -1040,20 +1088,31 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         val tabInner = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         for (tab in ExpandedTab.values()) {
             val active = expandedTab == tab
-            val tabBtn = makePanelButton(
-                tab.label,
-                if (active) accent else cardBg,
-                if (active) Color.WHITE else textCol,
-                if (active) accent else border
-            ) {
-                expandedTab = tab
-                expandedScroll.scrollTo(0, 0)
-                populateExpandedPanel(session.snapshot)
+            val tabCell = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = Gravity.CENTER_HORIZONTAL
+                setPadding(dp(9), dp(5), dp(9), 0)
+                setOnClickListener {
+                    expandedTab = tab
+                    expandedScroll.scrollTo(0, 0)
+                    updateExpandedPanelHeight()
+                    syncExpandedPanelState(session.snapshot)
+                }
             }
-            tabBtn.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(32)).apply {
-                marginEnd = dp(4)
-            }
-            tabInner.addView(tabBtn)
+            tabCell.addView(TextView(this).apply {
+                text = tab.label
+                gravity = Gravity.CENTER
+                maxLines = 1
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                setTypeface(null, if (active) Typeface.BOLD else Typeface.NORMAL)
+                setTextColor(if (active) textCol else mutedCol)
+                setPadding(0, 0, 0, dp(5))
+            })
+            tabCell.addView(View(this).apply {
+                setBackgroundColor(if (active) accent else Color.TRANSPARENT)
+                layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(2))
+            })
+            tabInner.addView(tabCell)
         }
         tabScroll.addView(tabInner)
         tabBarRow.addView(tabScroll)
@@ -1063,27 +1122,44 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
                 isExpandedPanelOpen = false
                 onEnter()
             }
-            commitBtn.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(32)).apply {
+            commitBtn.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(26)).apply {
                 marginStart = dp(4)
+                bottomMargin = dp(3)
             }
             tabBarRow.addView(commitBtn)
         }
-        val closeBtn = makePanelButton("✕", cardBg, textCol, border) {
-            isExpandedPanelOpen = false
-            syncExpandedPanelState(session.snapshot)
-        }
-        closeBtn.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(32)).apply {
-            marginStart = dp(4)
+        val closeBtn = TextView(this).apply {
+            text = "✕"
+            gravity = Gravity.CENTER
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            setTextColor(mutedCol)
+            background = borderlessPressedBg(dark)
+            layoutParams = LinearLayout.LayoutParams(dp(30), dp(28)).apply {
+                marginStart = dp(4)
+                bottomMargin = dp(2)
+            }
+            setOnClickListener {
+                isExpandedPanelOpen = false
+                syncExpandedPanelState(session.snapshot)
+            }
         }
         tabBarRow.addView(closeBtn)
-        expandedContent.addView(tabBarRow)
+        expandedHeader.addView(tabBarRow)
+        expandedHeader.addView(View(this).apply {
+            setBackgroundColor(border)
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(1))
+        })
 
         when (expandedTab) {
             ExpandedTab.CANDIDATES -> populateCandidatesTab(snap, accent, cardBg, border, textCol, mutedCol)
-            ExpandedTab.EMOJI -> populateEmojiTab(accent, cardBg, border, textCol, mutedCol)
-            ExpandedTab.KAOMOJI -> populateKaomojiTab(accent, cardBg, border, textCol, mutedCol)
+            ExpandedTab.EMOJI -> populateEmojiTab(dark, accent, border, textCol, mutedCol)
+            ExpandedTab.KAOMOJI -> populateKaomojiTab(dark, border, textCol)
             ExpandedTab.TEMPLATES -> populateTemplatesTab(accent, cardBg, border, textCol, mutedCol)
             ExpandedTab.EDIT -> populateEditTab(accent, cardBg, border, textCol, mutedCol)
+        }
+
+        if (expandedTab != ExpandedTab.CANDIDATES) {
+            addPanelFooterActions(dark, barBg, border, textCol, mutedCol, accent)
         }
     }
 
@@ -1273,43 +1349,57 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
     }
 
     private fun populateEmojiTab(
+        dark: Boolean,
         accent: Int,
-        cardBg: Int,
         border: Int,
         textCol: Int,
         mutedCol: Int
     ) {
-        val catNames = listOf("履歴", "顔・感情", "手・ジェスチャ", "ハート・記号", "動物・自然", "食べ物", "活動・物")
-        val catScroll = HorizontalScrollView(this).apply {
-            isHorizontalScrollBarEnabled = false
-            setPadding(0, 0, 0, dp(6))
+        // Sticky compact category bar in expandedHeader
+        val catNames = listOf("履歴", "顔", "手", "記号", "動物", "食", "物")
+        val catRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+            setPadding(dp(4), 0, dp(4), 0)
         }
-        val catRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         for ((idx, name) in catNames.withIndex()) {
             val active = selectedEmojiCategory == idx
-            val chip = makePanelButton(
-                name,
-                if (active) accent else cardBg,
-                if (active) Color.WHITE else textCol,
-                if (active) accent else border
-            ) {
-                selectedEmojiCategory = idx
-                expandedScroll.scrollTo(0, 0)
-                populateExpandedPanel(session.snapshot)
+            val catCell = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = Gravity.CENTER_HORIZONTAL
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                setOnClickListener {
+                    selectedEmojiCategory = idx
+                    expandedScroll.scrollTo(0, 0)
+                    populateExpandedPanel(session.snapshot)
+                }
             }
-            chip.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(30)).apply {
-                marginEnd = dp(4)
-            }
-            catRow.addView(chip)
+            catCell.addView(TextView(this).apply {
+                text = name
+                gravity = Gravity.CENTER
+                maxLines = 1
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+                setTypeface(null, if (active) Typeface.BOLD else Typeface.NORMAL)
+                setTextColor(if (active) textCol else mutedCol)
+                setPadding(0, dp(6), 0, dp(5))
+            })
+            catCell.addView(View(this).apply {
+                setBackgroundColor(if (active) accent else Color.TRANSPARENT)
+                layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(2))
+            })
+            catRow.addView(catCell)
         }
-        catScroll.addView(catRow)
-        expandedContent.addView(catScroll)
+        expandedHeader.addView(catRow)
+        expandedHeader.addView(View(this).apply {
+            setBackgroundColor(border)
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(1))
+        })
 
         val emojis = when (selectedEmojiCategory) {
-            0 -> {
-                val recent = settings.getRecentEmojis()
-                if (recent.isNotEmpty()) recent else DEFAULT_RECENT_EMOJIS
-            }
+            0 -> (settings.getRecentEmojis() + DEFAULT_RECENT_EMOJIS).distinct().take(27)
             1 -> EMOJI_CAT_FACES
             2 -> EMOJI_CAT_HANDS
             3 -> EMOJI_CAT_HEARTS_SYMBOLS
@@ -1318,16 +1408,10 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             else -> EMOJI_CAT_OBJECTS
         }
 
-        if (selectedEmojiCategory == 0 && settings.getRecentEmojis().isEmpty()) {
-            expandedContent.addView(TextView(this).apply {
-                text = "よく使われる絵文字（選択すると履歴に追加）"
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
-                setTextColor(mutedCol)
-                setPadding(0, 0, 0, dp(4))
-            })
-        }
-
-        val cols = 7
+        // Dense, borderless flat glyph cells without chunky card borders
+        val availDp = resources.displayMetrics.widthPixels / resources.displayMetrics.density - 8f
+        val cols = (availDp / 45f).toInt().coerceIn(8, 10)
+        val rowHeightPx = dp(38)
         var r = 0
         while (r < emojis.size) {
             val rowLayout = LinearLayout(this).apply {
@@ -1335,27 +1419,22 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
                 layoutParams = LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT,
                     ViewGroup.LayoutParams.WRAP_CONTENT
-                ).apply { bottomMargin = dp(4) }
+                )
             }
             for (c in 0 until cols) {
                 val emoji = emojis.getOrNull(r + c)
                 if (emoji == null) {
                     rowLayout.addView(View(this).apply {
-                        layoutParams = LinearLayout.LayoutParams(0, dp(40), 1f)
+                        layoutParams = LinearLayout.LayoutParams(0, rowHeightPx, 1f)
                     })
                 } else {
                     val btn = TextView(this).apply {
                         text = emoji
                         gravity = Gravity.CENTER
-                        setTextSize(TypedValue.COMPLEX_UNIT_SP, 21f)
-                        background = GradientDrawable().apply {
-                            setColor(cardBg)
-                            cornerRadius = dp(5).toFloat()
-                            setStroke(dp(1), border)
-                        }
-                        layoutParams = LinearLayout.LayoutParams(0, dp(40), 1f).apply {
-                            if (c < cols - 1) marginEnd = dp(4)
-                        }
+                        includeFontPadding = false
+                        setTextSize(TypedValue.COMPLEX_UNIT_SP, 22f)
+                        background = borderlessPressedBg(dark)
+                        layoutParams = LinearLayout.LayoutParams(0, rowHeightPx, 1f)
                         setOnClickListener {
                             settings.addRecentEmoji(emoji)
                             commitDirectExtraText(emoji)
@@ -1367,25 +1446,16 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             expandedContent.addView(rowLayout)
             r += cols
         }
-
-        addPanelFooterActions(cardBg, border, textCol, accent)
     }
 
     private fun populateKaomojiTab(
-        accent: Int,
-        cardBg: Int,
+        dark: Boolean,
         border: Int,
-        textCol: Int,
-        mutedCol: Int
+        textCol: Int
     ) {
-        expandedContent.addView(TextView(this).apply {
-            text = "顔文字（タップで入力）"
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
-            setTextColor(mutedCol)
-            setPadding(0, 0, 0, dp(4))
-        })
         val list = (COMMON_KAOMOJI + dictionaries.kaomojiList).distinct()
         val cols = 3
+        val rowHeightPx = dp(36)
         var r = 0
         while (r < list.size) {
             val rowLayout = LinearLayout(this).apply {
@@ -1393,30 +1463,45 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
                 layoutParams = LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT,
                     ViewGroup.LayoutParams.WRAP_CONTENT
-                ).apply { bottomMargin = dp(5) }
+                )
             }
             for (c in 0 until cols) {
                 val km = list.getOrNull(r + c)
                 if (km == null) {
                     rowLayout.addView(View(this).apply {
-                        layoutParams = LinearLayout.LayoutParams(0, dp(38), 1f)
+                        layoutParams = LinearLayout.LayoutParams(0, rowHeightPx, 1f)
                     })
                 } else {
-                    val btn = makePanelButton(km, cardBg, textCol, border) {
-                        commitDirectExtraText(km)
-                    }.apply {
+                    val btn = TextView(this).apply {
+                        text = km
+                        gravity = Gravity.CENTER
+                        maxLines = 1
                         ellipsize = TextUtils.TruncateAt.END
-                        layoutParams = LinearLayout.LayoutParams(0, dp(38), 1f).apply {
-                            if (c < cols - 1) marginEnd = dp(4)
-                        }
+                        setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
+                        setTextColor(textCol)
+                        setPadding(dp(4), 0, dp(4), 0)
+                        background = borderlessPressedBg(dark)
+                        layoutParams = LinearLayout.LayoutParams(0, rowHeightPx, 1f)
+                        setOnClickListener { commitDirectExtraText(km) }
                     }
                     rowLayout.addView(btn)
                 }
+                if (c < cols - 1) {
+                    rowLayout.addView(View(this).apply {
+                        setBackgroundColor(border)
+                        layoutParams = LinearLayout.LayoutParams(dp(1), dp(20)).apply {
+                            gravity = Gravity.CENTER_VERTICAL
+                        }
+                    })
+                }
             }
             expandedContent.addView(rowLayout)
+            expandedContent.addView(View(this).apply {
+                setBackgroundColor(border)
+                layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(1))
+            })
             r += cols
         }
-        addPanelFooterActions(cardBg, border, textCol, accent)
     }
 
     private fun populateTemplatesTab(
@@ -1544,7 +1629,6 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
                 expandedContent.addView(btn)
             }
         }
-        addPanelFooterActions(cardBg, border, textCol, accent)
     }
 
     private fun populateEditTab(
@@ -1625,41 +1709,76 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
                 }
             )
         )
-        addPanelFooterActions(cardBg, border, textCol, accent)
     }
 
-    private fun addPanelFooterActions(cardBg: Int, border: Int, textCol: Int, accent: Int) {
+    private fun borderlessPressedBg(dark: Boolean): StateListDrawable {
+        val pressedColor = if (dark) Color.argb(46, 255, 255, 255) else Color.argb(28, 32, 35, 40)
+        val pressedDrawable = GradientDrawable().apply {
+            setColor(pressedColor)
+            cornerRadius = dp(6).toFloat()
+        }
+        return StateListDrawable().apply {
+            addState(intArrayOf(android.R.attr.state_pressed), pressedDrawable)
+            addState(intArrayOf(), ColorDrawable(Color.TRANSPARENT))
+        }
+    }
+
+    private fun addPanelFooterActions(
+        dark: Boolean,
+        barBg: Int,
+        border: Int,
+        textCol: Int,
+        mutedCol: Int,
+        accent: Int
+    ) {
+        expandedFooter.setBackgroundColor(barBg)
+        expandedFooter.addView(View(this).apply {
+            setBackgroundColor(border)
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(1))
+        })
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(6), dp(2), dp(6), dp(2))
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { topMargin = dp(4) }
+                dp(38)
+            )
         }
-        val backKb = makePanelButton("キーボードへ", cardBg, accent, accent) {
+        fun footerCell(label: String, color: Int, bold: Boolean = false, onClick: () -> Unit): TextView {
+            return TextView(this).apply {
+                text = label
+                gravity = Gravity.CENTER
+                maxLines = 1
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
+                setTypeface(null, if (bold) Typeface.BOLD else Typeface.NORMAL)
+                setTextColor(color)
+                background = borderlessPressedBg(dark)
+                setOnClickListener { onClick() }
+            }
+        }
+        val backKb = footerCell("⌨ キーボードへ", accent, bold = true) {
             isExpandedPanelOpen = false
             syncExpandedPanelState(session.snapshot)
         }
-        val spaceBtn = makePanelButton("空白", cardBg, textCol, border) {
+        val spaceBtn = footerCell("空白", mutedCol) {
             commitDirectExtraText(" ")
         }
-        val bsBtn = makePanelButton("⌫ 削除", cardBg, textCol, border) {
+        val bsBtn = footerCell("⌫ 削除", textCol) {
             clearUndoCommit()
             sendDownUpKeyEvents(KeyEvent.KEYCODE_DEL)
         }
-        val enterBtn = makePanelButton("⏎ 改行", accent, Color.WHITE, accent) {
+        val enterBtn = footerCell("⏎ 改行", accent, bold = true) {
             if (!sendDefaultEditorAction(true)) {
                 sendDownUpKeyEvents(KeyEvent.KEYCODE_ENTER)
             }
         }
-        val items = listOf(backKb to 1.4f, spaceBtn to 1f, bsBtn to 1f, enterBtn to 1f)
-        for ((idx, pair) in items.withIndex()) {
-            pair.first.layoutParams = LinearLayout.LayoutParams(0, dp(36), pair.second).apply {
-                if (idx < items.lastIndex) marginEnd = dp(4)
-            }
-            row.addView(pair.first)
+        val items = listOf(backKb to 1.45f, spaceBtn to 1.0f, bsBtn to 1.0f, enterBtn to 1.05f)
+        for ((cell, weight) in items) {
+            cell.layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, weight)
+            row.addView(cell)
         }
-        expandedContent.addView(row)
+        expandedFooter.addView(row)
     }
 
     private fun makePanelButton(
@@ -1728,66 +1847,64 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
 
     companion object {
         private val DEFAULT_RECENT_EMOJIS = listOf(
-            "😀", "😂", "🤣", "😊", "🙏", "🙇", "👍", "✨",
-            "🔥", "❤️", "🎉", "😭", "😅", "🤔", "👀", "✅",
-            "☀️", "🌸", "👌", "🙌", "💻"
+            "😀", "😂", "🤣", "😊", "🙏", "🙇", "👍", "✨", "🔥",
+            "❤️", "🎉", "😭", "😅", "🤔", "👀", "✅", "☀️", "🌸",
+            "👌", "🙌", "💻", "🫡", "🥹", "🫶", "💪", "🚀", "☕"
         )
 
         private val EMOJI_CAT_FACES = listOf(
-            "😀", "😃", "😄", "😁", "😆", "😅", "😂",
-            "🤣", "😊", "😇", "🙂", "🙃", "😉", "😌",
-            "😍", "🥰", "😘", "😗", "😋", "😛", "😜",
-            "🤪", "😝", "🤔", "🤫", "🤭", "😐", "😑",
-            "😶", "😏", "😒", "🙄", "😬", "😔", "😪",
-            "😴", "😷", "🤒", "😵", "🤯", "🥳", "😎",
-            "🤓", "🧐", "😕", "😟", "🙁", "😮", "😯",
-            "😲", "😳", "🥺", "😢", "😭", "😱", "😖",
-            "😣", "😞", "😓", "😩", "😫", "😤", "😡"
+            "😀", "😃", "😄", "😁", "😆", "😅", "😂", "🤣", "🥹",
+            "😊", "😇", "🙂", "🙃", "😉", "😌", "😍", "🥰", "😘",
+            "😗", "😋", "😛", "😜", "🤪", "😝", "🫠", "🤔", "🫡",
+            "🤭", "🤫", "😐", "😑", "😶", "😏", "😒", "🙄", "😬",
+            "😔", "😪", "😴", "😷", "🤒", "😵", "🤯", "🥳", "😎",
+            "🤓", "🧐", "😕", "😟", "🙁", "😮", "😯", "😲", "😳",
+            "🥺", "😢", "😭", "😱", "😖", "😣", "😞", "😓", "😡"
         )
 
         private val EMOJI_CAT_HANDS = listOf(
-            "👍", "👎", "👌", "✌️", "🤞", "🤟", "🤘",
-            "🤙", "👈", "👉", "👆", "👇", "☝️", "✋",
-            "🤚", "👋", "👏", "🙌", "👐", "🤲", "🙏",
-            "🤝", "💪", "✍️", "🙇", "🙋", "💁", "🙆",
-            "🙅", "🤷", "🤦", "👀", "💬", "💭", "💯",
-            "🔥", "💥", "💫", "💦", "💤", "🎉", "🎊"
+            "👍", "👎", "👌", "🫶", "✌️", "🤞", "🤟", "🤘", "🤙",
+            "👈", "👉", "👆", "👇", "☝️", "✋", "🤚", "👋", "👏",
+            "🙌", "👐", "🤲", "🙏", "🤝", "💪", "✍️", "🙇", "🙋",
+            "💁", "🙆", "🙅", "🤷", "🤦", "👀", "💬", "💭", "💯",
+            "🔥", "💥", "💫", "💦", "💤", "🎉", "🎊", "🫡", "🫰",
+            "👊", "✊", "🖐️", "🫂", "🧠", "🫀", "🫶🏻", "👍🏻", "🙏🏻"
         )
 
         private val EMOJI_CAT_HEARTS_SYMBOLS = listOf(
-            "❤️", "🧡", "💛", "💚", "💙", "💜", "🖤",
-            "🤍", "💔", "💕", "💞", "💓", "💗", "💖",
-            "⭐", "🌟", "✨", "⚡", "⭕", "❌", "❗",
-            "❓", "‼️", "⁉️", "✅", "❎", "✔️", "⚠️",
-            "⛔", "🚫", "ℹ️", "🔔", "🎵", "🎶", "📌",
-            "📍", "🔗", "🔍", "🔒", "🔓", "⚙️", "💡"
+            "❤️", "🧡", "💛", "💚", "💙", "💜", "🖤", "🤍", "🩷",
+            "💔", "❤️‍🔥", "💕", "💞", "💓", "💗", "💖", "💘", "💝",
+            "⭐", "🌟", "✨", "⚡", "⭕", "❌", "❗", "❓", "‼️",
+            "⁉️", "✅", "❎", "✔️", "⚠️", "⛔", "🚫", "ℹ️", "🔔",
+            "🎵", "🎶", "📌", "📍", "🔗", "🔍", "🔒", "🔓", "⚙️",
+            "💡", "➡️", "⬅️", "⬆️", "⬇️", "🔄", "♻️", "🏁", "🆘"
         )
 
         private val EMOJI_CAT_NATURE = listOf(
-            "🐶", "🐱", "🐭", "🐹", "🐰", "🦊", "🐻",
-            "🐼", "🐨", "🐯", "🦁", "🐸", "🐵", "🐧",
-            "🐦", "🐥", "🦉", "🐝", "🦋", "🐢", "🐳",
-            "🐬", "🐟", "🐙", "🌸", "🌹", "🌺", "🌻",
-            "🌷", "🌱", "🌲", "🌳", "🍀", "🍁", "🍂",
-            "☀️", "🌤️", "☁️", "🌧️", "❄️", "🌈", "🌙"
+            "🐶", "🐱", "🐭", "🐹", "🐰", "🦊", "🐻", "🐼", "🐨",
+            "🐯", "🦁", "🐸", "🐵", "🐧", "🐦", "🐥", "🦉", "🐝",
+            "🦋", "🐢", "🐳", "🐬", "🐟", "🐙", "🦈", "🐊", "🦕",
+            "🌸", "🌹", "🌺", "🌻", "🌷", "🌱", "🌲", "🌳", "🍀",
+            "🍁", "🍂", "🌿", "🌾", "☀️", "🌤️", "⛅", "☁️", "🌧️",
+            "⛈️", "❄️", "🌈", "🌙", "⭐", "🌊", "🌋", "🏔️", "🌍"
         )
 
         private val EMOJI_CAT_FOOD = listOf(
-            "🍚", "🍙", "🍣", "🍤", "🍜", "🍝", "🍞",
-            "🥐", "🍔", "🍟", "🍕", "🌭", "🥪", "🥚",
-            "🍳", "🍲", "🍛", "🍱", "🍰", "🎂", "🍫",
-            "🍬", "🍮", "🍩", "🍪", "☕", "🍵", "🧃",
-            "🍺", "🍻", "🍷", "🥤", "🍎", "🍊", "🍋",
-            "🍌", "🍓", "🍇", "🍉", "🍑", "🍒", "🥝"
+            "🍚", "🍙", "🍣", "🍤", "🍜", "🍝", "🍞", "🥐", "🥖",
+            "🍔", "🍟", "🍕", "🌭", "🥪", "🌮", "🥟", "🍲", "🍛",
+            "🍱", "🍢", "🍡", "🍳", "🥚", "🥩", "🍗", "🥗", "🍰",
+            "🎂", "🍫", "🍬", "🍮", "🍩", "🍪", "🍦", "🧁", "☕",
+            "🍵", "🧋", "🧃", "🥤", "🍺", "🍻", "🍷", "🍶", "🍎",
+            "🍊", "🍋", "🍌", "🍓", "🍇", "🍉", "🍑", "🍒", "🥝"
         )
 
         private val EMOJI_CAT_OBJECTS = listOf(
-            "📱", "💻", "⌨️", "🖥️", "🖱️", "📷", "🎧",
-            "🎤", "⌚", "📖", "📚", "📝", "✏️", "📅",
-            "📆", "⏰", "⌛", "📦", "✉️", "📩", "🔑",
-            "🔧", "🔨", "🏠", "🏢", "🏫", "🏥", "🚉",
-            "🚆", "🚌", "🚗", "✈️", "🚀", "⚽", "🏀",
-            "🎮", "🎸", "🎨", "🎁", "💰", "💳", "🧾"
+            "📱", "💻", "⌨️", "🖥️", "🖱️", "📷", "🎧", "🎤", "⌚",
+            "🔋", "🔌", "💾", "💿", "📖", "📚", "📝", "✏️", "📅",
+            "📆", "⏰", "⌛", "📦", "✉️", "📩", "🔑", "🔧", "🔨",
+            "🏠", "🏢", "🏫", "🏥", "🏪", "🚉", "🚆", "🚌", "🚗",
+            "🚲", "✈️", "🚀", "🛸", "⚽", "🏀", "🎮", "🎸", "🎨",
+            "🎁", "🎈", "🏆", "🥇", "💰", "💳", "🧾", "🛒", "🧳"
         )
 
         private val COMMON_KAOMOJI = listOf(
