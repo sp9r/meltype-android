@@ -104,6 +104,22 @@ class MeltypeSettings(context: Context) {
         get() = prefs.getBoolean(KEY_TYPO_CORRECTION, true)
         set(value) = prefs.edit().putBoolean(KEY_TYPO_CORRECTION, value).apply()
 
+    var glideEvalLoggingEnabled: Boolean
+        get() = prefs.getBoolean(KEY_GLIDE_EVAL_LOGGING, false)
+        set(value) = prefs.edit().putBoolean(KEY_GLIDE_EVAL_LOGGING, value).apply()
+
+    var activePromptId: String
+        get() = prefs.getString(KEY_ACTIVE_PROMPT_ID, "") ?: ""
+        set(value) = prefs.edit().putString(KEY_ACTIVE_PROMPT_ID, value).apply()
+
+    var activePromptExpected: String
+        get() = prefs.getString(KEY_ACTIVE_PROMPT_EXPECTED, "") ?: ""
+        set(value) = prefs.edit().putString(KEY_ACTIVE_PROMPT_EXPECTED, value).apply()
+
+    var activePromptIndex: Int
+        get() = prefs.getInt(KEY_ACTIVE_PROMPT_INDEX, 0).coerceAtLeast(0)
+        set(value) = prefs.edit().putInt(KEY_ACTIVE_PROMPT_INDEX, value.coerceAtLeast(0)).apply()
+
     fun getRecentEmojis(): List<String> = readStringList(KEY_RECENT_EMOJIS)
 
     fun addRecentEmoji(emoji: String) {
@@ -199,6 +215,10 @@ class MeltypeSettings(context: Context) {
         private const val KEY_LETTER_FLICK = "letter_flick_enabled"
         private const val KEY_LEARNING = "learning_enabled"
         private const val KEY_TYPO_CORRECTION = "typo_correction_enabled"
+        private const val KEY_GLIDE_EVAL_LOGGING = "glide_eval_logging"
+        private const val KEY_ACTIVE_PROMPT_ID = "glide_eval_prompt_id"
+        private const val KEY_ACTIVE_PROMPT_EXPECTED = "glide_eval_prompt_expected"
+        private const val KEY_ACTIVE_PROMPT_INDEX = "glide_eval_prompt_index"
         private const val KEY_RECENT_EMOJIS = "recent_emojis"
         private const val KEY_CLIPBOARD_HISTORY = "clipboard_history"
         private const val KEY_USER_DICT = "user_dictionary"

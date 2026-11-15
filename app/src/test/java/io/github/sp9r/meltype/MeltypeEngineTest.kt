@@ -536,4 +536,65 @@ class MeltypeEngineTest {
         val englishMatches = catalog.search("heart").map { it.emoji }
         assertTrue("Expected matches for 'heart', got $englishMatches", englishMatches.any { it.contains("❤") || it == "🩷" })
     }
+
+    @Test
+    fun glideEvalLoggerAndDebugBreakdownProduceConsistentDiagnostics() {
+        val converter = AndroidMozcConverter(dictionaries)
+        val sess = CompositionSession(dictionaries, scoreEngine, converter)
+        val path = KeyLayoutGeometry.syntheticPathForWord("arigatou", jitter = 0.02f)
+
+        val normal = glideDecoder.decode(path, maxResults = 5, preferJapanese = true)
+        val debug = glideDecoder.decodeDebug(path, maxResults = 5, preferJapanese = true)
+        assertTrue(normal.isNotEmpty())
+        assertEquals(normal.map { it.word }, debug.candidates.map { it.word })
+        assertTrue(debug.pathLen > 0.5f)
+        assertTrue(debug.startKeys.isNotEmpty() && debug.endKeys.isNotEmpty())
+        assertTrue(debug.anchorSeq.isNotEmpty())
+
+        val top = debug.candidates.first()
+        val snap = sess.appendGlideResult(top.word, top.isEnglish, debug.candidates.map { it.word to it.isEnglish })
+
+        val tempDir = File.createTempFile("meltype_eval_test", "").apply { delete(); mkdirs() }
+        try {
+            val logger = io.github.sp9r.meltype.core.GlideEvalLogger(tempDir)
+            logger.logGlide(
+                rawPoints = path,
+                normalizedPoints = path,
+                boundsLeft = 0f,
+                boundsTop = 0f,
+                boundsWidth = 1080f,
+                boundsHeight = 600f,
+                oneHandedMode = "FULL",
+                heightScale = 1.0f,
+                preferJapanese = true,
+                debugResult = debug,
+                composingBefore = "",
+                snapshotAfter = snap,
+                promptId = "t01",
+                expectedText = "ありがとう\"テスト\""
+            )
+            logger.logGlideAltPicked("t01", top.word, "arigatou", false, "ありがとう")
+            logger.logBackspace("t01", "glide_undo", "ありがとう", "")
+            logger.logPromptDone("t01", "テスト", "ありがとう", "ありがとう", "next")
+
+            val summary = logger.readSummary()
+            assertEquals(4, summary.totalEvents)
+            assertEquals(1, summary.glideCount)
+            assertEquals(1, summary.altPickCount)
+            assertEquals(1, summary.backspaceCount)
+            assertEquals(1, summary.glideUndoCount)
+            assertEquals(1, summary.promptDoneCount)
+            assertTrue(summary.recentGlides.isNotEmpty())
+
+            val rawLines = logger.logFile.readLines(Charsets.UTF_8)
+            assertEquals(4, rawLines.size)
+            assertTrue(rawLines[0].contains("\"type\":\"glide\"") && rawLines[0].contains("\"pts\":["))
+            assertTrue(rawLines[0].contains("\\\"テスト\\\""))
+
+            logger.clear()
+            assertFalse(logger.logFile.exists())
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
 }

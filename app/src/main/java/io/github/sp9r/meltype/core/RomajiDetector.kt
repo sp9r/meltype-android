@@ -109,6 +109,12 @@ object RomajiDetector {
 
     private val STRICT_DISALLOWED_SINGLE_LETTERS = setOf('l', 'q', 'v', 'x')
     private val VOWELS = setOf('a', 'i', 'u', 'e', 'o')
+    private val LONG_VOWEL_DIGRAPHS = setOf(
+        "おう", "こう", "そう", "とう", "のう", "ほう", "もう", "よう", "ろう", "ごう", "ぞう", "どう", "ぼう", "ぽう",
+        "うう", "くう", "すう", "つう", "ぬう", "ふう", "むう", "ゆう", "るう",
+        "きゅう", "しゅう", "ちゅう", "にゅう", "ひゅう", "みゅう", "りゅう", "じゅう", "ぎゅう", "びゅう", "ぴゅう",
+        "きょう", "しょう", "ちょう", "にょう", "ひょう", "みょう", "りょう", "じょう", "ぎょう", "びょう", "ぴょう"
+    )
 
     private val STRICT_YOUON_PREFIXES = setOf(
         "kya", "kyu", "kyo", "gya", "gyu", "gyo",
@@ -191,7 +197,7 @@ object RomajiDetector {
                 kanaOut.append(matchedKana)
                 if (kanaOut.length >= 2) {
                     val last2 = kanaOut.substring(kanaOut.length - 2)
-                    if (last2 in setOf("おう", "こう", "そう", "とう", "のう", "ほう", "もう", "よう", "ろう", "ごう", "ぞう", "どう", "ぼう", "ぽう", "うう", "くう", "すう", "つう", "ぬう", "ふう", "むう", "ゆう", "るう", "きゅう", "しゅう", "ちゅう", "にゅう", "ひゅう", "みゅう", "りゅう", "じゅう", "ぎゅう", "びゅう", "ぴゅう", "きょう", "しょう", "ちょう", "にょう", "ひょう", "みょう", "りょう", "じょう", "ぎょう", "びょう", "ぴょう")) {
+                    if (last2 in LONG_VOWEL_DIGRAPHS) {
                         longVowels++
                     }
                 }
@@ -222,11 +228,14 @@ object RomajiDetector {
             }
 
             // Bilabial 'm' before b/p/m acts as moraic nasal 'ん' (e.g. shimbun, sampo, tempura, ammari)
-            if (ch == 'm' && i + 1 < raw.length && raw[i + 1] in charArrayOf('b', 'p', 'm')) {
-                chunks.add(RomajiChunk(i, i + 1, "m", "ん"))
-                kanaOut.append("ん")
-                i += 1
-                continue
+            if (ch == 'm' && i + 1 < raw.length) {
+                val mNext = raw[i + 1]
+                if (mNext == 'b' || mNext == 'p' || mNext == 'm') {
+                    chunks.add(RomajiChunk(i, i + 1, "m", "ん"))
+                    kanaOut.append("ん")
+                    i += 1
+                    continue
+                }
             }
 
             // Sokuon (double consonant like kk, tt, ss, pp, cc, tch)
@@ -290,11 +299,15 @@ object RomajiDetector {
         var i = 0
         while (i < letters.length) {
             val c = letters[i]
-            if (c == 'c' && i + 1 < letters.length && letters[i + 1] in charArrayOf('a', 'u', 'o')) {
-                sb.append('k')
-            } else {
-                sb.append(c)
+            if (c == 'c' && i + 1 < letters.length) {
+                val nx = letters[i + 1]
+                if (nx == 'a' || nx == 'u' || nx == 'o') {
+                    sb.append('k')
+                    i++
+                    continue
+                }
             }
+            sb.append(c)
             i++
         }
         return sb.toString()

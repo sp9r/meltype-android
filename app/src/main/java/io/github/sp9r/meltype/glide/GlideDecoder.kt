@@ -14,6 +14,32 @@ data class GlideCandidate(
     val kanaHint: String? = null
 )
 
+data class GlideScoreBreakdown(
+    val word: String,
+    val traceWord: String,
+    val isEnglish: Boolean,
+    val scoreCost: Float,
+    val baseCost: Float,
+    val endpointCost: Float,
+    val locDist: Float,
+    val shapeDist: Float,
+    val dirDist: Float,
+    val wpPenalty: Float,
+    val cornerAdj: Float,
+    val freqBonus: Float,
+    val langPrior: Float,
+    val source: String = "dict",
+    val kanaHint: String? = null
+)
+
+data class GlideDebugResult(
+    val candidates: List<GlideScoreBreakdown>,
+    val pathLen: Float,
+    val startKeys: List<Pair<Char, Float>>,
+    val endKeys: List<Pair<Char, Float>>,
+    val anchorSeq: String
+)
+
 /**
  * Dual-language (English + Japanese Romaji) QWERTY gesture/glide decoder.
  * Indexed by (firstChar, lastChar) buckets and scored in two stages:
@@ -308,8 +334,19 @@ class GlideDecoder(private val dictionaries: MeltypeDictionaries) {
 
     private data class Stage1Hit(
         val entry: LexiconEntry,
-        val baseCost: Float
+        val baseCost: Float,
+        val endpointCost: Float = 0f,
+        val locDist: Float = 0f,
+        val shapeDist: Float = 0f,
+        val langPrior: Float = 0f
     )
+
+    private class DebugMetaCollector {
+        var pathLen: Float = 0f
+        var startKeys: List<Pair<Char, Float>> = emptyList()
+        var endKeys: List<Pair<Char, Float>> = emptyList()
+        var anchorSeq: String = ""
+    }
 
     /**
      * Decodes normalized isotropic touch points into ranked dual-language glide candidates.
@@ -329,12 +366,44 @@ class GlideDecoder(private val dictionaries: MeltypeDictionaries) {
         )
     }
 
+    /**
+     * Runs the exact production decode path while returning per-candidate cost breakdowns
+     * and trajectory anchor metadata for offline evaluation.
+     */
+    fun decodeDebug(
+        normalizedPoints: List<TouchPoint>,
+        maxResults: Int = 10,
+        preferJapanese: Boolean = true
+    ): GlideDebugResult {
+        val breakdowns = ArrayList<GlideScoreBreakdown>(64)
+        val meta = DebugMetaCollector()
+        decodeInternal(
+            normalizedPoints = normalizedPoints,
+            maxResults = maxResults,
+            preferJapanese = preferJapanese,
+            allowCompoundSplit = true,
+            fastPreview = false,
+            debugBreakdownsOut = breakdowns,
+            debugMetaOut = meta
+        )
+        breakdowns.sortBy { it.scoreCost }
+        return GlideDebugResult(
+            candidates = breakdowns.distinctBy { it.word }.take(maxResults),
+            pathLen = meta.pathLen,
+            startKeys = meta.startKeys,
+            endKeys = meta.endKeys,
+            anchorSeq = meta.anchorSeq
+        )
+    }
+
     private fun decodeInternal(
         normalizedPoints: List<TouchPoint>,
         maxResults: Int,
         preferJapanese: Boolean,
         allowCompoundSplit: Boolean,
-        fastPreview: Boolean = false
+        fastPreview: Boolean = false,
+        debugBreakdownsOut: MutableList<GlideScoreBreakdown>? = null,
+        debugMetaOut: DebugMetaCollector? = null
     ): List<GlideCandidate> {
         if (normalizedPoints.size < 2) return emptyList()
 
@@ -356,6 +425,11 @@ class GlideDecoder(private val dictionaries: MeltypeDictionaries) {
         val maxEndpointDist = if (fastPreview) 0.58f else 0.68f
         val startKeys = KeyLayoutGeometry.nearestKeys(startX, startY, limit = startLimit)
         val endKeys = KeyLayoutGeometry.nearestKeys(endX, endY, limit = endLimit)
+        debugMetaOut?.let {
+            it.pathLen = pathLen
+            it.startKeys = startKeys.take(4)
+            it.endKeys = endKeys.take(4)
+        }
 
         val stage1Limit = if (fastPreview) 40 else 72
         val stage1 = ArrayList<Stage1Hit>(stage1Limit)
@@ -436,13 +510,27 @@ class GlideDecoder(private val dictionaries: MeltypeDictionaries) {
                     effArcDiff * 0.10f
 
                 if (baseCost < stage1WorstCost) {
-                    stage1WorstCost = insertTopStage1(stage1, Stage1Hit(entry, baseCost), limit = stage1Limit)
+                    val hit = if (debugBreakdownsOut != null) {
+                        Stage1Hit(entry, baseCost, endpointCost, rawLocDist, shapeDist, langPrior)
+                    } else {
+                        Stage1Hit(entry, baseCost)
+                    }
+                    stage1WorstCost = insertTopStage1(stage1, hit, limit = stage1Limit)
                 }
             }
         }
 
         // Stage 2 reranking: corner anchors + direction channel + arc-fraction waypoint penalty
         val anchors = KeyLayoutGeometry.extractAnchorPoints(normalizedPoints)
+        debugMetaOut?.let { meta ->
+            val dedup = StringBuilder(anchors.size)
+            for (a in anchors) {
+                if (dedup.isEmpty() || dedup[dedup.length - 1] != a.nearestChar) {
+                    dedup.append(a.nearestChar)
+                }
+            }
+            meta.anchorSeq = dedup.toString()
+        }
         val interiorAnchors = anchors.filter { !it.isEndpoint }.map { a ->
             val near2 = KeyLayoutGeometry.nearestKeys(a.x, a.y, limit = 2)
             var nearMask = 0
@@ -500,11 +588,30 @@ class GlideDecoder(private val dictionaries: MeltypeDictionaries) {
 
             val finalCost = hit.baseCost + cornerAdj + dirDist * 1.40f + wpPenalty * 0.60f
             candidates.add(GlideCandidate(e.outputWord, e.isEnglish, finalCost, e.kanaHint))
+            debugBreakdownsOut?.add(
+                GlideScoreBreakdown(
+                    word = e.outputWord,
+                    traceWord = e.traceWord,
+                    isEnglish = e.isEnglish,
+                    scoreCost = finalCost,
+                    baseCost = hit.baseCost,
+                    endpointCost = hit.endpointCost,
+                    locDist = hit.locDist,
+                    shapeDist = hit.shapeDist,
+                    dirDist = dirDist,
+                    wpPenalty = wpPenalty,
+                    cornerAdj = cornerAdj,
+                    freqBonus = e.freqBonus,
+                    langPrior = hit.langPrior,
+                    source = "dict",
+                    kanaHint = e.kanaHint
+                )
+            )
         }
 
         // Compound suffix split rescue for single-stroke Stem + masu/desu/shimasu/gozaimasu/etc.
         if (!fastPreview && allowCompoundSplit && preferJapanese && pathLen >= 1.35f && normalizedPoints.size >= 6) {
-            decodeCompoundSplits(normalizedPoints, pathLen, endKeys, n, candidates)
+            decodeCompoundSplits(normalizedPoints, pathLen, endKeys, n, candidates, debugBreakdownsOut)
         }
 
         // Syllable lattice fallback if trajectory anchors themselves form strict valid romaji
@@ -517,12 +624,32 @@ class GlideDecoder(private val dictionaries: MeltypeDictionaries) {
                 val anchorStr = dedupChars.joinToString("")
                 val analysis = RomajiDetector.analyze(anchorStr, strictForDetection = true)
                 if (analysis.isStrictValid && analysis.pendingTail.isEmpty() && candidates.none { it.word == anchorStr }) {
+                    val kana = analysis.finalizedHiragana()
                     candidates.add(
                         GlideCandidate(
                             word = anchorStr,
                             isEnglish = false,
                             scoreCost = 1.42f,
-                            kanaHint = analysis.finalizedHiragana()
+                            kanaHint = kana
+                        )
+                    )
+                    debugBreakdownsOut?.add(
+                        GlideScoreBreakdown(
+                            word = anchorStr,
+                            traceWord = anchorStr,
+                            isEnglish = false,
+                            scoreCost = 1.42f,
+                            baseCost = 1.42f,
+                            endpointCost = 0f,
+                            locDist = 0f,
+                            shapeDist = 0f,
+                            dirDist = 0f,
+                            wpPenalty = 0f,
+                            cornerAdj = 0f,
+                            freqBonus = 0f,
+                            langPrior = 0f,
+                            source = "anchor_fallback",
+                            kanaHint = kana
                         )
                     )
                 }
@@ -538,7 +665,8 @@ class GlideDecoder(private val dictionaries: MeltypeDictionaries) {
         totalLen: Float,
         endKeys: List<Pair<Char, Float>>,
         n: Int,
-        out: MutableList<GlideCandidate>
+        out: MutableList<GlideCandidate>,
+        debugBreakdownsOut: MutableList<GlideScoreBreakdown>? = null
     ) {
         val m = normalizedPoints.size
         val cum = FloatArray(m)
@@ -604,6 +732,25 @@ class GlideDecoder(private val dictionaries: MeltypeDictionaries) {
             val combinedCost = stem.scoreCost + bestTailCost * 0.95f + 0.25f
             if (out.none { it.word == joined }) {
                 out.add(GlideCandidate(joined, isEnglish = false, scoreCost = combinedCost, kanaHint = joinedKana))
+                debugBreakdownsOut?.add(
+                    GlideScoreBreakdown(
+                        word = joined,
+                        traceWord = joined,
+                        isEnglish = false,
+                        scoreCost = combinedCost,
+                        baseCost = stem.scoreCost,
+                        endpointCost = 0f,
+                        locDist = 0f,
+                        shapeDist = 0f,
+                        dirDist = 0f,
+                        wpPenalty = bestTailCost,
+                        cornerAdj = 0f,
+                        freqBonus = 0f,
+                        langPrior = 0f,
+                        source = "compound+${suf.romaji}",
+                        kanaHint = joinedKana
+                    )
+                )
             }
         }
     }

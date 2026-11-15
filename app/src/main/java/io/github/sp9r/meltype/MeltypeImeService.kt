@@ -35,17 +35,19 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.recyclerview.widget.GridLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import io.github.sp9r.meltype.core.AndroidMozcConverter
-import io.github.sp9r.meltype.core.AssetDictionarySource
+import io.github.sp9r.meltype.core.AppEngineHolder
 import io.github.sp9r.meltype.core.CandidateItem
 import io.github.sp9r.meltype.core.CandidateKind
 import io.github.sp9r.meltype.core.CompositionSession
 import io.github.sp9r.meltype.core.CompositionSnapshot
 import io.github.sp9r.meltype.core.EmojiCatalog
 import io.github.sp9r.meltype.core.EmojiCategory
+import io.github.sp9r.meltype.core.GlideEvalLogger
 import io.github.sp9r.meltype.core.MeltypeDictionaries
 import io.github.sp9r.meltype.core.RomajiDetector
 import io.github.sp9r.meltype.core.MozcRuntime
 import io.github.sp9r.meltype.core.ScoreEngine
+import io.github.sp9r.meltype.glide.GlideCandidate
 import io.github.sp9r.meltype.glide.GlideDecoder
 import io.github.sp9r.meltype.glide.KeyLayoutGeometry
 import io.github.sp9r.meltype.glide.TouchPoint
@@ -76,6 +78,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
     private lateinit var scoreEngine: ScoreEngine
     private lateinit var converter: AndroidMozcConverter
     private lateinit var session: CompositionSession
+    private lateinit var evalLogger: GlideEvalLogger
 
     @Volatile
     private var glideDecoder: GlideDecoder? = null
@@ -135,9 +138,9 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
     override fun onCreate() {
         super.onCreate()
         settings = MeltypeSettings(this)
-        val dictSource = AssetDictionarySource(this)
-        dictionaries = MeltypeDictionaries(dictSource)
-        emojiCatalog = EmojiCatalog(dictSource)
+        evalLogger = GlideEvalLogger(filesDir)
+        dictionaries = AppEngineHolder.getDictionaries(this)
+        emojiCatalog = AppEngineHolder.getEmojiCatalog(this)
         scoreEngine = ScoreEngine(dictionaries, typoCorrectionEnabled = { settings.typoCorrectionEnabled })
         converter = AndroidMozcConverter(
             dictionaries = dictionaries,
@@ -153,7 +156,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
 
         bgExecutor.execute {
             MozcRuntime.ensureInitialized(applicationContext)
-            glideDecoder = GlideDecoder(dictionaries)
+            glideDecoder = AppEngineHolder.getGlideDecoder(applicationContext)
         }
     }
 
@@ -215,6 +218,9 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
                         recordUndoCommit(rawBefore, committed)
                     } else {
                         clearUndoCommit()
+                    }
+                    if (shouldLogEval()) {
+                        evalLogger.logCommit(settings.activePromptId, rawBefore, committed, "partial")
                     }
                     renderSnapshot(session.snapshot)
                 }
@@ -446,9 +452,13 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         super.onFinishInputView(finishingInput)
         isExpandedPanelOpen = false
         if (!session.isEmpty) {
+            val raw = session.snapshot.rawInput
             val committed = session.commitAndLearn(getSurroundingTextBefore())
             if (committed.isNotEmpty()) {
                 currentInputConnection?.commitText(committed, 1)
+                if (shouldLogEval()) {
+                    evalLogger.logCommit(settings.activePromptId, raw, committed, "finish_view")
+                }
             }
         }
         renderSnapshot(session.snapshot)
@@ -567,12 +577,18 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         lastUndoDeletedText = null
     }
 
+    private fun shouldLogEval(): Boolean =
+        ::settings.isInitialized && ::evalLogger.isInitialized && !isPasswordField && settings.glideEvalLoggingEnabled
+
     private fun performUndoCommit() {
         val ic = currentInputConnection ?: return
         val deleted = lastUndoDeletedText
         if (deleted != null) {
             clearUndoCommit()
             ic.commitText(deleted, 1)
+            if (shouldLogEval()) {
+                evalLogger.logBackspace(settings.activePromptId, "commit_undo", deleted, session.snapshot.previewText)
+            }
             renderSnapshot(session.snapshot)
             return
         }
@@ -580,13 +596,21 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         val committed = lastUndoCommittedText ?: return
         clearUndoCommit()
         if (committed.isEmpty()) {
-            renderSnapshot(session.restoreFromUndo(raw, getSurroundingTextBefore()))
+            val restored = session.restoreFromUndo(raw, getSurroundingTextBefore())
+            if (shouldLogEval()) {
+                evalLogger.logBackspace(settings.activePromptId, "commit_undo", raw, restored.previewText)
+            }
+            renderSnapshot(restored)
             return
         }
         val before = ic.getTextBeforeCursor(committed.length, 0)?.toString()
         if (before == committed) {
             ic.deleteSurroundingText(committed.length, 0)
-            renderSnapshot(session.restoreFromUndo(raw, getSurroundingTextBefore()))
+            val restored = session.restoreFromUndo(raw, getSurroundingTextBefore())
+            if (shouldLogEval()) {
+                evalLogger.logBackspace(settings.activePromptId, "commit_undo", "$raw->$committed", restored.previewText)
+            }
+            renderSnapshot(restored)
         } else {
             renderSnapshot(session.snapshot)
         }
@@ -620,10 +644,17 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
                 val out = committed + ch
                 currentInputConnection?.commitText(out, 1)
                 recordUndoCommit(raw, out)
+                if (shouldLogEval()) {
+                    evalLogger.logCommit(settings.activePromptId, raw, committed, "direct_char")
+                    evalLogger.logTap(settings.activePromptId, ch, true, "")
+                }
                 renderSnapshot(session.snapshot)
             } else {
                 clearUndoCommit()
                 currentInputConnection?.commitText(ch.toString(), 1)
+                if (shouldLogEval()) {
+                    evalLogger.logTap(settings.activePromptId, ch, true, "")
+                }
             }
             return
         }
@@ -635,10 +666,16 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         if (isPureStandaloneSymbol) {
             clearUndoCommit()
             currentInputConnection?.commitText(ch.toString(), 1)
+            if (shouldLogEval()) {
+                evalLogger.logTap(settings.activePromptId, ch, true, "")
+            }
             return
         }
         clearUndoCommit()
         val snap = session.appendChar(ch, getSurroundingTextBefore(), spatialHints)
+        if (shouldLogEval()) {
+            evalLogger.logTap(settings.activePromptId, ch, false, snap.previewText)
+        }
         renderSnapshot(snap)
     }
 
@@ -714,15 +751,24 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
                 val out = committed + punct
                 currentInputConnection?.commitText(out, 1)
                 recordUndoCommit(raw, out)
+                if (shouldLogEval()) {
+                    evalLogger.logCommit(settings.activePromptId, raw, committed, "punct")
+                }
                 renderSnapshot(session.snapshot)
             } else {
                 clearUndoCommit()
                 val updated = session.appendText(punct, getSurroundingTextBefore())
+                if (shouldLogEval()) {
+                    evalLogger.logTap(settings.activePromptId, punct.firstOrNull() ?: ',', false, updated.previewText)
+                }
                 renderSnapshot(updated)
             }
         } else {
             clearUndoCommit()
             currentInputConnection?.commitText(punct, 1)
+            if (shouldLogEval()) {
+                evalLogger.logTap(settings.activePromptId, punct.firstOrNull() ?: ',', true, "")
+            }
             renderSnapshot(session.snapshot)
         }
     }
@@ -741,11 +787,19 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         }
         if (isExpandedPanelOpen) isExpandedPanelOpen = false
         if (!session.isEmpty) {
+            val snapBefore = session.snapshot
             val snap = session.backspace(getSurroundingTextBefore())
+            if (shouldLogEval()) {
+                val kind = if (snapBefore.hasGlideUndo) "glide_undo" else "char_bs"
+                evalLogger.logBackspace(settings.activePromptId, kind, snapBefore.previewText, snap.previewText)
+            }
             renderSnapshot(snap)
         } else {
             clearUndoCommit()
             sendDownUpKeyEvents(KeyEvent.KEYCODE_DEL)
+            if (shouldLogEval()) {
+                evalLogger.logBackspace(settings.activePromptId, "committed_del", "", "")
+            }
             renderSnapshot(session.snapshot)
         }
     }
@@ -764,6 +818,9 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
                 lastUndoRawInput = rawBefore
                 lastUndoCommittedText = ""
                 lastUndoDeletedText = null
+                if (shouldLogEval()) {
+                    evalLogger.logBackspace(settings.activePromptId, "clear_all", rawBefore, "")
+                }
             }
             renderSnapshot(snap)
             currentInputConnection?.finishComposingText()
@@ -793,6 +850,9 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             lastUndoRawInput = null
             lastUndoCommittedText = null
             lastUndoDeletedText = removed
+            if (shouldLogEval()) {
+                evalLogger.logBackspace(settings.activePromptId, "word_swipe_bs", removed, "")
+            }
             renderSnapshot(session.snapshot)
         } else {
             clearUndoCommit()
@@ -877,6 +937,9 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             val committed = session.commitAndLearn(getSurroundingTextBefore())
             currentInputConnection?.commitText(committed, 1)
             recordUndoCommit(raw, committed)
+            if (shouldLogEval()) {
+                evalLogger.logCommit(settings.activePromptId, raw, committed, "enter")
+            }
             renderSnapshot(session.snapshot)
         } else {
             clearUndoCommit()
@@ -967,22 +1030,87 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         if (isExpandedPanelOpen) isExpandedPanelOpen = false
         if (isPasswordField) return
         clearUndoCommit()
-        val decoder = glideDecoder ?: GlideDecoder(dictionaries).also { glideDecoder = it }
+        val decoder = glideDecoder ?: AppEngineHolder.getGlideDecoder(applicationContext).also { glideDecoder = it }
         val norm = KeyLayoutGeometry.normalizeFromView(points, letterBounds)
         val snap = session.snapshot
         val inEnglishSentence = snap.isComposing && snap.rawInput.contains(' ') &&
             snap.clauses.lastOrNull()?.isEnglish == true
-        val cands = decoder.decode(norm, maxResults = 8, preferJapanese = !inEnglishSentence, fastPreview = false)
-        if (cands.isEmpty()) return
-        val top = cands.first()
-        val alts = cands.map { it.word to it.isEnglish }
-        val updated = session.appendGlideResult(
-            primaryWord = top.word,
-            isPrimaryEnglish = top.isEnglish,
-            alternatives = alts,
-            surroundingContext = getSurroundingTextBefore()
+        val preferJp = !inEnglishSentence
+        val loggingEval = shouldLogEval()
+        val debugRes = if (loggingEval) {
+            decoder.decodeDebug(norm, maxResults = 10, preferJapanese = preferJp)
+        } else {
+            null
+        }
+        val cands = if (debugRes != null) {
+            debugRes.candidates.take(8).map { GlideCandidate(it.word, it.isEnglish, it.scoreCost, it.kanaHint) }
+        } else {
+            decoder.decode(norm, maxResults = 8, preferJapanese = preferJp, fastPreview = false)
+        }
+        val composingBefore = snap.rawInput
+        val top = cands.firstOrNull()
+        val updated = if (top != null) {
+            val alts = cands.map { it.word to it.isEnglish }
+            session.appendGlideResult(
+                primaryWord = top.word,
+                isPrimaryEnglish = top.isEnglish,
+                alternatives = alts,
+                surroundingContext = getSurroundingTextBefore()
+            ).also { renderSnapshot(it) }
+        } else {
+            snap
+        }
+        if (debugRes != null && (top != null || (norm.size >= 3 && debugRes.pathLen >= 0.12f))) {
+            evalLogger.logGlide(
+                rawPoints = points,
+                normalizedPoints = norm,
+                boundsLeft = letterBounds.left,
+                boundsTop = letterBounds.top,
+                boundsWidth = letterBounds.width(),
+                boundsHeight = letterBounds.height(),
+                oneHandedMode = settings.oneHandedMode.name,
+                heightScale = settings.keyboardHeightScale,
+                preferJapanese = preferJp,
+                debugResult = debugRes,
+                composingBefore = composingBefore,
+                snapshotAfter = updated,
+                promptId = settings.activePromptId,
+                expectedText = settings.activePromptExpected
+            )
+        }
+    }
+
+    private fun selectCandidateAndLog(snap: CompositionSnapshot, item: CandidateItem, closeExpanded: Boolean) {
+        val rawBefore = snap.rawInput
+        val focusedClause = snap.clauses.getOrNull(snap.focusedClauseIndex)
+        val nextSnap = session.selectCandidate(
+            item,
+            getSurroundingTextBefore(),
+            advanceFocus = true
         )
-        renderSnapshot(updated)
+        if (closeExpanded) {
+            isExpandedPanelOpen = false
+        }
+        renderSnapshot(nextSnap)
+        if (shouldLogEval()) {
+            if (item.kind == CandidateKind.GLIDE_ALT) {
+                evalLogger.logGlideAltPicked(
+                    promptId = settings.activePromptId,
+                    fromRaw = rawBefore,
+                    pickedWord = item.text,
+                    isEnglish = item.subtitle.startsWith("英"),
+                    previewAfter = nextSnap.previewText
+                )
+            } else {
+                evalLogger.logCandidatePicked(
+                    promptId = settings.activePromptId,
+                    clauseReading = focusedClause?.reading.orEmpty(),
+                    pickedText = item.text,
+                    kind = item.kind.name,
+                    previewAfter = nextSnap.previewText
+                )
+            }
+        }
     }
 
     private fun showTransientTrace(text: String) {
@@ -1190,15 +1318,8 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
                 }
                 setOnClickListener {
                     val wasLast = snap.focusedClauseIndex >= snap.clauses.lastIndex
-                    val nextSnap = session.selectCandidate(
-                        item,
-                        getSurroundingTextBefore(),
-                        advanceFocus = true
-                    )
-                    if (isExpandedPanelOpen && (item.kind == CandidateKind.GLIDE_ALT || wasLast || snap.clauses.size <= 1)) {
-                        isExpandedPanelOpen = false
-                    }
-                    renderSnapshot(nextSnap)
+                    val close = isExpandedPanelOpen && (item.kind == CandidateKind.GLIDE_ALT || wasLast || snap.clauses.size <= 1)
+                    selectCandidateAndLog(snap, item, closeExpanded = close)
                 }
             }
 
@@ -1540,15 +1661,8 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
                             if (item.kind == CandidateKind.GLIDE_ALT) accent else border
                         ) {
                             val wasLast = snap.focusedClauseIndex >= snap.clauses.lastIndex
-                            val nextSnap = session.selectCandidate(
-                                item,
-                                getSurroundingTextBefore(),
-                                advanceFocus = true
-                            )
-                            if (item.kind == CandidateKind.GLIDE_ALT || wasLast || snap.clauses.size <= 1) {
-                                isExpandedPanelOpen = false
-                            }
-                            renderSnapshot(nextSnap)
+                            val close = item.kind == CandidateKind.GLIDE_ALT || wasLast || snap.clauses.size <= 1
+                            selectCandidateAndLog(snap, item, closeExpanded = close)
                         }
                         btn.layoutParams = LinearLayout.LayoutParams(0, dp(38), 1f).apply {
                             if (c < cols - 1) marginEnd = dp(5)

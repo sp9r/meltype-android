@@ -31,8 +31,9 @@ import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import io.github.sp9r.meltype.core.AndroidMozcConverter
-import io.github.sp9r.meltype.core.AssetDictionarySource
+import io.github.sp9r.meltype.core.AppEngineHolder
 import io.github.sp9r.meltype.core.CompositionSession
+import io.github.sp9r.meltype.core.GlideEvalLogger
 import io.github.sp9r.meltype.core.MeltypeDictionaries
 import io.github.sp9r.meltype.core.MozcRuntime
 import io.github.sp9r.meltype.core.ScoreEngine
@@ -41,6 +42,7 @@ import io.github.sp9r.meltype.glide.KeyLayoutGeometry
 import io.github.sp9r.meltype.glide.TouchPoint
 import io.github.sp9r.meltype.ui.GlideTraceLabView
 import io.github.sp9r.meltype.ui.KeyboardBlueprintView
+import org.json.JSONArray
 import java.io.File
 import java.util.concurrent.Executors
 import kotlin.math.roundToInt
@@ -53,7 +55,14 @@ class MainActivity : AppCompatActivity() {
         LEXICON("辞書・操作")
     }
 
+    private data class GlideEvalPrompt(
+        val id: String,
+        val category: String,
+        val text: String
+    )
+
     private lateinit var settings: MeltypeSettings
+    private lateinit var evalLogger: GlideEvalLogger
     private val executor = Executors.newSingleThreadExecutor()
 
     private var activeTab: WorkspaceTab = WorkspaceTab.STUDIO
@@ -62,6 +71,9 @@ class MainActivity : AppCompatActivity() {
     private var scoreEngine: ScoreEngine? = null
     private var converter: AndroidMozcConverter? = null
     private var glideDecoder: GlideDecoder? = null
+    private var evalPrompts: List<GlideEvalPrompt> = emptyList()
+    private var clearConfirmPending: Boolean = false
+    private val pendingSummaryRefresh = Runnable { refreshEvalSummaryAsync() }
 
     private lateinit var rootScroll: ScrollView
     private lateinit var setupStrip: LinearLayout
@@ -77,6 +89,12 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var sandboxInput: EditText
     private lateinit var probeResultBanner: TextView
+    private lateinit var evalPromptCounter: TextView
+    private lateinit var evalTargetTextView: TextView
+    private lateinit var evalPromptInput: EditText
+    private lateinit var evalToggleBtn: TextView
+    private lateinit var evalClearBtn: TextView
+    private lateinit var evalSummaryLabel: TextView
     private lateinit var glideLabView: GlideTraceLabView
     private lateinit var blueprintView: KeyboardBlueprintView
 
@@ -108,11 +126,39 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         settings = MeltypeSettings(this)
+        evalLogger = GlideEvalLogger(filesDir)
+        applyLaunchIntentOptions(intent)
+        evalPrompts = loadGlideEvalPrompts()
         val savedIdx = savedInstanceState?.getInt(KEY_ACTIVE_TAB, 0) ?: 0
         activeTab = WorkspaceTab.entries.getOrElse(savedIdx) { WorkspaceTab.STUDIO }
         resolvePalette()
         buildUi()
         initEngineAsync(runSelfTest = intent.getBooleanExtra("selftest", false))
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        applyLaunchIntentOptions(intent)
+        evalPrompts = loadGlideEvalPrompts()
+        if (::evalPromptCounter.isInitialized) {
+            bindActivePrompt(settings.activePromptIndex)
+            syncEvalToggleVisual()
+            refreshEvalSummaryAsync()
+        }
+        if (intent.getBooleanExtra("selftest", false)) {
+            executor.execute { runEngineSelfTest(writeFile = true) }
+        }
+    }
+
+    private fun applyLaunchIntentOptions(launchIntent: Intent?) {
+        if (launchIntent == null) return
+        if (launchIntent.hasExtra("glide_eval_logging")) {
+            settings.glideEvalLoggingEnabled = launchIntent.getBooleanExtra("glide_eval_logging", false)
+        }
+        if (launchIntent.getBooleanExtra("glide_eval_reset_prompt", false)) {
+            settings.activePromptIndex = 0
+        }
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
@@ -123,12 +169,21 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         refreshSystemStatus()
+        if (::evalSummaryLabel.isInitialized) {
+            evalPrompts = loadGlideEvalPrompts()
+            bindActivePrompt(settings.activePromptIndex)
+            syncEvalToggleVisual()
+            refreshEvalSummaryAsync()
+        }
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
         if (hasFocus) {
             refreshSystemStatus()
+            if (::evalSummaryLabel.isInitialized) {
+                refreshEvalSummaryAsync()
+            }
         }
     }
 
@@ -349,8 +404,13 @@ class MainActivity : AppCompatActivity() {
             )
         }
 
+        // 0. Real-Input Glide Prompt Runner & Telemetry Recorder
+        pane.addView(buildRealInputEvalCard())
+
         // 1. Live Conversion & Typo Repair Sandbox
-        val sandboxCard = makePanelFrame()
+        val sandboxCard = makePanelFrame().apply {
+            (layoutParams as LinearLayout.LayoutParams).topMargin = dp(12)
+        }
         val sandboxHead = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -394,8 +454,18 @@ class MainActivity : AppCompatActivity() {
                     if (raw.isEmpty()) {
                         probeResultBanner.visibility = View.GONE
                     }
+                    if (settings.glideEvalLoggingEnabled && ::evalSummaryLabel.isInitialized) {
+                        evalSummaryLabel.removeCallbacks(pendingSummaryRefresh)
+                        evalSummaryLabel.postDelayed(pendingSummaryRefresh, 280L)
+                    }
                 }
             })
+            setOnFocusChangeListener { _, hasFocus ->
+                if (hasFocus) {
+                    settings.activePromptId = "sandbox"
+                    settings.activePromptExpected = ""
+                }
+            }
         }
         sandboxCard.addView(sandboxInput)
 
@@ -585,6 +655,272 @@ class MainActivity : AppCompatActivity() {
         pane.addView(diagCard)
 
         return pane
+    }
+
+    private fun buildRealInputEvalCard(): LinearLayout {
+        val card = makePanelFrame()
+        val head = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(12), dp(10), dp(12), dp(6))
+        }
+        val titleCol = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                marginEnd = dp(8)
+            }
+        }
+        titleCol.addView(microHeading("REAL-INPUT GLIDE EVAL"))
+        evalPromptCounter = TextView(this).apply {
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
+            setTypeface(null, Typeface.BOLD)
+            setTextColor(cText)
+            setPadding(0, dp(2), 0, 0)
+        }
+        titleCol.addView(evalPromptCounter)
+        head.addView(titleCol)
+
+        evalToggleBtn = TextView(this).apply {
+            gravity = Gravity.CENTER
+            maxLines = 1
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+            setTypeface(null, Typeface.BOLD)
+            setPadding(dp(10), 0, dp(10), 0)
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(30))
+            setOnClickListener {
+                settings.glideEvalLoggingEnabled = !settings.glideEvalLoggingEnabled
+                syncEvalToggleVisual()
+                refreshEvalSummaryAsync()
+            }
+        }
+        head.addView(evalToggleBtn)
+        card.addView(head)
+
+        evalTargetTextView = TextView(this).apply {
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 15.5f)
+            setTypeface(null, Typeface.BOLD)
+            setTextColor(cText)
+            setTextIsSelectable(true)
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            background = boxBg(cAccentTint, cAccent, 5)
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                setMargins(dp(12), 0, dp(12), dp(8))
+            }
+        }
+        card.addView(evalTargetTextView)
+
+        evalPromptInput = EditText(this).apply {
+            hint = "上のお題を Meltype でグライド入力して「次のお題 →」を押してください"
+            setHintTextColor(cFaint)
+            setTextColor(cText)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14.5f)
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
+            minLines = 2
+            maxLines = 4
+            gravity = Gravity.TOP or Gravity.START
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            background = boxBg(cSurfaceSubtle, cBorder, 5)
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                setMargins(dp(12), 0, dp(12), dp(8))
+            }
+            addTextChangedListener(object : TextWatcher {
+                override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+                override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+                override fun afterTextChanged(s: Editable?) {
+                    if (settings.glideEvalLoggingEnabled && ::evalSummaryLabel.isInitialized) {
+                        evalSummaryLabel.removeCallbacks(pendingSummaryRefresh)
+                        evalSummaryLabel.postDelayed(pendingSummaryRefresh, 280L)
+                    }
+                }
+            })
+            setOnFocusChangeListener { _, hasFocus ->
+                if (hasFocus) {
+                    val prompt = evalPrompts.getOrNull(settings.activePromptIndex.coerceIn(0, (evalPrompts.size - 1).coerceAtLeast(0)))
+                    if (prompt != null) {
+                        settings.activePromptId = prompt.id
+                        settings.activePromptExpected = prompt.text
+                    }
+                }
+            }
+        }
+        card.addView(evalPromptInput)
+
+        val btnRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(12), 0, dp(12), dp(10))
+        }
+        val prevBtn = makeCompactChip("◀ 前", filled = false) {
+            if (evalPrompts.isEmpty()) return@makeCompactChip
+            val nextIdx = if (settings.activePromptIndex <= 0) evalPrompts.lastIndex else settings.activePromptIndex - 1
+            evalPromptInput.setText("")
+            bindActivePrompt(nextIdx)
+            refreshEvalSummaryAsync()
+        }.apply {
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(34)).apply {
+                marginEnd = dp(6)
+            }
+        }
+        val retryBtn = makeCompactChip("やり直し", filled = false) {
+            val prompt = evalPrompts.getOrNull(settings.activePromptIndex)
+            val typed = evalPromptInput.text?.toString().orEmpty()
+            if (settings.glideEvalLoggingEnabled && prompt != null && typed.isNotBlank()) {
+                evalLogger.logPromptDone(prompt.id, prompt.category, prompt.text, typed, "retry")
+            }
+            evalPromptInput.setText("")
+            evalPromptInput.requestFocus()
+            refreshEvalSummaryAsync()
+        }.apply {
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(34)).apply {
+                marginEnd = dp(6)
+            }
+        }
+        val nextBtn = makeCompactChip("次のお題 →", filled = true) {
+            if (evalPrompts.isEmpty()) return@makeCompactChip
+            val curIdx = settings.activePromptIndex.coerceIn(0, evalPrompts.lastIndex)
+            val prompt = evalPrompts[curIdx]
+            val typed = evalPromptInput.text?.toString().orEmpty()
+            if (settings.glideEvalLoggingEnabled) {
+                val action = if (typed.isBlank()) "skip" else "next"
+                evalLogger.logPromptDone(prompt.id, prompt.category, prompt.text, typed, action)
+            }
+            evalPromptInput.setText("")
+            bindActivePrompt((curIdx + 1) % evalPrompts.size)
+            evalPromptInput.requestFocus()
+            refreshEvalSummaryAsync()
+        }.apply {
+            layoutParams = LinearLayout.LayoutParams(0, dp(34), 1f)
+        }
+        btnRow.addView(prevBtn)
+        btnRow.addView(retryBtn)
+        btnRow.addView(nextBtn)
+        card.addView(btnRow)
+
+        card.addView(hairline())
+
+        val footer = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(12), dp(8), dp(12), dp(8))
+        }
+        evalSummaryLabel = TextView(this).apply {
+            text = "集計中..."
+            typeface = Typeface.MONOSPACE
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.5f)
+            setTextColor(cMuted)
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                marginEnd = dp(8)
+            }
+        }
+        val refreshBtn = makeCompactChip("更新", filled = false) {
+            refreshEvalSummaryAsync()
+        }.apply {
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(28)).apply {
+                marginEnd = dp(6)
+            }
+        }
+        evalClearBtn = makeCompactChip("消去", filled = false) {
+            if (!clearConfirmPending) {
+                clearConfirmPending = true
+                evalClearBtn.text = "確定消去?"
+                evalClearBtn.setTextColor(cWarning)
+                evalClearBtn.postDelayed({
+                    clearConfirmPending = false
+                    if (::evalClearBtn.isInitialized) {
+                        evalClearBtn.text = "消去"
+                        evalClearBtn.setTextColor(cText)
+                    }
+                }, 3000L)
+            } else {
+                clearConfirmPending = false
+                evalClearBtn.text = "消去"
+                evalClearBtn.setTextColor(cText)
+                executor.execute {
+                    evalLogger.clear()
+                    runOnUiThread { refreshEvalSummaryAsync() }
+                }
+            }
+        }.apply {
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(28))
+        }
+        footer.addView(evalSummaryLabel)
+        footer.addView(refreshBtn)
+        footer.addView(evalClearBtn)
+        card.addView(footer)
+
+        bindActivePrompt(settings.activePromptIndex)
+        syncEvalToggleVisual()
+        refreshEvalSummaryAsync()
+        return card
+    }
+
+    private fun loadGlideEvalPrompts(): List<GlideEvalPrompt> {
+        val file = File(filesDir, "glide_prompts.json")
+        if (file.isFile) {
+            val parsed = runCatching {
+                val arr = JSONArray(file.readText(Charsets.UTF_8))
+                buildList {
+                    for (i in 0 until arr.length()) {
+                        val obj = arr.optJSONObject(i) ?: continue
+                        val id = obj.optString("id").ifBlank { "p${i + 1}" }
+                        val cat = obj.optString("category").ifBlank { "実測" }
+                        val txt = obj.optString("text").trim()
+                        if (txt.isNotEmpty()) {
+                            add(GlideEvalPrompt(id, cat, txt))
+                        }
+                    }
+                }
+            }.getOrNull()
+            if (!parsed.isNullOrEmpty()) return parsed
+        }
+        return listOf(
+            GlideEvalPrompt("sample_01", "標準例", "おはようございます"),
+            GlideEvalPrompt("sample_02", "日英混在", "今日はGoogleで検索します"),
+            GlideEvalPrompt("sample_03", "標準例", "ありがとうございます")
+        )
+    }
+
+    private fun bindActivePrompt(rawIndex: Int) {
+        if (evalPrompts.isEmpty()) return
+        val idx = rawIndex.coerceIn(0, evalPrompts.lastIndex)
+        settings.activePromptIndex = idx
+        val prompt = evalPrompts[idx]
+        settings.activePromptId = prompt.id
+        settings.activePromptExpected = prompt.text
+        evalPromptCounter.text = "お題 ${idx + 1} / ${evalPrompts.size} · ${prompt.category}"
+        evalTargetTextView.text = prompt.text
+    }
+
+    private fun syncEvalToggleVisual() {
+        val on = settings.glideEvalLoggingEnabled
+        evalToggleBtn.text = if (on) "記録: ON" else "記録: OFF"
+        evalToggleBtn.setTextColor(if (on) Color.WHITE else cMuted)
+        evalToggleBtn.background = boxBg(
+            if (on) cAccent else cSurfaceSubtle,
+            if (on) cAccent else cBorder,
+            5
+        )
+    }
+
+    private fun refreshEvalSummaryAsync() {
+        if (!::evalLogger.isInitialized || !::evalSummaryLabel.isInitialized) return
+        executor.execute {
+            val s = evalLogger.readSummary()
+            val statusStr = if (settings.glideEvalLoggingEnabled) "記録中" else "停止中"
+            val latestStr = s.recentGlides.lastOrNull()?.let { "\n最新: $it" }.orEmpty()
+            val text = "$statusStr · ${s.glideCount}スワイプ / 戻し${s.glideUndoCount} / 候補${s.altPickCount} / 完了${s.promptDoneCount}件$latestStr"
+            runOnUiThread {
+                if (!isFinishing && !isDestroyed) {
+                    evalSummaryLabel.text = text
+                }
+            }
+        }
     }
 
     private fun buildLayoutWorkspace(): LinearLayout {
@@ -881,12 +1217,12 @@ class MainActivity : AppCompatActivity() {
 
     private fun initEngineAsync(runSelfTest: Boolean) {
         executor.execute {
-            val dicts = MeltypeDictionaries(AssetDictionarySource(applicationContext))
+            val dicts = AppEngineHolder.getDictionaries(applicationContext)
             dictionaries = dicts
             val mozcOk = MozcRuntime.ensureInitialized(applicationContext)
             scoreEngine = ScoreEngine(dicts)
             converter = AndroidMozcConverter(dicts)
-            val decoder = GlideDecoder(dicts)
+            val decoder = AppEngineHolder.getGlideDecoder(applicationContext)
             glideDecoder = decoder
 
             runOnUiThread {
@@ -910,7 +1246,7 @@ class MainActivity : AppCompatActivity() {
         sandboxInput.setText(sampleInput)
         sandboxInput.setSelection(sampleInput.length)
         executor.execute {
-            val dicts = dictionaries ?: MeltypeDictionaries(AssetDictionarySource(applicationContext)).also { dictionaries = it }
+            val dicts = dictionaries ?: AppEngineHolder.getDictionaries(applicationContext).also { dictionaries = it }
             MozcRuntime.ensureInitialized(applicationContext)
             val eng = scoreEngine ?: ScoreEngine(dicts).also { scoreEngine = it }
             val conv = converter ?: AndroidMozcConverter(dicts).also { converter = it }
@@ -976,11 +1312,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun runEngineSelfTest(writeFile: Boolean) {
-        val dicts = dictionaries ?: MeltypeDictionaries(AssetDictionarySource(applicationContext)).also { dictionaries = it }
+        val dicts = dictionaries ?: AppEngineHolder.getDictionaries(applicationContext).also { dictionaries = it }
         val mozcOk = MozcRuntime.ensureInitialized(applicationContext)
         val engine = ScoreEngine(dicts)
         val converter = AndroidMozcConverter(dicts)
-        val decoder = glideDecoder ?: GlideDecoder(dicts).also { glideDecoder = it }
+        val decoder = glideDecoder ?: AppEngineHolder.getGlideDecoder(applicationContext).also { glideDecoder = it }
 
         val sb = StringBuilder()
         var allPassed = true
@@ -1166,7 +1502,7 @@ class MainActivity : AppCompatActivity() {
             "qStart='$qStartPrev' qite='${qVowelSess.snapshot.previewText}' suji='$sujiPrev' sujiCands=${sujiCands.take(8)}"
         )
 
-        val catalog = io.github.sp9r.meltype.core.EmojiCatalog(AssetDictionarySource(applicationContext))
+        val catalog = AppEngineHolder.getEmojiCatalog(applicationContext)
         check(
             "EmojiCatalogFull",
             catalog.allEntries.size >= 1800 && catalog.search("egao").isNotEmpty(),
