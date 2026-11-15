@@ -690,9 +690,13 @@ class MainActivity : AppCompatActivity() {
             blueprintView.showNumberRow = it
         }
         switchCard.addView(hairline())
-        addSwitchRow(switchCard, "キー右上の数字・記号ヒントを表示", "0.22秒長押し・縦フリックで数字と記号を入力", settings.showSubLabels) {
+        addSwitchRow(switchCard, "キー右上の数字・記号ヒントを表示", "0.38秒長押しで数字・記号を入力（補助キーは上フリック対応）", settings.showSubLabels) {
             settings.showSubLabels = it
             blueprintView.showSubLabels = it
+        }
+        switchCard.addView(hairline())
+        addSwitchRow(switchCard, "文字キーの上フリック記号入力", "OFF推奨：グライド中の縦誤爆を防止（長押し入力と、。ー?123の上フリックは常時有効）", settings.letterFlickEnabled) {
+            settings.letterFlickEnabled = it
         }
         switchCard.addView(hairline())
         addSwitchRow(switchCard, "記号入力後に文字キーへ自動復帰", "?123から1文字入力した直後にQWERTYへ戻る", settings.autoReturnFromSymbols) {
@@ -1111,6 +1115,30 @@ class MainActivity : AppCompatActivity() {
         val uSaved = uCommitSess.commitAndLearn()
         val restored = uCommitSess.restoreFromUndo("kyou")
         check("UndoCommitRestore", uSaved.isNotEmpty() && restored.rawInput == "kyou" && restored.isComposing, "prev='${restored.previewText}'")
+
+        val noFalseSplit = listOf("makenai", "homete", "tameninaru").all { word ->
+            engine.segment(word).all { it.kind == io.github.sp9r.meltype.core.SegmentKind.JAPANESE }
+        }
+        check("JpNoFalseEngSplit", noFalseSplit, "makenai/homete/tameninaru=JP")
+
+        val pSess = CompositionSession(dicts, engine, converter)
+        pSess.appendText("kyouhagoogledekensaku")
+        pSess.focusClause(0)
+        val pCut = pSess.commitFocusedPrefix()
+        check(
+            "PartialPrefixCommit",
+            pCut.isNotEmpty() && pSess.snapshot.isComposing && pSess.snapshot.previewText.contains("google"),
+            "cut='$pCut' rem='${pSess.snapshot.previewText}'"
+        )
+
+        val warmPath = KeyLayoutGeometry.syntheticPathForWord("arigatou", jitter = 0.02f)
+        decoder.decode(warmPath, maxResults = 5, fastPreview = true)
+        val t0 = System.nanoTime()
+        val fastHits = decoder.decode(warmPath, maxResults = 5, fastPreview = false).map { it.word }
+        val ms = (System.nanoTime() - t0) / 1_000_000.0
+        check("GlideSpeedAndAccuracy", "arigatou" in fastHits.take(2) && ms < 80.0, "ms=${"%.1f".format(ms)} top=$fastHits")
+
+        check("DefaultLetterFlickOff", !MeltypeSettings(applicationContext).letterFlickEnabled, "letterFlickEnabled=false")
 
         val header = if (allPassed) "PASS\n" else "FAIL\n"
         val report = header + sb.toString()

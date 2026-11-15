@@ -23,7 +23,8 @@ data class DisplayClause(
     val reading: String,
     val text: String,
     val isEnglish: Boolean,
-    val candidates: List<String>
+    val candidates: List<String>,
+    val readingOffset: Int = 0
 )
 
 data class CompositionSnapshot(
@@ -204,13 +205,43 @@ class CompositionSession(
 
     /**
      * Manually shrinks (deltaKana < 0) or extends (deltaKana > 0) the focused Japanese clause
-     * by 1 hiragana character, shifting the boundary with the following clause in the same segment.
+     * by 1 hiragana character, locking prefix boundaries up to the focused clause while letting
+     * Mozc naturally re-segment remaining characters (merging contiguous Japanese segments if needed).
      */
     fun resizeFocusedClause(deltaKana: Int, surroundingContext: String? = null): CompositionSnapshot {
         if (deltaKana == 0) return cachedSnapshot
-        val clauses = cachedSnapshot.clauses
-        val focused = clauses.getOrNull(focusedClauseIdx) ?: return cachedSnapshot
+        var clauses = cachedSnapshot.clauses
+        var focused = clauses.getOrNull(focusedClauseIdx) ?: return cachedSnapshot
         if (focused.isEnglish) return cachedSnapshot
+
+        // If extending from the end of a Japanese segment directly into a contiguous Japanese segment, merge first
+        if (deltaKana > 0) {
+            val segs = scoreEngine.segment(buffer.toString(), overrides)
+            val segIdx = focused.segmentIndex
+            val nextClause = clauses.getOrNull(focusedClauseIdx + 1)
+            if (nextClause != null && !nextClause.isEnglish && nextClause.segmentIndex == segIdx + 1) {
+                val segA = segs.getOrNull(segIdx)
+                val segB = segs.getOrNull(segIdx + 1)
+                if (segA != null && segB != null &&
+                    segA.kind == SegmentKind.JAPANESE && segB.kind == SegmentKind.JAPANESE &&
+                    segA.endIndex == segB.startIndex
+                ) {
+                    val segALens = clauses.filter { it.segmentIndex == segIdx && !it.isEnglish && RomajiDetector.isHiraganaOnly(it.reading) }.map { it.reading.length }
+                    val mergedRange = segA.startIndex until segB.endIndex
+                    overrides.keys.filter { it.first <= mergedRange.last && it.last >= mergedRange.first }.toList()
+                        .forEach { overrides.remove(it) }
+                    overrides[mergedRange] = SegmentKind.JAPANESE
+                    customClauseSplits.remove(segIdx)
+                    customClauseSplits.remove(segIdx + 1)
+                    if (segALens.isNotEmpty()) {
+                        customClauseSplits[segIdx] = segALens.toMutableList()
+                    }
+                    recompute(surroundingContext, keepFocus = true)
+                    clauses = cachedSnapshot.clauses
+                    focused = clauses.getOrNull(focusedClauseIdx) ?: return cachedSnapshot
+                }
+            }
+        }
 
         val segIdx = focused.segmentIndex
         val segClauses = clauses.filter { it.segmentIndex == segIdx && !it.isEnglish && RomajiDetector.isHiraganaOnly(it.reading) }
@@ -220,29 +251,26 @@ class CompositionSession(
         val relIdx = focusedClauseIdx - firstGlobalIdx
         if (relIdx !in segClauses.indices) return cachedSnapshot
 
-        val lens = segClauses.map { it.reading.length }.toMutableList()
+        val prefixLens = segClauses.take(relIdx + 1).map { it.reading.length }.toMutableList()
+        val totalSegKana = segClauses.sumOf { it.reading.length }
         if (deltaKana < 0) {
-            if (lens[relIdx] <= 1) return cachedSnapshot
-            lens[relIdx] -= 1
-            if (relIdx + 1 < lens.size) {
-                lens[relIdx + 1] += 1
-            } else {
-                lens.add(1)
-            }
+            if (prefixLens[relIdx] <= 1) return cachedSnapshot
+            prefixLens[relIdx] -= 1
         } else {
-            if (relIdx + 1 >= lens.size) return cachedSnapshot
-            lens[relIdx] += 1
-            lens[relIdx + 1] -= 1
-            if (lens[relIdx + 1] <= 0) {
-                lens.removeAt(relIdx + 1)
-            }
+            val usedIncludingFocus = prefixLens.sum()
+            if (usedIncludingFocus >= totalSegKana) return cachedSnapshot
+            prefixLens[relIdx] += 1
         }
 
-        customClauseSplits[segIdx] = lens
-        // Reset user candidate overrides inside this segment so new boundaries show fresh conversions
+        customClauseSplits[segIdx] = prefixLens
+        val changedOffset = segClauses[relIdx].readingOffset
         val prefix = "$segIdx:"
-        selectedClauseTextByKey.keys.filter { it.startsWith(prefix) }.toList()
-            .forEach { selectedClauseTextByKey.remove(it) }
+        selectedClauseTextByKey.keys.filter { key ->
+            if (!key.startsWith(prefix)) return@filter false
+            val afterSeg = key.removePrefix(prefix)
+            val off = afterSeg.substringBefore(':').toIntOrNull() ?: 0
+            off >= changedOffset
+        }.toList().forEach { selectedClauseTextByKey.remove(it) }
         clearLastGlideHint()
         return recompute(surroundingContext, keepFocus = true)
     }
@@ -313,13 +341,70 @@ class CompositionSession(
         return committed
     }
 
+    /**
+     * Commits clauses [0..focusedClauseIndex] cleanly and leaves remaining clauses in composition.
+     */
+    fun commitFocusedPrefix(surroundingContext: String? = null): String {
+        val snap = cachedSnapshot
+        val clauses = snap.clauses
+        if (clauses.isEmpty()) return ""
+        val cutIdx = snap.focusedClauseIndex.coerceIn(0, clauses.lastIndex)
+        if (cutIdx == clauses.lastIndex) {
+            return commitAndLearn(surroundingContext)
+        }
+
+        val committedClauses = clauses.subList(0, cutIdx + 1)
+        val committed = committedClauses.joinToString("") { it.text }
+        val mozcClauses = committedClauses
+            .filter { !it.isEnglish && RomajiDetector.isHiraganaOnly(it.reading) }
+            .map { ConversionClause(it.reading, it.text) }
+        if (mozcClauses.isNotEmpty()) {
+            converter.learn(surroundingContext, mozcClauses)
+        }
+
+        val cutClause = clauses[cutIdx]
+        val segs = scoreEngine.segment(buffer.toString(), overrides)
+        val targetSeg = segs.getOrNull(cutClause.segmentIndex)
+        if (targetSeg == null) {
+            clearAll()
+            return committed
+        }
+
+        val remInSameSeg = clauses.drop(cutIdx + 1)
+            .filter { it.segmentIndex == cutClause.segmentIndex }
+            .joinToString("") { it.reading }
+        val tailAfterSeg = if (targetSeg.endIndex < buffer.length) buffer.substring(targetSeg.endIndex) else ""
+        val newRaw = remInSameSeg + tailAfterSeg
+        val shift = targetSeg.endIndex - remInSameSeg.length
+
+        val nextOverrides = LinkedHashMap<IntRange, SegmentKind>()
+        for ((range, kind) in overrides) {
+            if (range.first >= targetSeg.endIndex) {
+                val ns = (range.first - shift).coerceAtLeast(0)
+                val ne = (range.last - shift).coerceAtLeast(ns)
+                nextOverrides[ns..ne] = kind
+            }
+        }
+
+        buffer.setLength(0)
+        buffer.append(newRaw)
+        overrides.clear()
+        overrides.putAll(nextOverrides)
+        selectedClauseTextByKey.clear()
+        customClauseSplits.clear()
+        clearLastGlideHint()
+        focusedClauseIdx = 0
+        recompute((surroundingContext ?: "") + committed, keepFocus = true)
+        return committed
+    }
+
     private fun clearLastGlideHint() {
         lastGlideRange = null
         lastGlideLeadingSpace = false
         lastGlideAlternatives = emptyList()
     }
 
-    private fun clauseKey(c: DisplayClause): String = "${c.segmentIndex}:${c.raw}:${c.reading}"
+    private fun clauseKey(c: DisplayClause): String = "${c.segmentIndex}:${c.readingOffset}:${c.raw}:${c.reading}"
 
     private fun recompute(surroundingContext: String?, keepFocus: Boolean = false): CompositionSnapshot {
         val raw = buffer.toString()
@@ -330,8 +415,11 @@ class CompositionSession(
 
         val segments = scoreEngine.segment(raw, overrides)
         val displayClauses = ArrayList<DisplayClause>()
+        val segContextBuf = StringBuilder(surroundingContext ?: "")
 
         for ((segIdx, seg) in segments.withIndex()) {
+            val segContext = segContextBuf.toString().ifEmpty { null }
+            val segClauseStart = displayClauses.size
             when (seg.kind) {
                 SegmentKind.ENGLISH -> {
                     val lower = seg.raw.lowercase()
@@ -348,7 +436,7 @@ class CompositionSession(
                         cands.add(hiraVersion)
                         cands.add(kataVersion)
                     }
-                    val tempKey = "$segIdx:${seg.raw}:${seg.raw}"
+                    val tempKey = "$segIdx:0:${seg.raw}:${seg.raw}"
                     val chosen = selectedClauseTextByKey[tempKey] ?: seg.raw
                     displayClauses.add(
                         DisplayClause(
@@ -357,7 +445,8 @@ class CompositionSession(
                             reading = seg.raw,
                             text = chosen,
                             isEnglish = true,
-                            candidates = cands.toList()
+                            candidates = cands.toList(),
+                            readingOffset = 0
                         )
                     )
                 }
@@ -368,7 +457,7 @@ class CompositionSession(
                     if (calc != null) cands.add(calc)
                     cands.add(seg.raw)
                     cands.addAll(UtilityConverter.numericCandidates(seg.raw))
-                    val tempKey = "$segIdx:${seg.raw}:${seg.raw}"
+                    val tempKey = "$segIdx:0:${seg.raw}:${seg.raw}"
                     val chosen = selectedClauseTextByKey[tempKey] ?: cands.first()
                     displayClauses.add(
                         DisplayClause(
@@ -377,7 +466,8 @@ class CompositionSession(
                             reading = seg.raw,
                             text = chosen,
                             isEnglish = true,
-                            candidates = cands.distinct()
+                            candidates = cands.distinct(),
+                            readingOffset = 0
                         )
                     )
                 }
@@ -448,29 +538,48 @@ class CompositionSession(
                     }
 
                     if (activeHira.isNotEmpty()) {
-                        val customLens = customClauseSplits[segIdx]
-                        val clauses: List<ConversionClause> = if (
-                            customLens != null &&
-                            customLens.isNotEmpty() &&
-                            customLens.all { it >= 1 } &&
-                            customLens.sum() == activeHira.length
-                        ) {
+                        val lockedLens = customClauseSplits[segIdx]
+                        val usingCustomSplit = lockedLens != null &&
+                            lockedLens.isNotEmpty() &&
+                            lockedLens.all { it >= 1 } &&
+                            lockedLens.sum() <= activeHira.length
+                        val clauses: List<ConversionClause> = if (usingCustomSplit) {
                             var offset = 0
-                            customLens.map { sliceLen ->
-                                val sliceReading = activeHira.substring(offset, offset + sliceLen)
+                            var prefixCtx = segContext
+                            val lockedClauses = lockedLens!!.map { sliceLen ->
+                                val sliceOffset = offset
+                                val sliceReading = activeHira.substring(sliceOffset, sliceOffset + sliceLen)
+                                val sliceKey = "$segIdx:$sliceOffset:${seg.raw}:$sliceReading"
                                 offset += sliceLen
-                                val bestCand = converter.candidates(sliceReading).firstOrNull()
-                                    ?: converter.convertClauses(sliceReading, surroundingContext)?.joinToString("") { it.text }
-                                    ?: sliceReading
+                                val multiBest = converter.convertClauses(sliceReading, prefixCtx)?.joinToString("") { it.text }
+                                val candBest = converter.candidates(sliceReading).firstOrNull()
+                                val bestCand = when {
+                                    multiBest != null && (multiBest != sliceReading || candBest == null) -> multiBest
+                                    candBest != null -> candBest
+                                    else -> sliceReading
+                                }
+                                val chosenForCtx = selectedClauseTextByKey[sliceKey] ?: bestCand
+                                prefixCtx = (prefixCtx ?: "") + chosenForCtx
                                 ConversionClause(sliceReading, bestCand)
                             }
+                            val remainder = activeHira.substring(offset)
+                            val tailClauses = if (remainder.isNotEmpty()) {
+                                converter.convertClauses(remainder, prefixCtx)
+                                    ?: listOf(ConversionClause(remainder, remainder))
+                            } else {
+                                emptyList()
+                            }
+                            lockedClauses + tailClauses
                         } else {
-                            if (customLens != null) customClauseSplits.remove(segIdx)
-                            converter.convertClauses(activeHira, surroundingContext)
+                            if (lockedLens != null) customClauseSplits.remove(segIdx)
+                            converter.convertClauses(activeHira, segContext)
                                 ?: listOf(ConversionClause(activeHira, activeHira))
                         }
 
+                        var readingCursor = 0
                         for ((cIdx, c) in clauses.withIndex()) {
+                            val clauseOffset = readingCursor
+                            readingCursor += c.reading.length
                             val rawCands = converter.candidates(c.reading)
                             val utilCands = UtilityConverter.utilityCandidates(c.reading, seg.raw)
                             val misspellingCands = if (useTypoFix) dictionaries.resolveMisspelling(c.reading) else emptyList()
@@ -484,8 +593,10 @@ class CompositionSession(
                             val typoList = if (cIdx == 0) didyouMeanForWholeSeg.toList() else emptyList()
                             val rawFbList = if (cIdx == 0 && rawTypoFallback != null) listOf(rawTypoFallback) else emptyList()
 
+                            val isLockedPrefixClause = usingCustomSplit && cIdx < (lockedLens?.size ?: 0)
                             val allCands = (
                                 (if (isExactMisspelling) misspellingCands else emptyList()) +
+                                    (if (isLockedPrefixClause) listOf(preferredText) else emptyList()) +
                                     utilCands +
                                     rawCands +
                                     misspellingCands +
@@ -496,7 +607,7 @@ class CompositionSession(
                                 )
                                 .filter { it.isNotEmpty() }
                                 .distinct()
-                            val tempKey = "$segIdx:${seg.raw}:${c.reading}"
+                            val tempKey = "$segIdx:$clauseOffset:${seg.raw}:${c.reading}"
                             val isLastSubClause = (cIdx == clauses.lastIndex)
                             val tailSuffix = if (isLastSubClause && pendingTail != "n") pendingTail else ""
                             val chosen = (selectedClauseTextByKey[tempKey] ?: preferredText) + tailSuffix
@@ -507,7 +618,8 @@ class CompositionSession(
                                     reading = c.reading,
                                     text = chosen,
                                     isEnglish = false,
-                                    candidates = allCands
+                                    candidates = allCands,
+                                    readingOffset = clauseOffset
                                 )
                             )
                         }
@@ -519,11 +631,15 @@ class CompositionSession(
                                 reading = pendingTail,
                                 text = pendingTail,
                                 isEnglish = false,
-                                candidates = listOf(pendingTail)
+                                candidates = listOf(pendingTail),
+                                readingOffset = 0
                             )
                         )
                     }
                 }
+            }
+            for (k in segClauseStart until displayClauses.size) {
+                segContextBuf.append(displayClauses[k].text)
             }
         }
 
@@ -579,14 +695,16 @@ class CompositionSession(
             }
         }
 
-        // Prepend glide alternatives after the primary candidate so user can switch 1-tap between JP and EN glide decodes
+        // Prepend glide alternatives after the primary candidate (using fast cache/lookup to keep commit lag-free)
         if (lastGlideAlternatives.isNotEmpty()) {
-            val glideChips = lastGlideAlternatives.drop(1).take(6).map { (word, isEn) ->
+            val glideChips = lastGlideAlternatives.drop(1).take(4).map { (word, isEn) ->
                 val displayLabel = if (isEn) {
                     dictionaries.properNounCanonical[word.lowercase()] ?: word
                 } else {
                     val h = RomajiDetector.analyze(word).finalizedHiragana()
-                    converter.convertClauses(h)?.joinToString("") { it.text } ?: h
+                    dictionaries.readingToPhrases[h]?.firstOrNull()
+                        ?: converter.candidates(h).firstOrNull()
+                        ?: h
                 }
                 CandidateItem(
                     text = word,
@@ -603,7 +721,20 @@ class CompositionSession(
         val scriptVariants = buildScriptVariants(focused, displayClauses.count { it.segmentIndex == focused?.segmentIndex })
         val nextClause = displayClauses.getOrNull(focusedClauseIdx + 1)
         val canShrink = focused != null && !focused.isEnglish && RomajiDetector.isHiraganaOnly(focused.reading) && focused.reading.length >= 2
-        val canExtend = focused != null && !focused.isEnglish && nextClause != null && nextClause.segmentIndex == focused.segmentIndex && !nextClause.isEnglish && RomajiDetector.isHiraganaOnly(nextClause.reading)
+        val canExtendSameOrAdj = if (focused != null && !focused.isEnglish && nextClause != null && !nextClause.isEnglish && RomajiDetector.isHiraganaOnly(nextClause.reading)) {
+            if (nextClause.segmentIndex == focused.segmentIndex) {
+                true
+            } else if (nextClause.segmentIndex == focused.segmentIndex + 1) {
+                val sA = segments.getOrNull(focused.segmentIndex)
+                val sB = segments.getOrNull(nextClause.segmentIndex)
+                sA != null && sB != null && sA.kind == SegmentKind.JAPANESE && sB.kind == SegmentKind.JAPANESE && sA.endIndex == sB.startIndex
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+        val canExtend = canExtendSameOrAdj
         val hasGlideUndo = lastGlideRange != null && lastGlideRange!!.last == raw.length - 1
 
         val preview = displayClauses.joinToString("") { it.text }

@@ -92,6 +92,10 @@ class MeltypeSettings(context: Context) {
         get() = prefs.getBoolean(KEY_SUB_LABELS, true)
         set(value) = prefs.edit().putBoolean(KEY_SUB_LABELS, value).apply()
 
+    var letterFlickEnabled: Boolean
+        get() = prefs.getBoolean(KEY_LETTER_FLICK, false)
+        set(value) = prefs.edit().putBoolean(KEY_LETTER_FLICK, value).apply()
+
     var learningEnabled: Boolean
         get() = prefs.getBoolean(KEY_LEARNING, true)
         set(value) = prefs.edit().putBoolean(KEY_LEARNING, value).apply()
@@ -192,6 +196,7 @@ class MeltypeSettings(context: Context) {
         private const val KEY_PUNCT_STYLE = "punct_style"
         private const val KEY_HAPTIC = "haptic_feedback"
         private const val KEY_SUB_LABELS = "show_sub_labels"
+        private const val KEY_LETTER_FLICK = "letter_flick_enabled"
         private const val KEY_LEARNING = "learning_enabled"
         private const val KEY_TYPO_CORRECTION = "typo_correction_enabled"
         private const val KEY_RECENT_EMOJIS = "recent_emojis"

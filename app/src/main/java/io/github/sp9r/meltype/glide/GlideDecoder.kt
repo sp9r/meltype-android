@@ -3,9 +3,9 @@ package io.github.sp9r.meltype.glide
 import io.github.sp9r.meltype.core.MeltypeDictionaries
 import io.github.sp9r.meltype.core.RomajiDetector
 import kotlin.math.abs
-import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.sqrt
 
 data class GlideCandidate(
     val word: String,
@@ -42,7 +42,14 @@ class GlideDecoder(private val dictionaries: MeltypeDictionaries) {
         val arcFractions: FloatArray,
         val collapsedArcFractions: FloatArray,
         val collinearMask: Int,
-        val collapsedCollinearMask: Int
+        val collapsedCollinearMask: Int,
+        val tplCx: Float,
+        val tplCy: Float,
+        val tplScale: Float,
+        val tplInvScale: Float,
+        val smoothCx: Float,
+        val smoothCy: Float,
+        val smoothInvScale: Float
     )
 
     private data class SuffixEntry(
@@ -121,6 +128,8 @@ class GlideDecoder(private val dictionaries: MeltypeDictionaries) {
                 arcFracs to colMask
             }
 
+            val (tCx, tCy, tScale) = templateCentroidAndScale(tpl, KeyLayoutGeometry.RESAMPLE_N)
+            val (sCx, sCy, sScale) = templateCentroidAndScale(sTpl, KeyLayoutGeometry.RESAMPLE_N)
             val entry = LexiconEntry(
                 traceWord = trace,
                 outputWord = output,
@@ -138,7 +147,14 @@ class GlideDecoder(private val dictionaries: MeltypeDictionaries) {
                 arcFractions = arcFracs,
                 collapsedArcFractions = cArcFracs,
                 collinearMask = colMask,
-                collapsedCollinearMask = cColMask
+                collapsedCollinearMask = cColMask,
+                tplCx = tCx,
+                tplCy = tCy,
+                tplScale = tScale,
+                tplInvScale = 1f / tScale,
+                smoothCx = sCx,
+                smoothCy = sCy,
+                smoothInvScale = 1f / sScale
             )
             seen[dedupKey] = entry
             val idx = (trace.first() - 'a') * 26 + (trace.last() - 'a')
@@ -252,7 +268,8 @@ class GlideDecoder(private val dictionaries: MeltypeDictionaries) {
         // Tier 4: Untagged JMdict readings (negative prior so obscure readings do not hijack curved traces)
         for (hira in dictionaries.readingsSet) {
             if (hira.length in 2..9) {
-                registerJapaneseHira(hira, freqBonus = -0.06f)
+                val penalty = if (hira.length <= 2) -0.22f else -0.14f
+                registerJapaneseHira(hira, freqBonus = penalty)
             }
         }
 
@@ -278,7 +295,7 @@ class GlideDecoder(private val dictionaries: MeltypeDictionaries) {
                 val rom = RomajiDetector.analyze(w, strictForDetection = true)
                 val looksLikeJp = rom.isStrictValid && rom.pendingTail.isEmpty() && rom.chunks.size >= 2
                 if (!looksLikeJp) {
-                    registerTemplate(w, w, isEnglish = true, freqBonus = -0.35f)
+                    registerTemplate(w, w, isEnglish = true, freqBonus = -0.42f)
                 }
             }
         }
@@ -300,16 +317,24 @@ class GlideDecoder(private val dictionaries: MeltypeDictionaries) {
     fun decode(
         normalizedPoints: List<TouchPoint>,
         maxResults: Int = 8,
-        preferJapanese: Boolean = true
+        preferJapanese: Boolean = true,
+        fastPreview: Boolean = false
     ): List<GlideCandidate> {
-        return decodeInternal(normalizedPoints, maxResults, preferJapanese, allowCompoundSplit = true)
+        return decodeInternal(
+            normalizedPoints = normalizedPoints,
+            maxResults = maxResults,
+            preferJapanese = preferJapanese,
+            allowCompoundSplit = !fastPreview,
+            fastPreview = fastPreview
+        )
     }
 
     private fun decodeInternal(
         normalizedPoints: List<TouchPoint>,
         maxResults: Int,
         preferJapanese: Boolean,
-        allowCompoundSplit: Boolean
+        allowCompoundSplit: Boolean,
+        fastPreview: Boolean = false
     ): List<GlideCandidate> {
         if (normalizedPoints.size < 2) return emptyList()
 
@@ -326,62 +351,92 @@ class GlideDecoder(private val dictionaries: MeltypeDictionaries) {
         val endX = normalizedPoints.last().x
         val endY = normalizedPoints.last().y
 
-        val startKeys = KeyLayoutGeometry.nearestKeys(startX, startY, limit = 10)
-        val endKeys = KeyLayoutGeometry.nearestKeys(endX, endY, limit = 10)
+        val startLimit = if (fastPreview) 5 else 8
+        val endLimit = if (fastPreview) 5 else 8
+        val maxEndpointDist = if (fastPreview) 0.58f else 0.68f
+        val startKeys = KeyLayoutGeometry.nearestKeys(startX, startY, limit = startLimit)
+        val endKeys = KeyLayoutGeometry.nearestKeys(endX, endY, limit = endLimit)
 
-        val stage1 = ArrayList<Stage1Hit>(80)
+        val stage1Limit = if (fastPreview) 40 else 72
+        val stage1 = ArrayList<Stage1Hit>(stage1Limit)
+        var stage1WorstCost = 2.75f
 
+        val maxPairs = startKeys.size * endKeys.size
+        val pairBuckets = IntArray(maxPairs)
+        val pairCosts = FloatArray(maxPairs)
+        var pairCount = 0
         for ((sChar, sDist) in startKeys) {
-            if (sDist > 0.78f && startKeys.first().first != sChar) continue
+            if (sDist > maxEndpointDist && startKeys.first().first != sChar) continue
             val effSDist = max(0f, sDist - 0.13f)
             val sIdx = (sChar - 'a') * 26
             for ((eChar, eDist) in endKeys) {
-                if (eDist > 0.78f && endKeys.first().first != eChar) continue
+                if (eDist > maxEndpointDist && endKeys.first().first != eChar) continue
                 val effEDist = max(0f, eDist - 0.13f)
-                val endpointCost = (effSDist + effEDist) * 0.72f
-                val bucket = buckets[sIdx + (eChar - 'a')]
-                for (entry in bucket) {
-                    val lenDiff = abs(pathLen - entry.arcLen)
-                    val maxLenBound = maxOf(pathLen, entry.arcLen) * 0.85f + 0.65f
-                    if (lenDiff > maxLenBound) continue
+                val endpointCost = (effSDist + effEDist) * 0.76f
+                var ins = pairCount
+                while (ins > 0 && pairCosts[ins - 1] > endpointCost) {
+                    pairCosts[ins] = pairCosts[ins - 1]
+                    pairBuckets[ins] = pairBuckets[ins - 1]
+                    ins--
+                }
+                pairCosts[ins] = endpointCost
+                pairBuckets[ins] = sIdx + (eChar - 'a')
+                pairCount++
+            }
+        }
 
-                    var rawLocDist = meanPointDist(path, entry.template, n, nFloat)
-                    var effArcDiff = lenDiff
+        for (pIdx in 0 until pairCount) {
+            val endpointCost = pairCosts[pIdx]
+            val bucket = buckets[pairBuckets[pIdx]]
+            for (entry in bucket) {
+                val lenDiff = abs(pathLen - entry.arcLen)
+                val maxLenBound = maxOf(pathLen, entry.arcLen) * 0.85f + 0.65f
+                if (lenDiff > maxLenBound) continue
 
-                    val smoothLocDist = meanPointDist(path, entry.smoothedTemplate, n, nFloat) - 0.005f
-                    if (smoothLocDist < rawLocDist) {
-                        rawLocDist = smoothLocDist
-                        effArcDiff = min(effArcDiff, abs(pathLen - entry.smoothedArcLen) + 0.02f)
+                val langPrior = when {
+                    preferJapanese && !entry.isEnglish -> 0.24f
+                    !preferJapanese && entry.isEnglish -> 0.20f
+                    else -> 0f
+                }
+                val minLower = endpointCost - entry.freqBonus - langPrior
+                if (minLower - 0.01f >= stage1WorstCost) continue
+
+                val cTpl = entry.collapsedTemplate
+                if (cTpl == null) {
+                    val cLoc8 = coarseDist8(path, entry.template)
+                    if (cLoc8 > 0.96f && coarseDist8(path, entry.smoothedTemplate) > 0.96f) continue
+                    val cShape8 = coarseShapeDist8Cached(pathShape, entry.template, entry.tplCx, entry.tplCy, entry.tplInvScale)
+                    if (minLower + cLoc8 * 0.78f + cShape8 * 2.15f > stage1WorstCost + 0.55f) continue
+                }
+
+                var rawLocDist = meanPointDist(path, entry.template, n, nFloat)
+                var effArcDiff = lenDiff
+
+                val smoothLocDist = meanPointDist(path, entry.smoothedTemplate, n, nFloat) - 0.005f
+                if (smoothLocDist < rawLocDist) {
+                    rawLocDist = smoothLocDist
+                    effArcDiff = min(effArcDiff, abs(pathLen - entry.smoothedArcLen) + 0.02f)
+                }
+
+                if (cTpl != null) {
+                    val cLoc = meanPointDist(path, cTpl, n, nFloat) + 0.01f
+                    if (cLoc < rawLocDist) {
+                        rawLocDist = cLoc
+                        effArcDiff = min(effArcDiff, abs(pathLen - entry.collapsedArcLen) + 0.04f)
                     }
+                }
 
-                    val cTpl = entry.collapsedTemplate
-                    if (cTpl != null) {
-                        val cLoc = meanPointDist(path, cTpl, n, nFloat) + 0.01f
-                        if (cLoc < rawLocDist) {
-                            rawLocDist = cLoc
-                            effArcDiff = min(effArcDiff, abs(pathLen - entry.collapsedArcLen) + 0.04f)
-                        }
-                    }
+                val shapeDist = min(
+                    templateShapeDistCached(pathShape, entry.template, n, nFloat, entry.tplCx, entry.tplCy, entry.tplInvScale),
+                    templateShapeDistCached(pathShape, entry.smoothedTemplate, n, nFloat, entry.smoothCx, entry.smoothCy, entry.smoothInvScale)
+                )
+                val baseCost = minLower +
+                    rawLocDist * 0.78f +
+                    shapeDist * 2.15f +
+                    effArcDiff * 0.10f
 
-                    val shapeDist = min(
-                        templateShapeDist(pathShape, entry.template, n),
-                        templateShapeDist(pathShape, entry.smoothedTemplate, n)
-                    )
-                    val langPrior = when {
-                        preferJapanese && !entry.isEnglish -> 0.22f
-                        !preferJapanese && entry.isEnglish -> 0.18f
-                        else -> 0f
-                    }
-                    val baseCost = endpointCost +
-                        rawLocDist * 0.78f +
-                        shapeDist * 2.15f +
-                        effArcDiff * 0.10f -
-                        entry.freqBonus -
-                        langPrior
-
-                    if (baseCost < 2.65f) {
-                        insertTopStage1(stage1, Stage1Hit(entry, baseCost), limit = 80)
-                    }
+                if (baseCost < stage1WorstCost) {
+                    stage1WorstCost = insertTopStage1(stage1, Stage1Hit(entry, baseCost), limit = stage1Limit)
                 }
             }
         }
@@ -422,28 +477,33 @@ class GlideDecoder(private val dictionaries: MeltypeDictionaries) {
                 collinearMask = e.collinearMask,
                 resampledPath = path,
                 pathShape = pathShape,
-                tpl = e.template,
-                n = n
+                n = n,
+                tCx = e.tplCx,
+                tCy = e.tplCy,
+                tScale = e.tplScale
             )
             if (e.collapsedTrace != e.traceWord && e.collapsedTrace.length >= 2 && e.collapsedTemplate != null) {
+                val (cCx, cCy, cScale) = templateCentroidAndScale(e.collapsedTemplate, n)
                 val cWp = computeWaypointPenalty(
                     trace = e.collapsedTrace,
                     arcFractions = e.collapsedArcFractions,
                     collinearMask = e.collapsedCollinearMask,
                     resampledPath = path,
                     pathShape = pathShape,
-                    tpl = e.collapsedTemplate,
-                    n = n
+                    n = n,
+                    tCx = cCx,
+                    tCy = cCy,
+                    tScale = cScale
                 ) + 0.01f
                 if (cWp < wpPenalty) wpPenalty = cWp
             }
 
-            val finalCost = hit.baseCost + cornerAdj + dirDist * 1.40f + wpPenalty * 0.55f
+            val finalCost = hit.baseCost + cornerAdj + dirDist * 1.40f + wpPenalty * 0.60f
             candidates.add(GlideCandidate(e.outputWord, e.isEnglish, finalCost, e.kanaHint))
         }
 
         // Compound suffix split rescue for single-stroke Stem + masu/desu/shimasu/gozaimasu/etc.
-        if (allowCompoundSplit && preferJapanese && pathLen >= 1.35f && normalizedPoints.size >= 6) {
+        if (!fastPreview && allowCompoundSplit && preferJapanese && pathLen >= 1.35f && normalizedPoints.size >= 6) {
             decodeCompoundSplits(normalizedPoints, pathLen, endKeys, n, candidates)
         }
 
@@ -484,10 +544,9 @@ class GlideDecoder(private val dictionaries: MeltypeDictionaries) {
         val cum = FloatArray(m)
         var acc = 0f
         for (i in 1 until m) {
-            acc += hypot(
-                (normalizedPoints[i].x - normalizedPoints[i - 1].x).toDouble(),
-                (normalizedPoints[i].y - normalizedPoints[i - 1].y).toDouble()
-            ).toFloat()
+            val dx = normalizedPoints[i].x - normalizedPoints[i - 1].x
+            val dy = normalizedPoints[i].y - normalizedPoints[i - 1].y
+            acc += sqrt(dx * dx + dy * dy)
             cum[i] = acc
         }
         val endChars = endKeys.take(3).map { it.first }.toSet()
@@ -504,10 +563,9 @@ class GlideDecoder(private val dictionaries: MeltypeDictionaries) {
             for (i in 2 until m - 2) {
                 val frac = cum[i] / totalLen
                 if (frac !in 0.30f..0.85f) continue
-                val d = hypot(
-                    (normalizedPoints[i].x - sufStartKey.x).toDouble(),
-                    (normalizedPoints[i].y - sufStartKey.y).toDouble()
-                ).toFloat()
+                val dx = normalizedPoints[i].x - sufStartKey.x
+                val dy = normalizedPoints[i].y - sufStartKey.y
+                val d = sqrt(dx * dx + dy * dy)
                 if (d < bestStartD) {
                     bestStartD = d
                     splitIdx = i
@@ -550,6 +608,39 @@ class GlideDecoder(private val dictionaries: MeltypeDictionaries) {
         }
     }
 
+    private fun coarseDist8(a: FloatArray, b: FloatArray): Float {
+        // Indices 0, 4, 8, 12, 16, 20, 24, 28 -> Float offsets 0, 8, 16, ..., 56
+        var sum = 0f
+        var idx = 0
+        while (idx <= 56) {
+            val dx = a[idx] - b[idx]
+            val dy = a[idx + 1] - b[idx + 1]
+            sum += sqrt(dx * dx + dy * dy)
+            idx += 8
+        }
+        return sum * 0.125f
+    }
+
+    private fun coarseShapeDist8Cached(
+        pathShape: FloatArray,
+        tpl: FloatArray,
+        cx: Float,
+        cy: Float,
+        invScale: Float
+    ): Float {
+        var sum = 0f
+        var idx = 0
+        while (idx <= 56) {
+            val sx = (tpl[idx] - cx) * invScale
+            val sy = (tpl[idx + 1] - cy) * invScale
+            val dx = pathShape[idx] - sx
+            val dy = pathShape[idx + 1] - sy
+            sum += sqrt(dx * dx + dy * dy)
+            idx += 8
+        }
+        return sum * 0.125f
+    }
+
     private fun meanPointDist(a: FloatArray, b: FloatArray, n: Int, nFloat: Float): Float {
         var sum = 0f
         var j = 0
@@ -557,7 +648,7 @@ class GlideDecoder(private val dictionaries: MeltypeDictionaries) {
         while (j < limit) {
             val dx = a[j] - b[j]
             val dy = a[j + 1] - b[j + 1]
-            sum += hypot(dx.toDouble(), dy.toDouble()).toFloat()
+            sum += sqrt(dx * dx + dy * dy)
             j += 2
         }
         return sum / nFloat
@@ -589,18 +680,32 @@ class GlideDecoder(private val dictionaries: MeltypeDictionaries) {
         return Triple(cx, cy, scale)
     }
 
-    private fun templateShapeDist(pathShape: FloatArray, tpl: FloatArray, n: Int): Float {
-        val (cx, cy, scale) = templateCentroidAndScale(tpl, n)
+    private fun templateShapeDistCached(
+        pathShape: FloatArray,
+        tpl: FloatArray,
+        n: Int,
+        nFloat: Float,
+        cx: Float,
+        cy: Float,
+        invScale: Float
+    ): Float {
         var sum = 0f
         var i = 0
         val limit = n * 2
         while (i < limit) {
-            val sx = (tpl[i] - cx) / scale
-            val sy = (tpl[i + 1] - cy) / scale
-            sum += hypot((pathShape[i] - sx).toDouble(), (pathShape[i + 1] - sy).toDouble()).toFloat()
+            val sx = (tpl[i] - cx) * invScale
+            val sy = (tpl[i + 1] - cy) * invScale
+            val dx = pathShape[i] - sx
+            val dy = pathShape[i + 1] - sy
+            sum += sqrt(dx * dx + dy * dy)
             i += 2
         }
-        return sum / n.toFloat()
+        return sum / nFloat
+    }
+
+    private fun templateShapeDist(pathShape: FloatArray, tpl: FloatArray, n: Int): Float {
+        val (cx, cy, scale) = templateCentroidAndScale(tpl, n)
+        return templateShapeDistCached(pathShape, tpl, n, n.toFloat(), cx, cy, 1f / scale)
     }
 
     private fun templateDirDist(pathDirs: FloatArray, tpl: FloatArray, n: Int): Float {
@@ -612,7 +717,7 @@ class GlideDecoder(private val dictionaries: MeltypeDictionaries) {
             if (px == 0f && py == 0f) continue
             val tx = tpl[(i + 1) * 2] - tpl[i * 2]
             val ty = tpl[(i + 1) * 2 + 1] - tpl[i * 2 + 1]
-            val tLen = hypot(tx.toDouble(), ty.toDouble()).toFloat()
+            val tLen = sqrt(tx * tx + ty * ty)
             if (tLen > 1e-5f) {
                 val dot = ((px * tx + py * ty) / tLen).coerceIn(-1f, 1f)
                 sum += 0.5f * (1f - dot)
@@ -628,12 +733,13 @@ class GlideDecoder(private val dictionaries: MeltypeDictionaries) {
         collinearMask: Int,
         resampledPath: FloatArray,
         pathShape: FloatArray,
-        tpl: FloatArray,
-        n: Int
+        n: Int,
+        tCx: Float,
+        tCy: Float,
+        tScale: Float
     ): Float {
         val len = trace.length
         if (len <= 2) return 0f
-        val (tCx, tCy, tScale) = templateCentroidAndScale(tpl, n)
         var rawWeightedSum = 0f
         var normWeightedSum = 0f
         var totalWeight = 0f
@@ -653,14 +759,16 @@ class GlideDecoder(private val dictionaries: MeltypeDictionaries) {
             for (pIdx in lo..hi) {
                 val rdx = resampledPath[pIdx * 2] - kc.x
                 val rdy = resampledPath[pIdx * 2 + 1] - kc.y
-                val rd = hypot(rdx.toDouble(), rdy.toDouble()).toFloat()
+                val rd = sqrt(rdx * rdx + rdy * rdy)
                 if (rd < bestRawD) {
                     bestRawD = rd
                     bestIdx = pIdx
                 }
                 val ax = pathShape[pIdx * 2] * tScale + tCx
                 val ay = pathShape[pIdx * 2 + 1] * tScale + tCy
-                val nd = hypot((ax - kc.x).toDouble(), (ay - kc.y).toDouble()).toFloat()
+                val ndx = ax - kc.x
+                val ndy = ay - kc.y
+                val nd = sqrt(ndx * ndx + ndy * ndy)
                 if (nd < bestNormD) {
                     bestNormD = nd
                 }
@@ -684,10 +792,15 @@ class GlideDecoder(private val dictionaries: MeltypeDictionaries) {
         return min(rawWp, normWp + 0.04f)
     }
 
-    private fun insertTopStage1(list: MutableList<Stage1Hit>, item: Stage1Hit, limit: Int) {
+    private fun insertTopStage1(list: MutableList<Stage1Hit>, item: Stage1Hit, limit: Int): Float {
         if (list.size < limit) {
             list.add(item)
-            return
+            if (list.size < limit) return 2.75f
+            var mx = list[0].baseCost
+            for (i in 1 until list.size) {
+                if (list[i].baseCost > mx) mx = list[i].baseCost
+            }
+            return mx
         }
         var maxIdx = 0
         var maxCost = list[0].baseCost
@@ -699,7 +812,13 @@ class GlideDecoder(private val dictionaries: MeltypeDictionaries) {
         }
         if (item.baseCost < maxCost) {
             list[maxIdx] = item
+            var nextMax = list[0].baseCost
+            for (i in 1 until list.size) {
+                if (list[i].baseCost > nextMax) nextMax = list[i].baseCost
+            }
+            return nextMax
         }
+        return maxCost
     }
 
     companion object {
@@ -935,7 +1054,17 @@ class GlideDecoder(private val dictionaries: MeltypeDictionaries) {
             "ha" to "は", "ga" to "が", "wo" to "を", "ni" to "に", "de" to "で", "to" to "と", "no" to "の", "mo" to "も",
             "he" to "へ", "kara" to "から", "made" to "まで", "yori" to "より", "dake" to "だけ",
             "nado" to "など", "toka" to "とか", "demo" to "でも", "kedo" to "けど", "node" to "ので",
-            "noni" to "のに", "tame" to "ため", "youni" to "ように", "desuka" to "ですか", "desune" to "ですね", "desuyo" to "ですよ"
+            "noni" to "のに", "tame" to "ため", "youni" to "ように", "desuka" to "ですか", "desune" to "ですね", "desuyo" to "ですよ",
+            "maji" to "まじ", "yokatta" to "よかった", "ganbaru" to "がんばる", "ganbatte" to "がんばって",
+            "shiranai" to "しらない", "wakaranai" to "わからない", "dekinai" to "できない",
+            "taihen" to "たいへん", "daiji" to "だいじ", "hitsuyou" to "ひつよう", "mondai" to "もんだい",
+            "riyu" to "りゆう", "kekka" to "けっか", "keikaku" to "けいかく", "jissai" to "じっさい",
+            "toriaezu" to "とりあえず", "sonomama" to "そのまま", "seikou" to "せいこう", "shippai" to "しっぱい",
+            "shinpai" to "しんぱい", "zannen" to "ざんねん", "mendou" to "めんどう", "tadaima" to "ただいま",
+            "okaeri" to "おかえり", "douzo" to "どうぞ", "kondo" to "こんど", "kongetsu" to "こんげつ",
+            "raigetsu" to "らいげつ", "kotoshi" to "ことし", "rainen" to "らいねん", "kyonen" to "きょねん",
+            "yarimasu" to "やります", "yatte" to "やって", "yatta" to "やった", "neru" to "ねる", "okiru" to "おきる",
+            "tasukete" to "たすけて", "isogashii" to "いそがしい", "tanoshimi" to "たのしみ", "ohayougozaimasu" to "おはようございます"
         )
 
         private val CORE_ENGLISH_WORDS = listOf(

@@ -38,10 +38,10 @@ interface KeyboardActionListener {
  * Compact-Rail styled QWERTY software keyboard with:
  * - Freely scalable height (65%..155%)
  * - Optional persistent top number row (1..0) separated cleanly from 3-row glide geometry
- * - Non-conflicting long-press (220ms) and fast vertical flick for secondary numbers/symbols
+ * - Non-conflicting long-press (380ms) and upward-only vertical flick for secondary numbers/symbols
  * - Direct prolonged-sound / hyphen ("ー") key on bottom row + dedicated Numpad layer
  * - Glide typing trail & dual-language decoding hooks
- * - Spacebar horizontal cursor/clause slide & Backspace repeat / swipe-left clear
+ * - Spacebar horizontal cursor/clause slide with initial tap deadzone & Backspace repeat / swipe-left clear
  */
 class QwertyKeyboardView @JvmOverloads constructor(
     context: Context,
@@ -70,6 +70,7 @@ class QwertyKeyboardView @JvmOverloads constructor(
     var glideEnabled: Boolean = true
     var hapticEnabled: Boolean = true
     var showSubLabels: Boolean = true
+    var letterFlickEnabled: Boolean = false
     var showNumberRow: Boolean = true
         set(value) {
             if (field != value) {
@@ -164,11 +165,13 @@ class QwertyKeyboardView @JvmOverloads constructor(
         }
     }
 
+    fun isActivelyGliding(): Boolean = isGliding && activePointerId != -1
+
     private val subLongPressRunnable = Runnable {
         val dk = downKey
         if (dk != null && dk.subOutputChar != '\u0000' &&
-            activePointerId != -1 && !isGliding && !isSpaceSliding &&
-            hypot((lastX - downX).toDouble(), (lastY - downY).toDouble()) < keyWidthAvg * 0.45f
+            activePointerId != -1 && !isGliding && !isSpaceSliding && !verticalFlickActive &&
+            hypot((lastX - downX).toDouble(), (lastY - downY).toDouble()) < keyWidthAvg * 0.34f
         ) {
             subLongPressActive = true
             verticalFlickActive = false
@@ -673,7 +676,7 @@ class QwertyKeyboardView @JvmOverloads constructor(
                         handler.postDelayed(cursorRepeatRunnable, 320L)
                     } else {
                         if (hit.subOutputChar != '\u0000') {
-                            handler.postDelayed(subLongPressRunnable, 220L)
+                            handler.postDelayed(subLongPressRunnable, 380L)
                         }
                         if (glideEnabled && layer == Layer.QWERTY && isLetterCharKey(hit)) {
                             glideTrail.add(TouchPoint(x, y, event.eventTime))
@@ -693,14 +696,24 @@ class QwertyKeyboardView @JvmOverloads constructor(
 
                 if (dk?.kind == KeyKind.SPACE) {
                     val dx = x - lastX
-                    spaceSlideAccumX += dx
-                    val step = keyWidthAvg * 0.42f
-                    if (abs(spaceSlideAccumX) >= step) {
-                        isSpaceSliding = true
-                        val dir = if (spaceSlideAccumX > 0f) 1 else -1
-                        spaceSlideAccumX -= dir * step
-                        performHaptic()
-                        listener?.onMoveCursor(dir)
+                    if (!isSpaceSliding) {
+                        val totalDx = x - downX
+                        if (abs(totalDx) >= keyWidthAvg * 0.72f) {
+                            isSpaceSliding = true
+                            val dir = if (totalDx > 0f) 1 else -1
+                            spaceSlideAccumX = 0f
+                            performHaptic()
+                            listener?.onMoveCursor(dir)
+                        }
+                    } else {
+                        spaceSlideAccumX += dx
+                        val step = keyWidthAvg * 0.42f
+                        if (abs(spaceSlideAccumX) >= step) {
+                            val dir = if (spaceSlideAccumX > 0f) 1 else -1
+                            spaceSlideAccumX -= dir * step
+                            performHaptic()
+                            listener?.onMoveCursor(dir)
+                        }
                     }
                     lastX = x
                     lastY = y
@@ -708,43 +721,53 @@ class QwertyKeyboardView @JvmOverloads constructor(
                 }
 
                 val totalDist = hypot((x - downX).toDouble(), (y - downY).toDouble()).toFloat()
-                if (totalDist > keyWidthAvg * 0.45f) {
+                if (totalDist > keyWidthAvg * 0.34f) {
                     handler.removeCallbacks(subLongPressRunnable)
                 }
 
                 val hover = findKeyAt(x, y)
-                val dxAbs = abs(x - downX)
-                val absDy = abs(y - downY)
                 val elapsed = event.eventTime - downTimeMs
 
-                if (!isGliding && !subLongPressActive && dk != null && dk.subOutputChar != '\u0000') {
-                    val flickThresh = keyHeightAvg * (0.36f / flickSensitivity)
-                    verticalFlickActive = (
-                        absDy > flickThresh &&
-                            absDy > dxAbs * 1.45f &&
-                            dxAbs < keyWidthAvg * 0.65f
-                        )
+                if (!isGliding && !subLongPressActive && isFlickEnabledForKey(dk)) {
+                    val wasFlick = verticalFlickActive
+                    verticalFlickActive = isUpwardFlickGesture(
+                        k = dk,
+                        curX = x,
+                        curY = y,
+                        elapsedMs = elapsed,
+                        maintain = wasFlick
+                    )
+                    if (verticalFlickActive && !wasFlick) {
+                        handler.removeCallbacks(subLongPressRunnable)
+                        performHaptic()
+                    }
                 }
 
                 if (!isGliding && !subLongPressActive && glideEnabled && layer == Layer.QWERTY && isLetterCharKey(dk)) {
                     glideTrail.add(TouchPoint(x, y, event.eventTime))
                     val enteredAnotherLetterKey = isLetterCharKey(hover) &&
                         hover?.outputChar?.lowercaseChar() != dk?.outputChar?.lowercaseChar()
-                    val stillLooksLikeQuickVerticalFlick = verticalFlickActive &&
-                        elapsed < 220L &&
-                        totalDist < keyHeightAvg * 1.38f
-                    if (!stillLooksLikeQuickVerticalFlick && totalDist > keyWidthAvg * 0.85f && enteredAnotherLetterKey) {
+                    val upDy = downY - y
+                    val dxAbs = abs(x - downX)
+                    val stillLooksLikeQuickVerticalFlick = verticalFlickActive || (
+                        letterFlickEnabled &&
+                            upDy > keyHeightAvg * (0.38f / flickSensitivity) &&
+                            upDy > dxAbs * 1.35f &&
+                            dxAbs < keyWidthAvg * 0.60f &&
+                            elapsed < 240L
+                        )
+                    if (!stillLooksLikeQuickVerticalFlick && totalDist > keyWidthAvg * 0.78f && enteredAnotherLetterKey) {
                         isGliding = true
                         verticalFlickActive = false
                         handler.removeCallbacks(subLongPressRunnable)
                     }
                 } else if (isGliding) {
                     val prev = glideTrail.lastOrNull()
-                    if (prev == null || hypot((x - prev.x).toDouble(), (y - prev.y).toDouble()) >= dp(3f)) {
+                    if (prev == null || hypot((x - prev.x).toDouble(), (y - prev.y).toDouble()) >= dp(4f)) {
                         glideTrail.add(TouchPoint(x, y, event.eventTime))
                     }
                     val now = event.eventTime
-                    if (now - lastGlidePreviewTime >= 90L && glideTrail.size >= 4) {
+                    if (now - lastGlidePreviewTime >= 115L && glideTrail.size >= 4) {
                         lastGlidePreviewTime = now
                         listener?.onGlidePreview(glideTrail.toList(), RectF(letterBounds))
                     }
@@ -752,7 +775,7 @@ class QwertyKeyboardView @JvmOverloads constructor(
 
                 if (!isGliding && !subLongPressActive) {
                     if (dk?.kind != KeyKind.BACKSPACE) {
-                        currentHoverKey = hover
+                        currentHoverKey = if (verticalFlickActive) dk else hover
                     }
                 }
                 lastX = x
@@ -796,7 +819,7 @@ class QwertyKeyboardView @JvmOverloads constructor(
                         handler.postDelayed(cursorRepeatRunnable, 320L)
                     } else {
                         if (hit.subOutputChar != '\u0000') {
-                            handler.postDelayed(subLongPressRunnable, 220L)
+                            handler.postDelayed(subLongPressRunnable, 380L)
                         }
                         if (glideEnabled && layer == Layer.QWERTY && isLetterCharKey(hit)) {
                             glideTrail.add(TouchPoint(downX, downY, event.eventTime))
@@ -835,6 +858,10 @@ class QwertyKeyboardView @JvmOverloads constructor(
     private fun finishTapOrGesture(endX: Float, endY: Float, eventTime: Long) {
         val dk = downKey
         if (isGliding) {
+            val prev = glideTrail.lastOrNull()
+            if (prev == null || hypot((endX - prev.x).toDouble(), (endY - prev.y).toDouble()) >= dp(1f)) {
+                glideTrail.add(TouchPoint(endX, endY, eventTime))
+            }
             if (glideTrail.size >= 2) {
                 listener?.onGlideCommit(glideTrail.toList(), RectF(letterBounds))
             }
@@ -858,12 +885,15 @@ class QwertyKeyboardView @JvmOverloads constructor(
             return
         }
 
-        // Long-press or vertical flick for secondary symbol/number/layer/emoji
+        // Long-press or upward-only flick for secondary symbol/number/layer/emoji
         if (dk != null && dk.subOutputChar != '\u0000') {
-            val dxAbs = abs(endX - downX)
-            val absDy = abs(endY - downY)
-            val flickThresh = keyHeightAvg * (0.36f / flickSensitivity)
-            val isFlick = absDy > flickThresh && absDy > dxAbs * 1.45f && dxAbs < keyWidthAvg * 0.65f && (eventTime - downTimeMs) < 350L
+            val isFlick = isUpwardFlickGesture(
+                k = dk,
+                curX = endX,
+                curY = endY,
+                elapsedMs = eventTime - downTimeMs,
+                maintain = false
+            )
             if (subLongPressActive || verticalFlickActive || isFlick) {
                 when {
                     dk.kind == KeyKind.LAYER_SYM && dk.subOutputChar == '\u0001' -> {
@@ -880,7 +910,16 @@ class QwertyKeyboardView @JvmOverloads constructor(
             }
         }
 
-        val target = currentHoverKey ?: dk ?: return
+        val releaseDist = hypot((endX - downX).toDouble(), (endY - downY).toDouble()).toFloat()
+        if (currentHoverKey == null && releaseDist > keyHeightAvg * 2.2f) {
+            return
+        }
+        // Keep base key on QWERTY glide-mode taps or utility-key aborted short flicks to eliminate neighbor/upper-row typos
+        val target = when {
+            dk != null && dk.subOutputChar != '\u0000' -> dk
+            dk != null && glideEnabled && layer == Layer.QWERTY -> dk
+            else -> currentHoverKey ?: dk ?: return
+        }
         when (target.kind) {
             KeyKind.CHAR -> {
                 val out = target.outputChar
@@ -937,6 +976,35 @@ class QwertyKeyboardView @JvmOverloads constructor(
             KeyKind.SPACE -> listener?.onSpace()
             KeyKind.ENTER -> listener?.onEnter()
         }
+    }
+
+    private fun isFlickEnabledForKey(k: VisualKey?): Boolean {
+        if (k == null || k.subOutputChar == '\u0000') return false
+        if (layer == Layer.QWERTY && isLetterCharKey(k) && glideEnabled && !letterFlickEnabled) {
+            return false
+        }
+        return true
+    }
+
+    private fun isUpwardFlickGesture(
+        k: VisualKey?,
+        curX: Float,
+        curY: Float,
+        elapsedMs: Long,
+        maintain: Boolean
+    ): Boolean {
+        if (!isFlickEnabledForKey(k)) return false
+        val upDy = downY - curY
+        val dxAbs = abs(curX - downX)
+        val isLetterOnGlide = layer == Layer.QWERTY && isLetterCharKey(k) && glideEnabled
+        val baseThresh = keyHeightAvg * ((if (isLetterOnGlide) 0.56f else 0.42f) / flickSensitivity)
+        if (maintain) {
+            return upDy > baseThresh * 0.50f && upDy > dxAbs * (if (isLetterOnGlide) 1.0f else 0.70f)
+        }
+        if (elapsedMs > 520L) return false
+        val minRatio = if (isLetterOnGlide) 1.35f else 0.85f
+        val maxDx = keyWidthAvg * (if (isLetterOnGlide) 0.72f else 1.25f)
+        return upDy > baseThresh && upDy > dxAbs * minRatio && dxAbs < maxDx
     }
 
     private fun isLetterCharKey(k: VisualKey?): Boolean {

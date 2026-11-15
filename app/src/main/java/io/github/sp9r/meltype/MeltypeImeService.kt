@@ -48,6 +48,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.roundToInt
 
 /**
@@ -72,6 +73,8 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
     @Volatile
     private var glideDecoder: GlideDecoder? = null
     private val bgExecutor = Executors.newSingleThreadExecutor()
+    private val glidePreviewExecutor = Executors.newSingleThreadExecutor()
+    private val glidePreviewSeq = AtomicLong(0L)
 
     private lateinit var rootContainer: LinearLayout
     private lateinit var clauseBar: LinearLayout
@@ -81,6 +84,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
     private lateinit var nextClauseBtn: TextView
     private lateinit var shrinkClauseBtn: TextView
     private lateinit var extendClauseBtn: TextView
+    private lateinit var partialCommitBtn: TextView
     private lateinit var langSwitchBtn: TextView
 
     private lateinit var topBar: LinearLayout
@@ -147,7 +151,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             setPadding(dp(6), dp(3), dp(6), dp(2))
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
-                dp(36)
+                dp(40)
             )
         }
 
@@ -167,17 +171,33 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         nextClauseBtn = makeRailButton("▶").apply {
             setOnClickListener { renderSnapshot(session.moveFocus(+1)) }
         }
-        shrinkClauseBtn = makeRailButton("区-").apply {
+        shrinkClauseBtn = makeRailButton("短").apply {
             setOnClickListener {
                 renderSnapshot(session.resizeFocusedClause(-1, getSurroundingTextBefore()))
             }
         }
-        extendClauseBtn = makeRailButton("区+").apply {
+        extendClauseBtn = makeRailButton("長").apply {
             setOnClickListener {
                 renderSnapshot(session.resizeFocusedClause(+1, getSurroundingTextBefore()))
             }
         }
-        langSwitchBtn = makeRailButton("日⇔英").apply {
+        partialCommitBtn = makeRailButton("確定✓").apply {
+            setOnClickListener {
+                glidePreviewSeq.incrementAndGet()
+                val rawBefore = session.snapshot.rawInput
+                val committed = session.commitFocusedPrefix(getSurroundingTextBefore())
+                if (committed.isNotEmpty()) {
+                    currentInputConnection?.commitText(committed, 1)
+                    if (session.isEmpty) {
+                        recordUndoCommit(rawBefore, committed)
+                    } else {
+                        clearUndoCommit()
+                    }
+                    renderSnapshot(session.snapshot)
+                }
+            }
+        }
+        langSwitchBtn = makeRailButton("日/英").apply {
             setOnClickListener { onToggleLanguage() }
         }
 
@@ -186,6 +206,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         clauseBar.addView(nextClauseBtn)
         clauseBar.addView(shrinkClauseBtn)
         clauseBar.addView(extendClauseBtn)
+        clauseBar.addView(partialCommitBtn)
         clauseBar.addView(langSwitchBtn)
 
         // Top Compact-Rail bar (trace + candidate/quick-symbol chips + expand/onehand/settings)
@@ -381,6 +402,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
     }
 
     override fun onFinishInputView(finishingInput: Boolean) {
+        glidePreviewSeq.incrementAndGet()
         super.onFinishInputView(finishingInput)
         isExpandedPanelOpen = false
         if (!session.isEmpty) {
@@ -390,6 +412,12 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             }
         }
         renderSnapshot(session.snapshot)
+    }
+
+    override fun onDestroy() {
+        bgExecutor.shutdownNow()
+        glidePreviewExecutor.shutdownNow()
+        super.onDestroy()
     }
 
     private fun isDarkTheme(): Boolean {
@@ -405,6 +433,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         keyboardView.glideEnabled = settings.glideEnabled
         keyboardView.hapticEnabled = settings.hapticFeedback
         keyboardView.showSubLabels = settings.showSubLabels
+        keyboardView.letterFlickEnabled = settings.letterFlickEnabled
         keyboardView.showNumberRow = settings.showNumberRow
         keyboardView.autoReturnFromSymbols = settings.autoReturnFromSymbols
         keyboardView.flickSensitivity = settings.flickSensitivity
@@ -434,6 +463,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         styleRailButton(nextClauseBtn, dark, subtle = false)
         styleRailButton(shrinkClauseBtn, dark, subtle = false)
         styleRailButton(extendClauseBtn, dark, subtle = false)
+        styleRailButton(partialCommitBtn, dark, subtle = false)
         styleRailButton(langSwitchBtn, dark, subtle = false)
         styleRailButton(emojiBarBtn, dark, subtle = false)
         styleRailButton(expandPanelBtn, dark, subtle = false)
@@ -516,6 +546,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
     // --- KeyboardActionListener implementation ---
 
     override fun onCharacter(ch: Char, directCommit: Boolean) {
+        glidePreviewSeq.incrementAndGet()
         if (isExpandedPanelOpen) {
             isExpandedPanelOpen = false
         }
@@ -603,6 +634,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
     }
 
     override fun onPunctuation(isPeriod: Boolean) {
+        glidePreviewSeq.incrementAndGet()
         if (isExpandedPanelOpen) isExpandedPanelOpen = false
         if (isPasswordField) {
             currentInputConnection?.commitText(if (isPeriod) "." else ",", 1)
@@ -637,6 +669,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
     }
 
     override fun onBackspace() {
+        glidePreviewSeq.incrementAndGet()
         if (isExpandedPanelOpen) isExpandedPanelOpen = false
         if (!session.isEmpty) {
             val snap = session.backspace(getSurroundingTextBefore())
@@ -649,6 +682,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
     }
 
     override fun onBackspaceClearAll() {
+        glidePreviewSeq.incrementAndGet()
         if (isExpandedPanelOpen) isExpandedPanelOpen = false
         if (!session.isEmpty) {
             val snap = session.clearAll()
@@ -661,6 +695,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
     }
 
     override fun onSpace() {
+        glidePreviewSeq.incrementAndGet()
         val snap = session.snapshot
         if (!snap.isComposing) {
             clearUndoCommit()
@@ -693,6 +728,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
     }
 
     override fun onEnter() {
+        glidePreviewSeq.incrementAndGet()
         if (isExpandedPanelOpen) isExpandedPanelOpen = false
         if (!session.isEmpty) {
             val raw = session.snapshot.rawInput
@@ -758,19 +794,30 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
     override fun onGlidePreview(points: List<TouchPoint>, letterBounds: RectF) {
         if (isPasswordField) return
         val decoder = glideDecoder ?: return
-        val norm = KeyLayoutGeometry.normalizeFromView(points, letterBounds)
+        val seq = glidePreviewSeq.incrementAndGet()
         val snap = session.snapshot
         val inEnglishSentence = snap.isComposing && snap.rawInput.contains(' ') &&
             snap.clauses.lastOrNull()?.isEnglish == true
-        val cands = decoder.decode(norm, maxResults = 4, preferJapanese = !inEnglishSentence)
-        if (cands.isEmpty()) return
-        val preview = cands.joinToString(" | ") { c ->
-            if (!c.isEnglish && !c.kanaHint.isNullOrEmpty()) "${c.kanaHint}" else c.word
+        val copiedPoints = points.toList()
+        val boundsCopy = RectF(letterBounds)
+        glidePreviewExecutor.execute {
+            if (glidePreviewSeq.get() != seq) return@execute
+            val norm = KeyLayoutGeometry.normalizeFromView(copiedPoints, boundsCopy)
+            val cands = decoder.decode(norm, maxResults = 3, preferJapanese = !inEnglishSentence, fastPreview = true)
+            if (cands.isEmpty() || glidePreviewSeq.get() != seq) return@execute
+            val preview = cands.joinToString(" | ") { c ->
+                if (!c.isEnglish && !c.kanaHint.isNullOrEmpty()) c.kanaHint else c.word
+            }
+            rootContainer.post {
+                if (glidePreviewSeq.get() == seq && keyboardView.isActivelyGliding()) {
+                    showTransientTrace(preview)
+                }
+            }
         }
-        showTransientTrace(preview)
     }
 
     override fun onGlideCommit(points: List<TouchPoint>, letterBounds: RectF) {
+        glidePreviewSeq.incrementAndGet()
         if (isExpandedPanelOpen) isExpandedPanelOpen = false
         if (isPasswordField) return
         clearUndoCommit()
@@ -779,7 +826,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         val snap = session.snapshot
         val inEnglishSentence = snap.isComposing && snap.rawInput.contains(' ') &&
             snap.clauses.lastOrNull()?.isEnglish == true
-        val cands = decoder.decode(norm, maxResults = 8, preferJapanese = !inEnglishSentence)
+        val cands = decoder.decode(norm, maxResults = 8, preferJapanese = !inEnglishSentence, fastPreview = false)
         if (cands.isEmpty()) return
         val top = cands.first()
         val alts = cands.map { it.word to it.isEnglish }
@@ -819,15 +866,24 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             }
             ic?.setComposingText(spanned, 1)
 
+            val clauseTrace = snap.clauses.joinToString("│") { it.reading }.ifEmpty { snap.romajiTrace }
             traceBadge.visibility = View.VISIBLE
-            traceBadge.text = snap.romajiTrace
+            traceBadge.text = clauseTrace
 
             clauseBar.visibility = View.VISIBLE
-            val multiClause = snap.clauses.size > 1
-            prevClauseBtn.visibility = if (multiClause) View.VISIBLE else View.GONE
-            nextClauseBtn.visibility = if (multiClause) View.VISIBLE else View.GONE
-            shrinkClauseBtn.visibility = if (snap.canShrinkClause) View.VISIBLE else View.GONE
-            extendClauseBtn.visibility = if (snap.canExtendClause) View.VISIBLE else View.GONE
+            val hasClauses = snap.clauses.isNotEmpty()
+            val canPrev = snap.clauses.size > 1 && snap.focusedClauseIndex > 0
+            val canNext = snap.clauses.size > 1 && snap.focusedClauseIndex < snap.clauses.lastIndex
+            prevClauseBtn.isEnabled = canPrev
+            prevClauseBtn.alpha = if (canPrev) 1.0f else 0.32f
+            nextClauseBtn.isEnabled = canNext
+            nextClauseBtn.alpha = if (canNext) 1.0f else 0.32f
+            shrinkClauseBtn.isEnabled = snap.canShrinkClause
+            shrinkClauseBtn.alpha = if (snap.canShrinkClause) 1.0f else 0.32f
+            extendClauseBtn.isEnabled = snap.canExtendClause
+            extendClauseBtn.alpha = if (snap.canExtendClause) 1.0f else 0.32f
+            partialCommitBtn.isEnabled = hasClauses
+            partialCommitBtn.alpha = if (hasClauses) 1.0f else 0.32f
             renderClausePills(snap, dark, accent)
         } else {
             ic?.finishComposingText()
@@ -848,9 +904,13 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
 
         for ((idx, clause) in snap.clauses.withIndex()) {
             val focused = idx == snap.focusedClauseIndex
+            val showReadingCue = focused && !clause.isEnglish &&
+                clause.reading.isNotEmpty() && clause.reading != clause.text
+            val pillLabel = if (showReadingCue) "${clause.reading}▸${clause.text}" else clause.text
             val pill = TextView(this).apply {
-                text = clause.text
+                text = pillLabel
                 gravity = Gravity.CENTER
+                maxLines = 1
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
                 setTypeface(null, if (focused) Typeface.BOLD else Typeface.NORMAL)
                 setTextColor(textCol)
@@ -862,10 +922,16 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
                 }
                 layoutParams = LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.WRAP_CONTENT,
-                    dp(28)
+                    dp(30)
                 ).apply { marginEnd = dp(4) }
                 setOnClickListener {
-                    renderSnapshot(session.focusClause(idx))
+                    if (focused) {
+                        expandedTab = ExpandedTab.CANDIDATES
+                        isExpandedPanelOpen = !isExpandedPanelOpen
+                        syncExpandedPanelState(session.snapshot)
+                    } else {
+                        renderSnapshot(session.focusClause(idx))
+                    }
                 }
             }
             clausePillRow.addView(pill)
@@ -1809,11 +1875,12 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         return TextView(this).apply {
             text = label
             gravity = Gravity.CENTER
+            maxLines = 1
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-            setPadding(dp(7), dp(4), dp(7), dp(4))
+            setPadding(dp(6), dp(4), dp(6), dp(4))
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
-                dp(31)
+                dp(32)
             ).apply {
                 marginStart = dp(2)
                 marginEnd = dp(2)

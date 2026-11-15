@@ -354,4 +354,56 @@ class MeltypeEngineTest {
             )
         }
     }
+
+    @Test
+    fun noFalseEnglishSplitsPartialCommitAndFastGlideLatency() {
+        val converter = AndroidMozcConverter(dictionaries)
+
+        // 1. Japanese stems containing valid English substrings must stay JAPANESE
+        val pureJpWords = listOf("makenai", "homete", "tameninaru", "samenai", "hareta")
+        for (raw in pureJpWords) {
+            val segs = scoreEngine.segment(raw)
+            assertTrue(
+                "Expected '$raw' to remain pure JAPANESE, got ${segs.map { "${it.kind}:${it.raw}" }}",
+                segs.all { it.kind == SegmentKind.JAPANESE }
+            )
+        }
+
+        // True proper nouns / non-romaji English still split properly
+        val ytSegs = scoreEngine.segment("youtubewomiru")
+        assertTrue(ytSegs.any { it.kind == SegmentKind.ENGLISH && it.raw.equals("youtube", ignoreCase = true) })
+
+        // 2. Partial clause commit commits focused prefix while preserving remaining tail
+        val partialSession = CompositionSession(dictionaries, scoreEngine, converter)
+        partialSession.appendText("kyouhagoogledekensaku")
+        partialSession.focusClause(0)
+        val firstClauseText = partialSession.snapshot.clauses[0].text
+        val committed = partialSession.commitFocusedPrefix()
+        assertEquals(firstClauseText, committed)
+        assertTrue(partialSession.snapshot.isComposing)
+        assertTrue(partialSession.snapshot.previewText.contains("google"))
+
+        // 3. Conversational Japanese phrases & fast decode latency
+        val convGlideTargets = listOf(
+            "maji" to "maji",
+            "yokatta" to "yokatta",
+            "ganbatte" to "ganbatte",
+            "toriaezu" to "toriaezu",
+            "wakaranai" to "wakaranai",
+            "arigatougozaimasu" to "arigatougozaimasu"
+        )
+        // Warmup JIT before timing
+        glideDecoder.decode(KeyLayoutGeometry.syntheticPathForWord("kyouha", jitter = 0.02f), maxResults = 6)
+
+        var totalNs = 0L
+        for ((trace, want) in convGlideTargets) {
+            val path = KeyLayoutGeometry.syntheticPathForWord(trace, jitter = 0.02f)
+            val t0 = System.nanoTime()
+            val decoded = glideDecoder.decode(path, maxResults = 6, fastPreview = false).map { it.word }
+            totalNs += System.nanoTime() - t0
+            assertTrue("Expected '$want' in top-3 for '$trace', got $decoded", decoded.take(3).contains(want))
+        }
+        val avgMs = (totalNs / convGlideTargets.size) / 1_000_000.0
+        assertTrue("Expected avg full glide decode <= 35ms on JVM, got ${avgMs}ms", avgMs <= 35.0)
+    }
 }

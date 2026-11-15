@@ -495,6 +495,7 @@ class ScoreEngine(
     ): Double? {
         val len = sub.length
         val analysisStrict = RomajiDetector.analyze(sub, strictForDetection = true)
+        val isPureStrictRomaji = analysisStrict.isStrictValid
         val hasUppercase = originalSlice.any { it.isUpperCase() }
 
         // Single unmapped letter fallback (l, q, v, x or invalid char at end like "g" after space, etc.)
@@ -510,7 +511,7 @@ class ScoreEngine(
 
         // If sub is a standalone prefix typing of an English word at the end of input (length >= 3 & non-romaji)
         if (!isWord && !isFocused && !isProper) {
-            if (!analysisStrict.isStrictValid) {
+            if (!isPureStrictRomaji) {
                 val isPrefix = len >= 2 && (dictionaries.englishFocusedWords.hasPrefix(sub) || dictionaries.englishAllWords.hasPrefix(sub))
                 val nextIsBoundary = (nextPos == totalLen) || PARTICLES.any { fullRun.startsWith(it, nextPos) }
                 if (isPrefix && nextIsBoundary) {
@@ -526,14 +527,14 @@ class ScoreEngine(
         }
 
         // Known English word!
-        if (isJpOrigin && analysisStrict.isStrictValid && !hasUppercase) {
+        if (isJpOrigin && isPureStrictRomaji && !hasUppercase) {
             // Word like "sushi", "karaoke", "anime": favor Japanese unless surrounded by English context
             return 0.5
         }
 
         // Very short 2-3 char romaji-valid English words ("to", "ha", "no", "go", "de", "in", "at", "he", "me", "so", "do", "ma", "ai")
         // should NOT split Japanese strings unless typed with uppercase or surrounded by particle/space boundaries.
-        if (len <= 3 && analysisStrict.isStrictValid && !hasUppercase) {
+        if (len <= 3 && isPureStrictRomaji && !hasUppercase) {
             val midRunWithoutParticles = prevIdx > 0 && nextPos < totalLen &&
                 !PARTICLES.any { fullRun.substring(0, prevIdx).endsWith(it) } &&
                 !PARTICLES.any { fullRun.substring(nextPos).startsWith(it) }
@@ -555,22 +556,42 @@ class ScoreEngine(
             score += 9.0
         } else if (isFocused) {
             score += 6.0
-        } else if (!analysisStrict.isStrictValid) {
-            // Contains non-romaji sequence (th, l, v, x, ng, ck, ld, st, etc.) + in English dict => strong signal
+        } else if (!isPureStrictRomaji) {
+            // Contains non-romaji sequence (th, l, v, x, ng, ck, ld, st, or trailing consonant like meet/meeting) + in English dict => strong signal
             score += 7.0
         } else {
-            // Valid as both romaji and broad English dictionary (e.g. "time", "banana", "radio", "camera", "hero").
-            // Never let obscure broad-dictionary words (!isFocused && !isProper) chop a contiguous Japanese stem
-            // without a preceding particle (e.g. "shumire" -> "shu" + "mire").
+            // Valid pure romaji AND in broad English dictionary (e.g. "time", "banana", "radio", "camera", "hero").
             val precededByParticle = prevIdx > 0 && PARTICLES.any { fullRun.substring(0, prevIdx).endsWith(it) }
-            if (!isFocused && !isProper && !hasUppercase && prevIdx > 0 && !precededByParticle) {
+            val fullAnalysis = RomajiDetector.analyze(fullRun, strictForDetection = true)
+            val fullIsPureJp = fullAnalysis.isStrictValid && fullAnalysis.pendingTail.isEmpty()
+            if (!isFocused && !isProper && !hasUppercase && ((prevIdx > 0 && !precededByParticle) || (prevIdx == 0 && nextPos < totalLen && fullIsPureJp))) {
                 return -4.0
             }
             score += if (isReadable) 1.5 else 3.2
             if (dictionaries.japaneseWords.contains(sub) ||
-                dictionaries.readingsSet.contains(RomajiDetector.analyze(sub).finalizedHiragana())
+                dictionaries.readingsSet.contains(analysisStrict.finalizedHiragana())
             ) {
                 score -= 2.8
+            }
+        }
+
+        // Guard against focused/broad romaji-valid English words ("make", "home", "tame", "same", "hare") chopping
+        // contiguous lowercase Japanese stems ("makenai", "homete", "tameninaru", "samenai", "hareta") without clean boundaries.
+        if (isPureStrictRomaji && analysisStrict.pendingTail.isEmpty() && !isProper && !hasUppercase && (prevIdx > 0 || nextPos < totalLen)) {
+            val fullAnalysis = RomajiDetector.analyze(fullRun, strictForDetection = true)
+            val fullIsPureJp = fullAnalysis.isStrictValid && fullAnalysis.pendingTail.isEmpty()
+            if (fullIsPureJp) {
+                val precededByParticle = prevIdx > 0 && PARTICLES.any { fullRun.substring(0, prevIdx).endsWith(it) }
+                val followedByParticle = nextPos < totalLen && CASE_PARTICLES.any { fullRun.startsWith(it, nextPos) }
+                val subKana = analysisStrict.finalizedHiragana()
+                val isCommonJpReading = subKana.length >= 2 &&
+                    (dictionaries.japaneseWords.contains(sub) || dictionaries.readingsSet.contains(subKana))
+                val missingBoundary = (prevIdx > 0 && !precededByParticle) ||
+                    (nextPos < totalLen && !followedByParticle) ||
+                    (len <= 4 && isCommonJpReading)
+                if (missingBoundary) {
+                    return -5.0
+                }
             }
         }
 
@@ -585,7 +606,7 @@ class ScoreEngine(
             score += 1.0
         } else {
             val remaining = fullRun.substring(nextPos)
-            if (PARTICLES.any { remaining.startsWith(it) } || dictionaries.japaneseWords.hasPrefix(remaining)) {
+            if (PARTICLES.any { remaining.startsWith(it) } || (!isPureStrictRomaji && dictionaries.japaneseWords.hasPrefix(remaining))) {
                 score += 2.2
             } else {
                 // Followed by consonant/non-particle -> slightly less likely clean split unless itself is English
@@ -626,6 +647,7 @@ class ScoreEngine(
 
     companion object {
         private val PARTICLES = listOf("kara", "made", "ha", "ga", "wo", "ni", "de", "to", "no", "mo", "wa", "he", "ya")
+        private val CASE_PARTICLES = listOf("kara", "made", "ha", "ga", "wo", "ni", "de", "mo")
 
         private val SHORT_AMBIGUOUS_STOPWORDS = setOf(
             "a", "an", "as", "at", "be", "by", "do", "go", "ha", "he", "hi", "in", "is", "it",
