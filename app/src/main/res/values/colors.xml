@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="ic_launcher_background">#25282D</color>
+    <color name="cr_page">#F5F6F7</color>
+    <color name="cr_surface">#FFFFFF</color>
+    <color name="cr_surface_subtle">#F7F8F9</color>
+    <color name="cr_text">#202328</color>
+    <color name="cr_text_muted">#737A84</color>
+    <color name="cr_border">#DFE2E6</color>
+    <color name="cr_primary">#25282D</color>
+    <color name="cr_accent">#4A6F9E</color>
+    <color name="cr_success">#4C835F</color>
+    <color name="cr_warning">#A66B1F</color>
+    <color name="cr_danger">#B54B4B</color>
+</resources>
