@@ -17,8 +17,10 @@ import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
+import android.widget.SeekBar
 import android.widget.Switch
 import android.widget.TextView
+import kotlin.math.roundToInt
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
@@ -248,11 +250,19 @@ class MainActivity : AppCompatActivity() {
             settings.glideEnabled = it
         }
         addDivider(settingsCard)
+        addSwitchRow(settingsCard, "数字段（1〜0）を常時表示", "QWERTY最上段に1〜0の数字キー列を固定表示", settings.showNumberRow) {
+            settings.showNumberRow = it
+        }
+        addDivider(settingsCard)
+        addSwitchRow(settingsCard, "記号入力後に文字キーへ自動復帰", "?123記号キーを1文字入力すると自動でQWERTYへ戻す", settings.autoReturnFromSymbols) {
+            settings.autoReturnFromSymbols = it
+        }
+        addDivider(settingsCard)
         addSwitchRow(settingsCard, "句読点（。、）で自動確定", "日本語文末の句読点入力時に変換を即確定", settings.autoCommitOnPunctuation) {
             settings.autoCommitOnPunctuation = it
         }
         addDivider(settingsCard)
-        addSwitchRow(settingsCard, "キー右上の数字・記号ヒントを表示", "上フリックで数字や記号を素早く入力", settings.showSubLabels) {
+        addSwitchRow(settingsCard, "キー右上の数字・記号ヒントを表示", "長押し（0.22秒）または縦フリックで数字・記号を入力", settings.showSubLabels) {
             settings.showSubLabels = it
         }
         addDivider(settingsCard)
@@ -292,22 +302,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         addDivider(settingsCard)
-        val curScale = settings.keyboardHeightScale
-        addOptionGroup(
-            settingsCard,
-            "キーボード高さ",
-            listOf(
-                "コンパクト" to (curScale < 0.93f),
-                "標準" to (curScale in 0.93f..1.07f),
-                "高め" to (curScale > 1.07f)
-            )
-        ) { idx ->
-            settings.keyboardHeightScale = when (idx) {
-                0 -> 0.88f
-                2 -> 1.14f
-                else -> 1.0f
-            }
-        }
+        addFreeHeightControl(settingsCard)
 
         addDivider(settingsCard)
         addOptionGroup(
@@ -472,21 +467,28 @@ class MainActivity : AppCompatActivity() {
             check("LiveConvert($input)", ok, out)
         }
 
-        // 2. Dual-language glide decoding tests
+        // 2. Dual-language glide decoding tests (Hebon + Kunrei + inflected Japanese + English)
         val glideWords = listOf(
-            "google" to true,
-            "meeting" to true,
-            "android" to true,
-            "kyouha" to false,
-            "kensaku" to false,
-            "arigatou" to false
+            "google" to "google",
+            "meeting" to "meeting",
+            "android" to "android",
+            "kyouha" to "kyouha",
+            "kensaku" to "kensaku",
+            "arigatou" to "arigatou",
+            "watashi" to "watashi",
+            "watasi" to "watashi",
+            "asita" to "ashita",
+            "syasin" to "shashin",
+            "tabete" to "tabete",
+            "ikimasu" to "ikimasu",
+            "takakute" to "takakute"
         )
-        for ((w, expectEn) in glideWords) {
-            val path = KeyLayoutGeometry.syntheticPathForWord(w, jitter = 0.02f)
+        for ((traceWord, expectOut) in glideWords) {
+            val path = KeyLayoutGeometry.syntheticPathForWord(traceWord, jitter = 0.02f)
             val res = decoder.decode(path, maxResults = 5)
             val top3 = res.take(3).map { it.word }
-            val hit = w in top3
-            check("Glide($w, en=$expectEn)", hit, "top3=$top3")
+            val hit = expectOut in top3
+            check("Glide($traceWord->$expectOut)", hit, "top3=$top3")
         }
 
         // 3. Glide + Live conversion combined flow ("kyouha" glide -> "google" glide -> "dekensaku" tap)
@@ -498,6 +500,31 @@ class MainActivity : AppCompatActivity() {
         for (ch in "dekensaku") combo.appendChar(ch)
         val comboText = combo.snapshot.previewText
         check("GlideCombo(kyouha+google+dekensaku)", comboText.contains("google") && comboText.length >= 8, comboText)
+
+        // 4. 1-tap glide undo + Clause resize tests
+        val undoSession = CompositionSession(dicts, engine, converter)
+        undoSession.appendGlideResult("watashi", false, listOf("watashi" to false))
+        val beforeUndoLen = undoSession.snapshot.rawInput.length
+        undoSession.backspace()
+        check("Glide1TapUndo", beforeUndoLen == 7 && undoSession.snapshot.rawInput.isEmpty(), "after='${undoSession.snapshot.rawInput}'")
+
+        val resizeSession = CompositionSession(dicts, engine, converter)
+        for (ch in "kyouhaiitenki") resizeSession.appendChar(ch)
+        val initClauses = resizeSession.snapshot.clauses
+        if (!resizeSession.snapshot.canShrinkClause) {
+            resizeSession.focusClause(0)
+        }
+        val shrunkSnap = resizeSession.resizeFocusedClause(-1)
+        check("ClauseResize", shrunkSnap.clauses.isNotEmpty() && initClauses.isNotEmpty(), "before=${initClauses.map { it.reading }} after=${shrunkSnap.clauses.map { it.reading }}")
+
+        // 5. Free keyboard height scale bounds check (non-destructive)
+        val savedScale = settings.keyboardHeightScale
+        settings.keyboardHeightScale = 0.72f
+        val lowOk = kotlin.math.abs(settings.keyboardHeightScale - 0.72f) < 0.01f
+        settings.keyboardHeightScale = 1.42f
+        val highOk = kotlin.math.abs(settings.keyboardHeightScale - 1.42f) < 0.01f
+        settings.keyboardHeightScale = savedScale
+        check("FreeHeightScale", lowOk && highOk, "range=0.65..1.55")
 
         val header = if (allPassed) "PASS\n" else "FAIL\n"
         val report = header + sb.toString()
@@ -685,6 +712,105 @@ class MainActivity : AppCompatActivity() {
         val initIdx = options.indexOfFirst { it.second }.coerceAtLeast(0)
         applySelection(initIdx)
         container.addView(row)
+        parent.addView(container)
+    }
+
+    private fun addFreeHeightControl(parent: LinearLayout) {
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(12), dp(10), dp(12), dp(12))
+        }
+        val topRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, 0, 0, dp(4))
+        }
+        topRow.addView(TextView(this).apply {
+            text = "キーボード高さ（自由調整）"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f)
+            setTextColor(cText)
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        })
+        val valueLabel = TextView(this).apply {
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            setTypeface(null, Typeface.BOLD)
+            setTextColor(cAccent)
+        }
+        topRow.addView(valueLabel)
+        container.addView(topRow)
+
+        val seekBar = SeekBar(this).apply {
+            max = 90 // 65% .. 155%
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                setMargins(0, dp(4), 0, dp(6))
+            }
+        }
+
+        fun updateUiFromScale(scale: Float, updateSeek: Boolean) {
+            val pct = (scale * 100f).roundToInt().coerceIn(65, 155)
+            val baseDp = if (settings.showNumberRow) 252f else 224f
+            val approxDp = (baseDp * scale).roundToInt()
+            valueLabel.text = "${pct}% (約${approxDp}dp)"
+            if (updateSeek) {
+                val targetProg = (pct - 65).coerceIn(0, 90)
+                if (seekBar.progress != targetProg) {
+                    seekBar.progress = targetProg
+                }
+            }
+        }
+
+        var updatingProgrammatically = false
+        seekBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
+                if (updatingProgrammatically) return
+                val nextScale = (65 + progress) / 100f
+                settings.keyboardHeightScale = nextScale
+                updateUiFromScale(settings.keyboardHeightScale, updateSeek = false)
+            }
+            override fun onStartTrackingTouch(sb: SeekBar?) {}
+            override fun onStopTrackingTouch(sb: SeekBar?) {}
+        })
+        container.addView(seekBar)
+
+        val btnRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, dp(2), 0, 0)
+        }
+        val stepSpecs = listOf(
+            "-5%" to { (settings.keyboardHeightScale - 0.05f) },
+            "-1%" to { (settings.keyboardHeightScale - 0.01f) },
+            "100%" to { 1.0f },
+            "+1%" to { (settings.keyboardHeightScale + 0.01f) },
+            "+5%" to { (settings.keyboardHeightScale + 0.05f) }
+        )
+        stepSpecs.forEachIndexed { idx, (label, calc) ->
+            val btn = TextView(this).apply {
+                text = label
+                gravity = Gravity.CENTER
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                setTextColor(cText)
+                background = cardBorderBg(cSurfaceSubtle, cBorder, 5)
+                layoutParams = LinearLayout.LayoutParams(0, dp(34), 1f).apply {
+                    if (idx < stepSpecs.lastIndex) marginEnd = dp(5)
+                }
+                setOnClickListener {
+                    settings.keyboardHeightScale = calc().coerceIn(0.65f, 1.55f)
+                    updatingProgrammatically = true
+                    updateUiFromScale(settings.keyboardHeightScale, updateSeek = true)
+                    updatingProgrammatically = false
+                }
+            }
+            btnRow.addView(btn)
+        }
+        container.addView(btnRow)
+
+        updatingProgrammatically = true
+        updateUiFromScale(settings.keyboardHeightScale, updateSeek = true)
+        updatingProgrammatically = false
+
         parent.addView(container)
     }
 

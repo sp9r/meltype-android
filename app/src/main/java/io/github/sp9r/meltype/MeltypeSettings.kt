@@ -61,8 +61,20 @@ class MeltypeSettings(context: Context) {
         set(value) = prefs.edit().putString(KEY_ONE_HANDED, value.key).apply()
 
     var keyboardHeightScale: Float
-        get() = prefs.getFloat(KEY_HEIGHT_SCALE, 1.0f).coerceIn(0.85f, 1.25f)
-        set(value) = prefs.edit().putFloat(KEY_HEIGHT_SCALE, value.coerceIn(0.85f, 1.25f)).apply()
+        get() = prefs.getFloat(KEY_HEIGHT_SCALE, 1.0f).coerceIn(0.65f, 1.55f)
+        set(value) = prefs.edit().putFloat(KEY_HEIGHT_SCALE, value.coerceIn(0.65f, 1.55f)).apply()
+
+    var showNumberRow: Boolean
+        get() = prefs.getBoolean(KEY_SHOW_NUMBER_ROW, true)
+        set(value) = prefs.edit().putBoolean(KEY_SHOW_NUMBER_ROW, value).apply()
+
+    var autoReturnFromSymbols: Boolean
+        get() = prefs.getBoolean(KEY_AUTO_RETURN_SYMBOLS, false)
+        set(value) = prefs.edit().putBoolean(KEY_AUTO_RETURN_SYMBOLS, value).apply()
+
+    var flickSensitivity: Float
+        get() = prefs.getFloat(KEY_FLICK_SENSITIVITY, 1.0f).coerceIn(0.7f, 1.4f)
+        set(value) = prefs.edit().putFloat(KEY_FLICK_SENSITIVITY, value.coerceIn(0.7f, 1.4f)).apply()
 
     var autoCommitOnPunctuation: Boolean
         get() = prefs.getBoolean(KEY_AUTO_COMMIT_PUNCT, true)
@@ -133,6 +145,9 @@ class MeltypeSettings(context: Context) {
         private const val KEY_THEME_MODE = "theme_mode"
         private const val KEY_ONE_HANDED = "one_handed_mode"
         private const val KEY_HEIGHT_SCALE = "keyboard_height_scale"
+        private const val KEY_SHOW_NUMBER_ROW = "show_number_row"
+        private const val KEY_AUTO_RETURN_SYMBOLS = "auto_return_symbols"
+        private const val KEY_FLICK_SENSITIVITY = "flick_sensitivity"
         private const val KEY_AUTO_COMMIT_PUNCT = "auto_commit_punct"
         private const val KEY_PUNCT_STYLE = "punct_style"
         private const val KEY_HAPTIC = "haptic_feedback"

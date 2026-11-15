@@ -100,6 +100,12 @@ class MeltypeEngineTest {
         // Lowercase "ai" in Japanese phrase must stay Japanese
         val aiJp = scoreEngine.segment("aiwotsukau")
         assertTrue(aiJp.all { it.kind == SegmentKind.JAPANESE })
+
+        // Prolonged hyphen '-' inside a Japanese word stays in JAPANESE segment as 'ー'
+        val ramen = scoreEngine.segment("ra-menwotaberu")
+        assertEquals(1, ramen.size)
+        assertEquals(SegmentKind.JAPANESE, ramen[0].kind)
+        assertEquals("らーめんをたべる", RomajiDetector.analyze(ramen[0].raw).finalizedHiragana())
     }
 
     @Test
@@ -111,11 +117,43 @@ class MeltypeEngineTest {
             assertTrue("Expected '$word' in top-2 for English glide, got $decoded", decoded.take(2).contains(word))
         }
 
-        val japaneseTargets = listOf("kyouha", "kensaku", "arigatou", "ohayou", "ashitano")
-        for (word in japaneseTargets) {
-            val path = KeyLayoutGeometry.syntheticPathForWord(word, jitter = 0.02f)
-            val decoded = glideDecoder.decode(path, maxResults = 5).map { it.word }
-            assertTrue("Expected '$word' in top-3 for Japanese glide, got $decoded", decoded.take(3).contains(word))
+        val japaneseTargets = listOf(
+            "kyouha" to "kyouha",
+            "kensaku" to "kensaku",
+            "arigatou" to "arigatou",
+            "ohayou" to "ohayou",
+            "ashitano" to "ashitano",
+            "watashi" to "watashi",
+            "ashita" to "ashita",
+            "shashin" to "shashin",
+            "chotto" to "chotto",
+            "toukyou" to "toukyou",
+            // Kunrei-shiki swipe inputs must resolve to canonical Hepburn output
+            "watasi" to "watashi",
+            "asita" to "ashita",
+            "syasin" to "shashin",
+            "tyotto" to "chotto",
+            "tugi" to "tsugi",
+            // Inflected verbs & adjectives
+            "tabete" to "tabete",
+            "ikimasu" to "ikimasu",
+            "takakute" to "takakute",
+            // Japanese words that collide with obscure SCOWL English words
+            "kore" to "kore",
+            "sore" to "sore"
+        )
+        for ((traceWord, expectedOut) in japaneseTargets) {
+            val path = KeyLayoutGeometry.syntheticPathForWord(traceWord, jitter = 0.02f)
+            val res = glideDecoder.decode(path, maxResults = 5)
+            val decoded = res.map { it.word }
+            assertTrue(
+                "Expected '$expectedOut' in top-3 for trace '$traceWord', got $decoded",
+                decoded.take(3).contains(expectedOut)
+            )
+            if (traceWord == "kore" || traceWord == "sore") {
+                val matched = res.firstOrNull { it.word == expectedOut }
+                assertTrue("Expected '$expectedOut' to be treated as Japanese", matched != null && !matched.isEnglish)
+            }
         }
     }
 
@@ -134,6 +172,44 @@ class MeltypeEngineTest {
         val toggled = session.toggleFocusedSegmentLanguage()
         assertTrue(toggled.clauses.last().isEnglish)
         session.toggleFocusedSegmentLanguage()
+
+        // 1-tap glide undo deletes entire glided word in one Backspace press
+        val undoSession = CompositionSession(dictionaries, scoreEngine, converter)
+        undoSession.appendText("kyouha")
+        undoSession.appendGlideResult("ashitano", false, listOf("ashitano" to false))
+        assertEquals("kyouhaashitano", undoSession.snapshot.rawInput)
+        assertTrue(undoSession.snapshot.hasGlideUndo)
+        undoSession.backspace()
+        assertEquals("kyouha", undoSession.snapshot.rawInput)
+
+        // Clause boundary resize shrinks & extends focused Japanese clause reading
+        val resizeSession = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "kyouhagoogledekensaku") resizeSession.appendChar(ch)
+        val kyouhaIdx = resizeSession.snapshot.clauses.indexOfFirst { it.reading.length >= 3 }
+        if (kyouhaIdx >= 0) {
+            val focusedBefore = resizeSession.focusClause(kyouhaIdx)
+            val lenBefore = focusedBefore.clauses[focusedBefore.focusedClauseIndex].reading.length
+            val shrunk = resizeSession.resizeFocusedClause(-1)
+            val lenAfter = shrunk.clauses[shrunk.focusedClauseIndex].reading.length
+            assertEquals(lenBefore - 1, lenAfter)
+            val extended = resizeSession.resizeFocusedClause(+1)
+            val lenRestored = extended.clauses[extended.focusedClauseIndex].reading.length
+            assertEquals(lenBefore, lenRestored)
+        }
+
+        // Script variants should include hiragana, katakana, half-width katakana
+        val svLabels = resizeSession.snapshot.scriptVariants.map { it.first }
+        assertTrue(svLabels.contains("あ") && svLabels.contains("ア"))
+
+        // Auto-advance focus when selecting a conversion candidate with advanceFocus = true
+        val advSession = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "kyouhagoogledekensaku") advSession.appendChar(ch)
+        advSession.focusClause(0)
+        val cand0 = advSession.snapshot.candidates.first()
+        val afterSelect = advSession.selectCandidate(cand0, advanceFocus = true)
+        if (afterSelect.clauses.size > 1) {
+            assertEquals(1, afterSelect.focusedClauseIndex)
+        }
 
         // Utility checks
         assertEquals("2048", UtilityConverter.evaluateCalculator("128*16="))

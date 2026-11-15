@@ -125,12 +125,14 @@ class ScoreEngine(private val dictionaries: MeltypeDictionaries) {
                 continue
             }
 
-            // Existing Hiragana/Katakana/Kanji or '-' between kana
-            if (isJapaneseScript(ch) || (ch == '-' && i > 0 && isJapaneseScript(input[i - 1]))) {
+            // Existing Hiragana/Katakana/Kanji or '-' / 'ー' continuing a Japanese segment
+            val prevIsJpSeg = out.lastOrNull()?.let { it.kind == SegmentKind.JAPANESE && it.endIndex == i } == true
+            if (isJapaneseScript(ch) || ch == 'ー' || (ch == '-' && prevIsJpSeg)) {
                 var end = i
-                while (end < input.length && (isJapaneseScript(input[end]) || input[end] == 'ー')) end++
+                while (end < input.length && (isJapaneseScript(input[end]) || input[end] == 'ー' || input[end] == '-')) end++
                 val sub = input.substring(i, end)
-                out.add(ScoredSegment(SegmentKind.JAPANESE, sub, i, end, hiragana = sub))
+                val hiraSub = sub.replace('-', 'ー')
+                out.add(ScoredSegment(SegmentKind.JAPANESE, sub, i, end, hiragana = hiraSub))
                 i = end
                 continue
             }

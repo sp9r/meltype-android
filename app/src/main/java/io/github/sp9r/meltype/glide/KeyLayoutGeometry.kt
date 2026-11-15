@@ -19,6 +19,14 @@ data class TouchPoint(
     val tMs: Long = 0L
 )
 
+data class AnchorPoint(
+    val x: Float,
+    val y: Float,
+    val nearestChar: Char,
+    val sharpness: Float,
+    val isEndpoint: Boolean
+)
+
 /**
  * Geometric model of the 3-row QWERTY letter layout used for both rendering and glide decoding.
  */
@@ -201,31 +209,77 @@ object KeyLayoutGeometry {
         return sb.toString()
     }
 
+    fun letterMask(word: String): Int {
+        var mask = 0
+        for (c in word) {
+            val idx = c.lowercaseChar() - 'a'
+            if (idx in 0 until 26) {
+                mask = mask or (1 shl idx)
+            }
+        }
+        return mask
+    }
+
+    /**
+     * Simplifies raw touch points slightly by removing jitter steps < [minStep],
+     * then extracts start, salient turn/inflection corners, and end anchors.
+     */
+    fun extractAnchorPoints(points: List<TouchPoint>, minStep: Float = 0.055f): List<AnchorPoint> {
+        if (points.isEmpty()) return emptyList()
+        val simplified = ArrayList<TouchPoint>(points.size)
+        simplified.add(points.first())
+        for (i in 1 until points.size - 1) {
+            val prev = simplified.last()
+            val cur = points[i]
+            val d = hypot((cur.x - prev.x).toDouble(), (cur.y - prev.y).toDouble()).toFloat()
+            if (d >= minStep) {
+                simplified.add(cur)
+            }
+        }
+        if (points.size > 1) {
+            simplified.add(points.last())
+        }
+
+        val anchors = ArrayList<AnchorPoint>()
+        nearestKeys(simplified.first().x, simplified.first().y, 1).firstOrNull()?.let { (ch, _) ->
+            anchors.add(AnchorPoint(simplified.first().x, simplified.first().y, ch, 1.0f, isEndpoint = true))
+        }
+        for (i in 1 until simplified.size - 1) {
+            val ax = simplified[i].x - simplified[i - 1].x
+            val ay = simplified[i].y - simplified[i - 1].y
+            val bx = simplified[i + 1].x - simplified[i].x
+            val by = simplified[i + 1].y - simplified[i].y
+            val la = hypot(ax.toDouble(), ay.toDouble()).toFloat()
+            val lb = hypot(bx.toDouble(), by.toDouble()).toFloat()
+            if (la >= minStep && lb >= minStep) {
+                val cosTheta = ((ax * bx + ay * by) / (la * lb)).coerceIn(-1f, 1f)
+                if (cosTheta < 0.78f || (abs(ay) > 0.07f && cosTheta < 0.88f)) {
+                    nearestKeys(simplified[i].x, simplified[i].y, 1).firstOrNull()?.let { (ch, _) ->
+                        val sharpness = ((1f - cosTheta) * 0.5f).coerceIn(0f, 1f)
+                        anchors.add(AnchorPoint(simplified[i].x, simplified[i].y, ch, sharpness, isEndpoint = false))
+                    }
+                }
+            }
+        }
+        if (simplified.size > 1) {
+            nearestKeys(simplified.last().x, simplified.last().y, 1).firstOrNull()?.let { (ch, _) ->
+                anchors.add(AnchorPoint(simplified.last().x, simplified.last().y, ch, 1.0f, isEndpoint = true))
+            }
+        }
+        return anchors
+    }
+
     /**
      * Detects salient inflection/corner points along a normalized path and returns nearest key candidates.
      */
     fun extractAnchorKeys(points: List<TouchPoint>): List<Char> {
-        if (points.isEmpty()) return emptyList()
-        val anchors = ArrayList<Char>()
-        fun addKey(ch: Char) {
-            if (anchors.lastOrNull() != ch) anchors.add(ch)
-        }
-        nearestKeys(points.first().x, points.first().y, 1).firstOrNull()?.let { addKey(it.first) }
-        for (i in 1 until points.size - 1) {
-            val ax = points[i].x - points[i - 1].x
-            val ay = points[i].y - points[i - 1].y
-            val bx = points[i + 1].x - points[i].x
-            val by = points[i + 1].y - points[i].y
-            val la = hypot(ax.toDouble(), ay.toDouble()).toFloat()
-            val lb = hypot(bx.toDouble(), by.toDouble()).toFloat()
-            if (la > 0.04f && lb > 0.04f) {
-                val cosTheta = ((ax * bx + ay * by) / (la * lb)).coerceIn(-1f, 1f)
-                if (cosTheta < 0.72f || abs(ay) > 0.08f && cosTheta < 0.85f) {
-                    nearestKeys(points[i].x, points[i].y, 1).firstOrNull()?.let { addKey(it.first) }
-                }
+        val raw = extractAnchorPoints(points)
+        val keys = ArrayList<Char>(raw.size)
+        for (a in raw) {
+            if (keys.lastOrNull() != a.nearestChar) {
+                keys.add(a.nearestChar)
             }
         }
-        nearestKeys(points.last().x, points.last().y, 1).firstOrNull()?.let { addKey(it.first) }
-        return anchors
+        return keys
     }
 }

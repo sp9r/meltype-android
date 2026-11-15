@@ -68,6 +68,7 @@ class MeltypeDictionaries(source: DictionarySource) {
     val extraCandidates: Map<String, List<String>>
     val emojiCandidates: Map<String, List<String>>
     val readingsSet: Set<String>
+    val readingWithTags: List<Pair<String, List<String>>>
     val commonLatinWordsForGlide: List<String>
     val loadedFileCount: Int
 
@@ -223,13 +224,25 @@ class MeltypeDictionaries(source: DictionarySource) {
 
         // 10. readings.txt (reading[\tpos])
         val rSet = HashSet<String>()
+        val rTagged = ArrayList<Pair<String, List<String>>>()
         for (rawLine in readLines("readings.txt")) {
             if (rawLine.isBlank() || rawLine.lstripStartsWithHash()) continue
             val tab = rawLine.indexOf('\t')
             val r = (if (tab >= 0) rawLine.substring(0, tab) else rawLine).trim()
-            if (r.isNotEmpty()) rSet.add(r)
+            if (r.isNotEmpty()) {
+                rSet.add(r)
+                val tags = if (tab >= 0) {
+                    rawLine.substring(tab + 1).trim().split(',', ' ', '/').map { it.trim() }.filter { it.isNotEmpty() }
+                } else {
+                    emptyList()
+                }
+                if (tags.isNotEmpty()) {
+                    rTagged.add(r to tags)
+                }
+            }
         }
         readingsSet = rSet
+        readingWithTags = rTagged
 
         // 11. Build priority English glide vocabulary list
         val glideEng = LinkedHashSet<String>()
