@@ -86,7 +86,7 @@ class KeyboardBlueprintView @JvmOverloads constructor(
         canvas.drawRoundRect(0.5f * d, 0.5f * d, width - 0.5f * d, height - 0.5f * d, 6f * d, 6f * d, paintStroke)
 
         // Metric telemetry header inside preview
-        val baseDp = if (showNumberRow) 252f else 224f
+        val baseDp = if (showNumberRow) 264f else 224f
         val approxDp = (baseDp * heightScale).roundToInt()
         val pct = (heightScale * 100f).roundToInt()
         paintMono.textSize = 10.5f * d
@@ -137,8 +137,9 @@ class KeyboardBlueprintView @JvmOverloads constructor(
 
         val keysAreaTop = kbTop + railH + 4f * d
         val keysAreaH = (height - 4f * d - keysAreaTop).coerceAtLeast(36f * d)
+        val sepGap = if (showNumberRow) 4.5f * d else 0f
         val rowCount = rows.size
-        val rowH = keysAreaH / rowCount
+        val rowH = (keysAreaH - sepGap) / rowCount
         val padX = 1.4f * d
         val padY = 1.3f * d
         val unitW = innerW / 10f
@@ -148,8 +149,15 @@ class KeyboardBlueprintView @JvmOverloads constructor(
         paintSub.textSize = (rowH * 0.25f).coerceIn(5f * d, 6.5f * d)
 
         for ((ri, rStr) in rows.withIndex()) {
-            val y0 = keysAreaTop + ri * rowH + padY
-            val y1 = keysAreaTop + (ri + 1) * rowH - padY
+            val extraOffset = if (showNumberRow && ri >= 1) sepGap else 0f
+            val y0 = keysAreaTop + extraOffset + ri * rowH + padY
+            val y1 = keysAreaTop + extraOffset + (ri + 1) * rowH - padY
+            if (showNumberRow && ri == 1) {
+                val divY = keysAreaTop + rowH + sepGap * 0.5f
+                paintStroke.color = mutedCol
+                paintStroke.strokeWidth = 0.6f * d
+                canvas.drawLine(kbLeft + 3f * d, divY, kbRight - 3f * d, divY, paintStroke)
+            }
             when (rStr) {
                 "1234567890", "qwertyuiop" -> {
                     for (i in rStr.indices) {

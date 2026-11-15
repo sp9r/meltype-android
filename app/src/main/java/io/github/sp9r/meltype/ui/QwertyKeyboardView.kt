@@ -30,6 +30,9 @@ interface KeyboardActionListener {
     fun onSpace()
     fun onEnter()
     fun onMoveCursor(delta: Int)
+    fun onMoveCursor2D(dx: Int, dy: Int) {
+        if (dx != 0) onMoveCursor(dx)
+    }
     fun onToggleLanguage()
     fun onToggleEmojiPanel()
     fun onOpenSettings()
@@ -118,6 +121,8 @@ class QwertyKeyboardView @JvmOverloads constructor(
 
     private val keys = ArrayList<VisualKey>(60)
     private val letterBounds = RectF()
+    private var numAlphaDeadTop = 0f
+    private var numAlphaDeadBottom = 0f
 
     // Touch tracking
     private var activePointerId = -1
@@ -138,6 +143,12 @@ class QwertyKeyboardView @JvmOverloads constructor(
     private var backspaceLongPressed = false
     private var backspaceSwipeTriggered = false
     private var cursorLongPressed = false
+    private var cursorSwipeActive = false
+    private var cursorSwipeAnchorX = 0f
+    private var cursorSwipeAnchorY = 0f
+    private var cursorSwipeDirX = 0
+    private var cursorSwipeDirY = 0
+    private var cursorSwipeBadge = ""
     private var verticalFlickActive = false
     private var subLongPressActive = false
 
@@ -159,12 +170,26 @@ class QwertyKeyboardView @JvmOverloads constructor(
         override fun run() {
             val dk = downKey
             if ((dk?.kind == KeyKind.CURSOR_LEFT || dk?.kind == KeyKind.CURSOR_RIGHT) &&
-                activePointerId != -1 && !isGliding
+                activePointerId != -1 && !isGliding && !cursorSwipeActive
             ) {
                 cursorLongPressed = true
                 performHaptic()
-                listener?.onMoveCursor(if (dk.kind == KeyKind.CURSOR_LEFT) -1 else 1)
+                listener?.onMoveCursor2D(if (dk.kind == KeyKind.CURSOR_LEFT) -1 else 1, 0)
                 handler.postDelayed(this, 72L)
+            }
+        }
+    }
+
+    private val arrowSwipeRepeatRunnable = object : Runnable {
+        override fun run() {
+            val dk = downKey
+            if ((dk?.kind == KeyKind.CURSOR_LEFT || dk?.kind == KeyKind.CURSOR_RIGHT) &&
+                activePointerId != -1 && cursorSwipeActive &&
+                (cursorSwipeDirX != 0 || cursorSwipeDirY != 0)
+            ) {
+                performHaptic()
+                listener?.onMoveCursor2D(cursorSwipeDirX, cursorSwipeDirY)
+                handler.postDelayed(this, 115L)
             }
         }
     }
@@ -258,7 +283,7 @@ class QwertyKeyboardView @JvmOverloads constructor(
     private fun sp(v: Float): Float = v * resources.displayMetrics.scaledDensity
 
     fun currentBaseHeightDp(): Float {
-        return if (layer == Layer.QWERTY && showNumberRow) 252f else 224f
+        return if (layer == Layer.QWERTY && showNumberRow) 264f else 224f
     }
 
     override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
@@ -304,32 +329,42 @@ class QwertyKeyboardView @JvmOverloads constructor(
         keyWidthAvg = unitW
 
         val hasTopNumRow = (layer == Layer.QWERTY && showNumberRow)
+        val numLetterGap = if (hasTopNumRow) dp(11f * heightScale.coerceIn(0.85f, 1.35f)) else 0f
         val rowWeights = if (hasTopNumRow) {
             floatArrayOf(0.76f, 1.0f, 1.0f, 1.0f, 1.04f)
         } else {
             floatArrayOf(1.0f, 1.0f, 1.0f, 1.04f)
         }
+        val distributableH = (availH - numLetterGap).coerceAtLeast(100f)
         val weightSum = rowWeights.sum()
-        val rowTops = FloatArray(rowWeights.size + 1)
-        rowTops[0] = topPad
+        val rowTops = FloatArray(rowWeights.size)
+        val rowBottoms = FloatArray(rowWeights.size)
+        var curY = topPad
         for (r in rowWeights.indices) {
-            rowTops[r + 1] = rowTops[r] + availH * (rowWeights[r] / weightSum)
+            rowTops[r] = curY
+            val rh = distributableH * (rowWeights[r] / weightSum)
+            rowBottoms[r] = curY + rh
+            curY = rowBottoms[r] + if (hasTopNumRow && r == 0) numLetterGap else 0f
         }
 
-        keyHeightAvg = (rowTops[1] - rowTops[0]).coerceAtLeast(
-            if (rowWeights.size > 1) rowTops[2] - rowTops[1] else availH / 4f
-        )
+        val sampleIdx = if (hasTopNumRow) 1 else 0
+        keyHeightAvg = (rowBottoms[sampleIdx] - rowTops[sampleIdx]).coerceAtLeast(availH / 4.5f)
 
         if (hasTopNumRow) {
+            // Reserve non-reactive dead zone between number keycaps and QWERTY letter keycaps
+            numAlphaDeadTop = rowBottoms[0] - gapY * 0.5f
+            numAlphaDeadBottom = rowTops[1] + gapY * 0.5f
             // Keep KeyLayoutGeometry bounds strictly aligned to the 3 letter rows (rows 1..3)
-            letterBounds.set(areaLeft, rowTops[1], areaLeft + areaW, rowTops[4])
+            letterBounds.set(areaLeft, rowTops[1], areaLeft + areaW, rowBottoms[3])
         } else {
-            letterBounds.set(areaLeft, rowTops[0], areaLeft + areaW, rowTops[3])
+            numAlphaDeadTop = 0f
+            numAlphaDeadBottom = 0f
+            letterBounds.set(areaLeft, rowTops[0], areaLeft + areaW, rowBottoms[2])
         }
 
         fun addRowKeys(rowIdx: Int, specs: List<Pair<Float, VisualKeyBuilder>>, insetUnits: Float = 0f) {
             val y0 = rowTops[rowIdx] + gapY * 0.5f
-            val y1 = rowTops[rowIdx + 1] - gapY * 0.5f
+            val y1 = rowBottoms[rowIdx] - gapY * 0.5f
             var curX = areaLeft + unitW * insetUnits
             for ((units, b) in specs) {
                 val kw = unitW * units
@@ -358,7 +393,9 @@ class QwertyKeyboardView @JvmOverloads constructor(
                     val numSpecs = nums.indices.map { i ->
                         val n = nums[i]
                         val s = numSyms[i]
-                        1f to VisualKeyBuilder(n.toString(), s.toString(), KeyKind.CHAR, n, s, false)
+                        val primary = if (upper) s else n
+                        val secondary = if (upper) n else s
+                        1f to VisualKeyBuilder(primary.toString(), secondary.toString(), KeyKind.CHAR, primary, secondary, false)
                     }
                     addRowKeys(0, numSpecs)
                     rOffset = 1
@@ -405,9 +442,9 @@ class QwertyKeyboardView @JvmOverloads constructor(
                         1.05f to VisualKeyBuilder("?123", "123", KeyKind.LAYER_SYM, subOutputChar = '\u0001', isFn = true),
                         0.85f to VisualKeyBuilder("日/英", "☺", KeyKind.LANG_TOGGLE, subOutputChar = '\u0002', isFn = true),
                         0.80f to VisualKeyBuilder(punctuationStyle.comma, "！", KeyKind.COMMA, subOutputChar = '！', isFn = false),
-                        0.80f to VisualKeyBuilder("◀", "", KeyKind.CURSOR_LEFT, isFn = true),
+                        0.80f to VisualKeyBuilder("◀", "↕", KeyKind.CURSOR_LEFT, isFn = true),
                         2.50f to VisualKeyBuilder("空白", "", KeyKind.SPACE, isFn = false),
-                        0.80f to VisualKeyBuilder("▶", "", KeyKind.CURSOR_RIGHT, isFn = true),
+                        0.80f to VisualKeyBuilder("▶", "↕", KeyKind.CURSOR_RIGHT, isFn = true),
                         0.80f to VisualKeyBuilder("ー", "〜", KeyKind.CHAR, outputChar = '-', subOutputChar = '〜', isFn = false),
                         0.80f to VisualKeyBuilder(punctuationStyle.period, "？", KeyKind.PERIOD, subOutputChar = '？', isFn = false),
                         1.60f to VisualKeyBuilder("⏎", "", KeyKind.ENTER, isFn = true)
@@ -442,9 +479,9 @@ class QwertyKeyboardView @JvmOverloads constructor(
                         1.15f to VisualKeyBuilder("ABC", "", KeyKind.LAYER_ABC, isFn = true),
                         1.15f to VisualKeyBuilder("テンキー", "", KeyKind.LAYER_NUMPAD, isFn = true),
                         0.80f to VisualKeyBuilder(",", "！", KeyKind.CHAR, ',', '！', isFn = false),
-                        0.80f to VisualKeyBuilder("◀", "", KeyKind.CURSOR_LEFT, isFn = true),
+                        0.80f to VisualKeyBuilder("◀", "↕", KeyKind.CURSOR_LEFT, isFn = true),
                         2.70f to VisualKeyBuilder("スペース", "", KeyKind.SPACE, isFn = false),
-                        0.80f to VisualKeyBuilder("▶", "", KeyKind.CURSOR_RIGHT, isFn = true),
+                        0.80f to VisualKeyBuilder("▶", "↕", KeyKind.CURSOR_RIGHT, isFn = true),
                         0.80f to VisualKeyBuilder(".", "？", KeyKind.CHAR, '.', '？', isFn = false),
                         1.80f to VisualKeyBuilder("⏎", "", KeyKind.ENTER, isFn = true)
                     )
@@ -476,9 +513,9 @@ class QwertyKeyboardView @JvmOverloads constructor(
                         1.15f to VisualKeyBuilder("ABC", "", KeyKind.LAYER_ABC, isFn = true),
                         1.15f to VisualKeyBuilder("テンキー", "", KeyKind.LAYER_NUMPAD, isFn = true),
                         0.80f to VisualKeyBuilder("<", "", KeyKind.CHAR, '<', isFn = false),
-                        0.80f to VisualKeyBuilder("◀", "", KeyKind.CURSOR_LEFT, isFn = true),
+                        0.80f to VisualKeyBuilder("◀", "↕", KeyKind.CURSOR_LEFT, isFn = true),
                         2.70f to VisualKeyBuilder("スペース", "", KeyKind.SPACE, isFn = false),
-                        0.80f to VisualKeyBuilder("▶", "", KeyKind.CURSOR_RIGHT, isFn = true),
+                        0.80f to VisualKeyBuilder("▶", "↕", KeyKind.CURSOR_RIGHT, isFn = true),
                         0.80f to VisualKeyBuilder(">", "", KeyKind.CHAR, '>', isFn = false),
                         1.80f to VisualKeyBuilder("⏎", "", KeyKind.ENTER, isFn = true)
                     )
@@ -521,9 +558,9 @@ class QwertyKeyboardView @JvmOverloads constructor(
                     listOf(
                         1.25f to VisualKeyBuilder("ABC", "", KeyKind.LAYER_ABC, isFn = true),
                         1.10f to VisualKeyBuilder("?123", "", KeyKind.LAYER_SYM, isFn = true),
-                        0.85f to VisualKeyBuilder("◀", "", KeyKind.CURSOR_LEFT, isFn = true),
+                        0.85f to VisualKeyBuilder("◀", "↕", KeyKind.CURSOR_LEFT, isFn = true),
                         2.05f to VisualKeyBuilder("0", "", KeyKind.CHAR, '0', isFn = false),
-                        0.85f to VisualKeyBuilder("▶", "", KeyKind.CURSOR_RIGHT, isFn = true),
+                        0.85f to VisualKeyBuilder("▶", "↕", KeyKind.CURSOR_RIGHT, isFn = true),
                         1.00f to VisualKeyBuilder(".", ",", KeyKind.CHAR, '.', ',', isFn = false),
                         1.10f to VisualKeyBuilder("=", "", KeyKind.CHAR, '=', isFn = true),
                         1.80f to VisualKeyBuilder("⏎", "", KeyKind.ENTER, isFn = true)
@@ -551,11 +588,25 @@ class QwertyKeyboardView @JvmOverloads constructor(
         paintBorder.strokeWidth = dp(1f)
         paintBorder.color = cKeyBorder
 
+        if (numAlphaDeadBottom > numAlphaDeadTop) {
+            val midY = (numAlphaDeadTop + numAlphaDeadBottom) * 0.5f
+            paintBorder.color = Color.argb(120, Color.red(cKeyBorder), Color.green(cKeyBorder), Color.blue(cKeyBorder))
+            canvas.drawLine(
+                letterBounds.left + dp(8f),
+                midY,
+                letterBounds.right - dp(8f),
+                midY,
+                paintBorder
+            )
+            paintBorder.color = cKeyBorder
+        }
+
         for (k in keys) {
             val isPressed = !isGliding && (
                 currentHoverKey === k ||
                     (downKey === k && (subLongPressActive || verticalFlickActive)) ||
-                    (downKey === k && isSpaceSliding && k.kind == KeyKind.SPACE)
+                    (downKey === k && isSpaceSliding && k.kind == KeyKind.SPACE) ||
+                    (downKey === k && cursorSwipeActive && (k.kind == KeyKind.CURSOR_LEFT || k.kind == KeyKind.CURSOR_RIGHT))
                 )
             paintKey.color = when {
                 k.kind == KeyKind.ENTER -> if (isPressed) adjustBrightness(cAccent, 0.85f) else cAccent
@@ -614,15 +665,20 @@ class QwertyKeyboardView @JvmOverloads constructor(
             canvas.drawCircle(head.x, head.y, dp(5.5f), paintTrailHead)
         }
 
-        // Key preview badge on press, vertical flick, or long-press secondary character
+        // Key preview badge on press, vertical flick, long-press secondary, or 4-way arrow swipe
         val dk = downKey
+        val isArrowSwipeBadge = cursorSwipeActive && cursorSwipeBadge.isNotEmpty() &&
+            (dk?.kind == KeyKind.CURSOR_LEFT || dk?.kind == KeyKind.CURSOR_RIGHT)
         if (!isGliding && dk != null && activePointerId != -1 &&
-            (dk.kind == KeyKind.CHAR || ((subLongPressActive || verticalFlickActive) && dk.subOutputChar != '\u0000'))
+            (dk.kind == KeyKind.CHAR ||
+                ((subLongPressActive || verticalFlickActive) && dk.subOutputChar != '\u0000') ||
+                isArrowSwipeBadge)
         ) {
-            val previewChar = if ((subLongPressActive || verticalFlickActive) && dk.subOutputChar != '\u0000') {
-                dk.subLabel.ifEmpty { dk.subOutputChar.toString() }
-            } else {
-                dk.label
+            val previewChar = when {
+                isArrowSwipeBadge -> cursorSwipeBadge
+                (subLongPressActive || verticalFlickActive) && dk.subOutputChar != '\u0000' ->
+                    dk.subLabel.ifEmpty { dk.subOutputChar.toString() }
+                else -> dk.label
             }
             val popW = (dk.rect.width() * 1.15f).coerceAtLeast(dp(38f))
             val popH = (dk.rect.height() * 0.92f).coerceAtLeast(dp(40f))
@@ -650,6 +706,7 @@ class QwertyKeyboardView @JvmOverloads constructor(
             MotionEvent.ACTION_DOWN -> {
                 handler.removeCallbacks(bsRepeatRunnable)
                 handler.removeCallbacks(cursorRepeatRunnable)
+                handler.removeCallbacks(arrowSwipeRepeatRunnable)
                 handler.removeCallbacks(subLongPressRunnable)
 
                 val x = event.getX(0)
@@ -666,6 +723,12 @@ class QwertyKeyboardView @JvmOverloads constructor(
                 backspaceLongPressed = false
                 backspaceSwipeTriggered = false
                 cursorLongPressed = false
+                cursorSwipeActive = false
+                cursorSwipeAnchorX = x
+                cursorSwipeAnchorY = y
+                cursorSwipeDirX = 0
+                cursorSwipeDirY = 0
+                cursorSwipeBadge = ""
                 verticalFlickActive = false
                 subLongPressActive = false
                 glideTrail.clear()
@@ -722,6 +785,14 @@ class QwertyKeyboardView @JvmOverloads constructor(
                     }
                     lastX = x
                     lastY = y
+                    return true
+                }
+
+                if (dk?.kind == KeyKind.CURSOR_LEFT || dk?.kind == KeyKind.CURSOR_RIGHT) {
+                    handleCursorKeySwipeMove(x, y)
+                    lastX = x
+                    lastY = y
+                    invalidate()
                     return true
                 }
 
@@ -803,6 +874,7 @@ class QwertyKeyboardView @JvmOverloads constructor(
             MotionEvent.ACTION_POINTER_DOWN -> {
                 handler.removeCallbacks(bsRepeatRunnable)
                 handler.removeCallbacks(cursorRepeatRunnable)
+                handler.removeCallbacks(arrowSwipeRepeatRunnable)
                 handler.removeCallbacks(subLongPressRunnable)
                 if (activePointerId != -1 && !isGliding && !isSpaceSliding) {
                     val pIdx = event.findPointerIndex(activePointerId)
@@ -822,6 +894,12 @@ class QwertyKeyboardView @JvmOverloads constructor(
                 backspaceLongPressed = false
                 backspaceSwipeTriggered = false
                 cursorLongPressed = false
+                cursorSwipeActive = false
+                cursorSwipeAnchorX = downX
+                cursorSwipeAnchorY = downY
+                cursorSwipeDirX = 0
+                cursorSwipeDirY = 0
+                cursorSwipeBadge = ""
                 verticalFlickActive = false
                 subLongPressActive = false
                 glideTrail.clear()
@@ -850,6 +928,7 @@ class QwertyKeyboardView @JvmOverloads constructor(
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                 handler.removeCallbacks(bsRepeatRunnable)
                 handler.removeCallbacks(cursorRepeatRunnable)
+                handler.removeCallbacks(arrowSwipeRepeatRunnable)
                 handler.removeCallbacks(subLongPressRunnable)
                 val pIdx = event.findPointerIndex(activePointerId)
                 val endX = if (pIdx >= 0) event.getX(pIdx) else lastX
@@ -862,6 +941,10 @@ class QwertyKeyboardView @JvmOverloads constructor(
                 currentHoverKey = null
                 isGliding = false
                 isSpaceSliding = false
+                cursorSwipeActive = false
+                cursorSwipeDirX = 0
+                cursorSwipeDirY = 0
+                cursorSwipeBadge = ""
                 verticalFlickActive = false
                 subLongPressActive = false
                 backspaceSwipeTriggered = false
@@ -897,8 +980,19 @@ class QwertyKeyboardView @JvmOverloads constructor(
             return
         }
         if (dk?.kind == KeyKind.CURSOR_LEFT || dk?.kind == KeyKind.CURSOR_RIGHT) {
-            if (!cursorLongPressed) {
-                listener?.onMoveCursor(if (dk.kind == KeyKind.CURSOR_LEFT) -1 else 1)
+            if (!cursorSwipeActive && !cursorLongPressed) {
+                val dx = endX - downX
+                val dy = endY - downY
+                val horizThresh = (keyWidthAvg * 0.34f).coerceAtLeast(dp(11f))
+                val upThresh = (keyHeightAvg * 0.30f).coerceAtLeast(dp(11f))
+                val downThresh = (keyHeightAvg * 0.22f).coerceAtLeast(dp(8f))
+                if (abs(dy) >= abs(dx) && (dy <= -upThresh || dy >= downThresh)) {
+                    listener?.onMoveCursor2D(0, if (dy < 0f) -1 else 1)
+                } else if (abs(dx) > abs(dy) && abs(dx) >= horizThresh) {
+                    listener?.onMoveCursor2D(if (dx < 0f) -1 else 1, 0)
+                } else {
+                    listener?.onMoveCursor2D(if (dk.kind == KeyKind.CURSOR_LEFT) -1 else 1, 0)
+                }
             }
             return
         }
@@ -922,7 +1016,13 @@ class QwertyKeyboardView @JvmOverloads constructor(
                     dk.kind == KeyKind.LANG_TOGGLE && dk.subOutputChar == '\u0002' -> {
                         listener?.onToggleEmojiPanel()
                     }
-                    else -> listener?.onCharacter(dk.subOutputChar, directCommit = (layer == Layer.NUMPAD))
+                    else -> {
+                        listener?.onCharacter(dk.subOutputChar, directCommit = (layer == Layer.NUMPAD))
+                        if (layer == Layer.QWERTY && shiftState == ShiftState.ONCE) {
+                            shiftState = ShiftState.OFF
+                            rebuildLayout()
+                        }
+                    }
                 }
                 return
             }
@@ -992,8 +1092,8 @@ class QwertyKeyboardView @JvmOverloads constructor(
             KeyKind.LANG_TOGGLE -> listener?.onToggleLanguage()
             KeyKind.SETTINGS -> listener?.onOpenSettings()
             KeyKind.EMOJI -> listener?.onToggleEmojiPanel()
-            KeyKind.CURSOR_LEFT -> listener?.onMoveCursor(-1)
-            KeyKind.CURSOR_RIGHT -> listener?.onMoveCursor(1)
+            KeyKind.CURSOR_LEFT -> listener?.onMoveCursor2D(-1, 0)
+            KeyKind.CURSOR_RIGHT -> listener?.onMoveCursor2D(1, 0)
             KeyKind.COMMA -> listener?.onPunctuation(isPeriod = false)
             KeyKind.PERIOD -> listener?.onPunctuation(isPeriod = true)
             KeyKind.SPACE -> listener?.onSpace()
@@ -1036,13 +1136,82 @@ class QwertyKeyboardView @JvmOverloads constructor(
         return low in 'a'..'z'
     }
 
+    private fun handleCursorKeySwipeMove(x: Float, y: Float) {
+        val horizThresh = (keyWidthAvg * 0.34f).coerceAtLeast(dp(11f))
+        val upThresh = (keyHeightAvg * 0.30f).coerceAtLeast(dp(11f))
+        val downThresh = (keyHeightAvg * 0.22f).coerceAtLeast(dp(8f))
+        if (!cursorSwipeActive) {
+            val totalDx = x - downX
+            val totalDy = y - downY
+            val dir: Pair<Int, Int>? = if (abs(totalDy) >= abs(totalDx)) {
+                when {
+                    totalDy <= -upThresh -> 0 to -1
+                    totalDy >= downThresh -> 0 to 1
+                    else -> null
+                }
+            } else if (abs(totalDx) >= horizThresh) {
+                (if (totalDx < 0f) -1 else 1) to 0
+            } else {
+                null
+            }
+            if (dir != null) {
+                handler.removeCallbacks(cursorRepeatRunnable)
+                cursorSwipeActive = true
+                cursorSwipeAnchorX = x
+                cursorSwipeAnchorY = y
+                emitCursorSwipeStep(dir.first, dir.second)
+            }
+            return
+        }
+
+        val stepX = (keyWidthAvg * 0.42f).coerceAtLeast(dp(14f))
+        val stepY = (keyHeightAvg * 0.36f).coerceAtLeast(dp(12f))
+        val dxStep = x - cursorSwipeAnchorX
+        val dyStep = y - cursorSwipeAnchorY
+        if (abs(dxStep) >= stepX && abs(dxStep) >= abs(dyStep)) {
+            val sx = if (dxStep > 0f) 1 else -1
+            cursorSwipeAnchorX += sx * stepX
+            cursorSwipeAnchorY = y
+            emitCursorSwipeStep(sx, 0)
+        } else if (abs(dyStep) >= stepY) {
+            val sy = if (dyStep > 0f) 1 else -1
+            cursorSwipeAnchorY += sy * stepY
+            cursorSwipeAnchorX = x
+            emitCursorSwipeStep(0, sy)
+        }
+    }
+
+    private fun emitCursorSwipeStep(dx: Int, dy: Int) {
+        cursorSwipeDirX = dx
+        cursorSwipeDirY = dy
+        cursorSwipeBadge = when {
+            dy < 0 -> "▲"
+            dy > 0 -> "▼"
+            dx < 0 -> "◀"
+            else -> "▶"
+        }
+        performHaptic()
+        listener?.onMoveCursor2D(dx, dy)
+        handler.removeCallbacks(arrowSwipeRepeatRunnable)
+        handler.postDelayed(arrowSwipeRepeatRunnable, 280L)
+    }
+
     private fun findKeyAt(x: Float, y: Float): VisualKey? {
         for (k in keys) {
             if (k.rect.contains(x, y)) return k
         }
+        val hasDeadBand = numAlphaDeadBottom > numAlphaDeadTop
+        if (hasDeadBand && y >= numAlphaDeadTop && y <= numAlphaDeadBottom) {
+            return null
+        }
+        val deadMid = (numAlphaDeadTop + numAlphaDeadBottom) * 0.5f
         var best: VisualKey? = null
         var bestDist = Float.MAX_VALUE
         for (k in keys) {
+            if (hasDeadBand) {
+                if (y < deadMid && k.rect.centerY() > deadMid) continue
+                if (y > deadMid && k.rect.centerY() < deadMid) continue
+            }
             val cx = x.coerceIn(k.rect.left, k.rect.right)
             val cy = y.coerceIn(k.rect.top, k.rect.bottom)
             val d = hypot((x - cx).toDouble(), (y - cy).toDouble()).toFloat()
@@ -1052,6 +1221,27 @@ class QwertyKeyboardView @JvmOverloads constructor(
             }
         }
         return if (bestDist <= dp(24f)) best else null
+    }
+
+    internal fun deadZoneRangeForTest(): Pair<Float, Float> = numAlphaDeadTop to numAlphaDeadBottom
+
+    internal fun hitTestLabelForTest(x: Float, y: Float): String? = findKeyAt(x, y)?.label
+
+    internal fun rowZeroLabelsForTest(): List<String> {
+        if (keys.isEmpty()) return emptyList()
+        val topMin = keys.minOf { it.rect.top }
+        return keys.filter { abs(it.rect.top - topMin) < dp(6f) }.sortedBy { it.rect.left }.map { it.label }
+    }
+
+    internal fun firstKeyCenterForTest(label: String): Pair<Float, Float>? {
+        val k = keys.firstOrNull { it.label == label } ?: return null
+        return k.rect.centerX() to k.rect.centerY()
+    }
+
+    internal fun setShiftStateForTest(state: ShiftState) {
+        shiftState = state
+        rebuildLayout()
+        invalidate()
     }
 
     private fun computeSpatialHints(target: VisualKey, tapX: Float, tapY: Float): Map<Char, Float> {

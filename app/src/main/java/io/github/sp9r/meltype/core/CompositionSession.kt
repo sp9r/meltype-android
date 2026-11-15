@@ -38,7 +38,9 @@ data class CompositionSnapshot(
     val scriptVariants: List<Pair<String, String>> = emptyList(),
     val canShrinkClause: Boolean = false,
     val canExtendClause: Boolean = false,
-    val hasGlideUndo: Boolean = false
+    val hasGlideUndo: Boolean = false,
+    val focusedAdjustableKana: String = "",
+    val focusedAdjustableLen: Int = 0
 )
 
 /**
@@ -234,69 +236,98 @@ class CompositionSession(
      */
     fun resizeFocusedClause(deltaKana: Int, surroundingContext: String? = null): CompositionSnapshot {
         if (deltaKana == 0) return cachedSnapshot
+        return updateFocusedClauseSplit(
+            targetLenProvider = { currentLen, _ -> currentLen + deltaKana },
+            surroundingContext = surroundingContext
+        )
+    }
+
+    /** Directly snaps the focused Japanese clause boundary to [targetKanaLen] characters. */
+    fun setFocusedClauseLength(targetKanaLen: Int, surroundingContext: String? = null): CompositionSnapshot {
+        if (targetKanaLen <= 0) return cachedSnapshot
+        return updateFocusedClauseSplit(
+            targetLenProvider = { _, _ -> targetKanaLen },
+            surroundingContext = surroundingContext
+        )
+    }
+
+    private fun updateFocusedClauseSplit(
+        targetLenProvider: (currentLen: Int, totalAvailableInSeg: Int) -> Int,
+        surroundingContext: String?
+    ): CompositionSnapshot {
         var clauses = cachedSnapshot.clauses
         var focused = clauses.getOrNull(focusedClauseIdx) ?: return cachedSnapshot
-        if (focused.isEnglish) return cachedSnapshot
+        if (focused.isEnglish || !RomajiDetector.isHiraganaOnly(focused.reading)) return cachedSnapshot
 
-        // If extending from the end of a Japanese segment directly into a contiguous Japanese segment, merge first
-        if (deltaKana > 0) {
-            val segs = scoreEngine.segment(buffer.toString(), overrides)
+        var guard = 0
+        while (guard++ < 6) {
             val segIdx = focused.segmentIndex
-            val nextClause = clauses.getOrNull(focusedClauseIdx + 1)
-            if (nextClause != null && !nextClause.isEnglish && nextClause.segmentIndex == segIdx + 1) {
-                val segA = segs.getOrNull(segIdx)
-                val segB = segs.getOrNull(segIdx + 1)
-                if (segA != null && segB != null &&
-                    segA.kind == SegmentKind.JAPANESE && segB.kind == SegmentKind.JAPANESE &&
-                    segA.endIndex == segB.startIndex
-                ) {
-                    val segALens = clauses.filter { it.segmentIndex == segIdx && !it.isEnglish && RomajiDetector.isHiraganaOnly(it.reading) }.map { it.reading.length }
-                    val mergedRange = segA.startIndex until segB.endIndex
-                    overrides.keys.filter { it.first <= mergedRange.last && it.last >= mergedRange.first }.toList()
-                        .forEach { overrides.remove(it) }
-                    overrides[mergedRange] = SegmentKind.JAPANESE
-                    customClauseSplits.remove(segIdx)
-                    customClauseSplits.remove(segIdx + 1)
-                    if (segALens.isNotEmpty()) {
-                        customClauseSplits[segIdx] = segALens.toMutableList()
-                    }
-                    recompute(surroundingContext, keepFocus = true)
-                    clauses = cachedSnapshot.clauses
-                    focused = clauses.getOrNull(focusedClauseIdx) ?: return cachedSnapshot
-                }
+            val segClauses = clauses.filter { it.segmentIndex == segIdx && !it.isEnglish && RomajiDetector.isHiraganaOnly(it.reading) }
+            if (segClauses.isEmpty()) return cachedSnapshot
+            val firstGlobalIdx = clauses.indexOfFirst { it.segmentIndex == segIdx }
+            val relIdx = focusedClauseIdx - firstGlobalIdx
+            if (relIdx !in segClauses.indices) return cachedSnapshot
+
+            val prefixSumBefore = segClauses.take(relIdx).sumOf { it.reading.length }
+            val totalSegKana = segClauses.sumOf { it.reading.length }
+            val maxInCurrentSeg = (totalSegKana - prefixSumBefore).coerceAtLeast(1)
+            val currentLen = segClauses[relIdx].reading.length
+            val desiredLen = targetLenProvider(currentLen, maxInCurrentSeg)
+
+            if (desiredLen > maxInCurrentSeg && mergeNextContiguousJapaneseSegment(segIdx, segClauses, surroundingContext)) {
+                clauses = cachedSnapshot.clauses
+                focused = clauses.getOrNull(focusedClauseIdx) ?: return cachedSnapshot
+                continue
             }
+
+            val finalLen = desiredLen.coerceIn(1, maxInCurrentSeg)
+            if (finalLen == currentLen) return cachedSnapshot
+
+            val prefixLens = segClauses.take(relIdx + 1).map { it.reading.length }.toMutableList()
+            prefixLens[relIdx] = finalLen
+            customClauseSplits[segIdx] = prefixLens
+
+            val changedOffset = segClauses[relIdx].readingOffset
+            val prefix = "$segIdx:"
+            selectedClauseTextByKey.keys.filter { key ->
+                if (!key.startsWith(prefix)) return@filter false
+                val afterSeg = key.removePrefix(prefix)
+                val off = afterSeg.substringBefore(':').toIntOrNull() ?: 0
+                off >= changedOffset
+            }.toList().forEach { selectedClauseTextByKey.remove(it) }
+            clearLastGlideHint()
+            return recompute(surroundingContext, keepFocus = true)
         }
+        return cachedSnapshot
+    }
 
-        val segIdx = focused.segmentIndex
-        val segClauses = clauses.filter { it.segmentIndex == segIdx && !it.isEnglish && RomajiDetector.isHiraganaOnly(it.reading) }
-        if (segClauses.isEmpty()) return cachedSnapshot
-
-        val firstGlobalIdx = clauses.indexOfFirst { it.segmentIndex == segIdx }
-        val relIdx = focusedClauseIdx - firstGlobalIdx
-        if (relIdx !in segClauses.indices) return cachedSnapshot
-
-        val prefixLens = segClauses.take(relIdx + 1).map { it.reading.length }.toMutableList()
-        val totalSegKana = segClauses.sumOf { it.reading.length }
-        if (deltaKana < 0) {
-            if (prefixLens[relIdx] <= 1) return cachedSnapshot
-            prefixLens[relIdx] -= 1
-        } else {
-            val usedIncludingFocus = prefixLens.sum()
-            if (usedIncludingFocus >= totalSegKana) return cachedSnapshot
-            prefixLens[relIdx] += 1
+    private fun mergeNextContiguousJapaneseSegment(
+        segIdx: Int,
+        segClauses: List<DisplayClause>,
+        surroundingContext: String?
+    ): Boolean {
+        val clauses = cachedSnapshot.clauses
+        val nextSegIdx = segIdx + 1
+        val nextHasJp = clauses.any { it.segmentIndex == nextSegIdx && !it.isEnglish && RomajiDetector.isHiraganaOnly(it.reading) }
+        if (!nextHasJp) return false
+        val segs = scoreEngine.segment(buffer.toString(), overrides)
+        val segA = segs.getOrNull(segIdx) ?: return false
+        val segB = segs.getOrNull(nextSegIdx) ?: return false
+        if (segA.kind != SegmentKind.JAPANESE || segB.kind != SegmentKind.JAPANESE || segA.endIndex != segB.startIndex) {
+            return false
         }
-
-        customClauseSplits[segIdx] = prefixLens
-        val changedOffset = segClauses[relIdx].readingOffset
-        val prefix = "$segIdx:"
-        selectedClauseTextByKey.keys.filter { key ->
-            if (!key.startsWith(prefix)) return@filter false
-            val afterSeg = key.removePrefix(prefix)
-            val off = afterSeg.substringBefore(':').toIntOrNull() ?: 0
-            off >= changedOffset
-        }.toList().forEach { selectedClauseTextByKey.remove(it) }
-        clearLastGlideHint()
-        return recompute(surroundingContext, keepFocus = true)
+        val segALens = segClauses.map { it.reading.length }
+        val mergedRange = segA.startIndex until segB.endIndex
+        overrides.keys.filter { it.first <= mergedRange.last && it.last >= mergedRange.first }.toList()
+            .forEach { overrides.remove(it) }
+        overrides[mergedRange] = SegmentKind.JAPANESE
+        customClauseSplits.remove(segIdx)
+        customClauseSplits.remove(nextSegIdx)
+        if (segALens.isNotEmpty()) {
+            customClauseSplits[segIdx] = segALens.toMutableList()
+        }
+        recompute(surroundingContext, keepFocus = true)
+        return true
     }
 
     fun selectCandidate(
@@ -803,6 +834,29 @@ class CompositionSession(
         }
         val canExtend = canExtendSameOrAdj
         val hasGlideUndo = lastGlideRange != null && lastGlideRange!!.last == raw.length - 1
+        val adjustableBuf = StringBuilder()
+        var focusedAdjLen = 0
+        if (focused != null && !focused.isEnglish && RomajiDetector.isHiraganaOnly(focused.reading)) {
+            adjustableBuf.append(focused.reading)
+            focusedAdjLen = focused.reading.length
+            var prevSegIdx = focused.segmentIndex
+            for (k in (focusedClauseIdx + 1) until displayClauses.size) {
+                val dc = displayClauses[k]
+                if (dc.isEnglish || !RomajiDetector.isHiraganaOnly(dc.reading)) break
+                if (dc.segmentIndex != prevSegIdx) {
+                    val segA = segments.getOrNull(prevSegIdx)
+                    val segB = segments.getOrNull(dc.segmentIndex)
+                    val contiguousJp = segA != null && segB != null &&
+                        dc.segmentIndex == prevSegIdx + 1 &&
+                        segA.kind == SegmentKind.JAPANESE &&
+                        segB.kind == SegmentKind.JAPANESE &&
+                        segA.endIndex == segB.startIndex
+                    if (!contiguousJp) break
+                    prevSegIdx = dc.segmentIndex
+                }
+                adjustableBuf.append(dc.reading)
+            }
+        }
 
         val preview = displayClauses.joinToString("") { it.text }
         val trace = segments.joinToString("|") { it.raw }
@@ -817,7 +871,9 @@ class CompositionSession(
             scriptVariants = scriptVariants,
             canShrinkClause = canShrink,
             canExtendClause = canExtend,
-            hasGlideUndo = hasGlideUndo
+            hasGlideUndo = hasGlideUndo,
+            focusedAdjustableKana = adjustableBuf.toString(),
+            focusedAdjustableLen = focusedAdjLen
         )
         return cachedSnapshot
     }

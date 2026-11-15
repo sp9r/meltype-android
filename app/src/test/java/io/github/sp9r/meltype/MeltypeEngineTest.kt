@@ -597,4 +597,37 @@ class MeltypeEngineTest {
             tempDir.deleteRecursively()
         }
     }
+
+    @Test
+    fun directClauseSplitAdjustsToExactKanaLengthAndMergesAdjacentSegments() {
+        val converter = AndroidMozcConverter(dictionaries)
+        val sess = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "kyouhaiitenki") {
+            sess.appendChar(ch)
+        }
+        val init = sess.focusClause(0)
+        assertTrue(init.focusedAdjustableKana.startsWith("きょう"))
+        assertEquals(init.clauses.first().reading.length, init.focusedAdjustableLen)
+
+        val snapped4 = sess.setFocusedClauseLength(4)
+        assertEquals("きょうは", snapped4.clauses[0].reading)
+        assertEquals(4, snapped4.focusedAdjustableLen)
+
+        val shrunk2 = sess.setFocusedClauseLength(2)
+        assertEquals("きょ", shrunk2.clauses[0].reading)
+        assertEquals(2, shrunk2.focusedAdjustableLen)
+
+        val restored3 = sess.resizeFocusedClause(+1)
+        assertEquals("きょう", restored3.clauses[0].reading)
+        assertEquals(3, restored3.focusedAdjustableLen)
+
+        // Adjacent Japanese tap + glide segments can also extend directly across segment boundaries
+        val mixedSess = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "kyouha") mixedSess.appendChar(ch)
+        mixedSess.appendGlideResult("tenki", false, listOf("tenki" to false))
+        val mixedInit = mixedSess.focusClause(0)
+        assertTrue(mixedInit.focusedAdjustableKana.length >= 5)
+        val extendedAcross = mixedSess.setFocusedClauseLength(4)
+        assertEquals(4, extendedAcross.clauses[0].reading.length)
+    }
 }

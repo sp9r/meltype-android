@@ -1528,6 +1528,126 @@ class MainActivity : AppCompatActivity() {
 
         check("DefaultLetterFlickOff", !MeltypeSettings(applicationContext).letterFlickEnabled, "letterFlickEnabled=false")
 
+        // Real QwertyKeyboardView checks on main thread: dead-zone band, Shift-swapped number row, and 4-way arrow key swipe
+        val movedDirs = ArrayList<Pair<Int, Int>>()
+        val typedChars = ArrayList<Char>()
+        val deadZoneChars = ArrayList<Char>()
+        var dzGap = 0f
+        var dzMidHit: String? = "INIT"
+        var row0Normal: List<String> = emptyList()
+        var row0Shifted: List<String> = emptyList()
+        var row0AfterTap: List<String> = emptyList()
+        val uiLatch = java.util.concurrent.CountDownLatch(1)
+        runOnUiThread {
+            try {
+                val probeKb = io.github.sp9r.meltype.ui.QwertyKeyboardView(this).apply {
+                    showNumberRow = true
+                    heightScale = 1.0f
+                    hapticEnabled = false
+                    listener = object : io.github.sp9r.meltype.ui.KeyboardActionListener {
+                        override fun onCharacter(ch: Char, directCommit: Boolean, spatialHints: Map<Char, Float>) {
+                            typedChars.add(ch)
+                        }
+                        override fun onPunctuation(isPeriod: Boolean) {}
+                        override fun onBackspace() {}
+                        override fun onBackspaceClearAll() {}
+                        override fun onSpace() {}
+                        override fun onEnter() {}
+                        override fun onMoveCursor(delta: Int) {}
+                        override fun onMoveCursor2D(dx: Int, dy: Int) { movedDirs.add(dx to dy) }
+                        override fun onToggleLanguage() {}
+                        override fun onToggleEmojiPanel() {}
+                        override fun onOpenSettings() {}
+                        override fun onGlidePreview(points: List<io.github.sp9r.meltype.glide.TouchPoint>, letterBounds: android.graphics.RectF) {}
+                        override fun onGlideCommit(points: List<io.github.sp9r.meltype.glide.TouchPoint>, letterBounds: android.graphics.RectF) {}
+                    }
+                }
+                val kbW = 1080
+                val kbH = dp(probeKb.currentBaseHeightDp().toInt())
+                probeKb.measure(
+                    View.MeasureSpec.makeMeasureSpec(kbW, View.MeasureSpec.EXACTLY),
+                    View.MeasureSpec.makeMeasureSpec(kbH, View.MeasureSpec.EXACTLY)
+                )
+                probeKb.layout(0, 0, kbW, kbH)
+                val (dzTop, dzBot) = probeKb.deadZoneRangeForTest()
+                dzGap = dzBot - dzTop
+                val dzMidY = (dzTop + dzBot) * 0.5f
+                dzMidHit = if (dzBot > dzTop) probeKb.hitTestLabelForTest(kbW * 0.5f, dzMidY) else "ERR"
+                if (dzBot > dzTop) {
+                    val tDz = android.os.SystemClock.uptimeMillis()
+                    val evDown = android.view.MotionEvent.obtain(tDz, tDz, android.view.MotionEvent.ACTION_DOWN, kbW * 0.5f, dzMidY, 0)
+                    val evUp = android.view.MotionEvent.obtain(tDz, tDz + 20L, android.view.MotionEvent.ACTION_UP, kbW * 0.5f, dzMidY, 0)
+                    probeKb.onTouchEvent(evDown)
+                    probeKb.onTouchEvent(evUp)
+                    evDown.recycle()
+                    evUp.recycle()
+                }
+                deadZoneChars.addAll(typedChars)
+                typedChars.clear()
+
+                row0Normal = probeKb.rowZeroLabelsForTest()
+                probeKb.setShiftStateForTest(io.github.sp9r.meltype.ui.QwertyKeyboardView.ShiftState.ONCE)
+                row0Shifted = probeKb.rowZeroLabelsForTest()
+                val c1 = probeKb.firstKeyCenterForTest("!")
+                if (c1 != null) {
+                    val t0 = android.os.SystemClock.uptimeMillis()
+                    val evDown = android.view.MotionEvent.obtain(t0, t0, android.view.MotionEvent.ACTION_DOWN, c1.first, c1.second, 0)
+                    val evUp = android.view.MotionEvent.obtain(t0, t0 + 20L, android.view.MotionEvent.ACTION_UP, c1.first, c1.second, 0)
+                    probeKb.onTouchEvent(evDown)
+                    probeKb.onTouchEvent(evUp)
+                    evDown.recycle()
+                    evUp.recycle()
+                }
+                row0AfterTap = probeKb.rowZeroLabelsForTest()
+
+                val arrowLeft = probeKb.firstKeyCenterForTest("◀")
+                if (arrowLeft != null) {
+                    val (ax, ay) = arrowLeft
+                    val deltas = listOf(0f to -dp(45).toFloat(), 0f to dp(35).toFloat(), -dp(45).toFloat() to 0f, dp(45).toFloat() to 0f)
+                    for ((dx, dy) in deltas) {
+                        val t0 = android.os.SystemClock.uptimeMillis()
+                        val e1 = android.view.MotionEvent.obtain(t0, t0, android.view.MotionEvent.ACTION_DOWN, ax, ay, 0)
+                        val e2 = android.view.MotionEvent.obtain(t0, t0 + 20L, android.view.MotionEvent.ACTION_MOVE, ax + dx, ay + dy, 0)
+                        val e3 = android.view.MotionEvent.obtain(t0, t0 + 40L, android.view.MotionEvent.ACTION_UP, ax + dx, ay + dy, 0)
+                        probeKb.onTouchEvent(e1)
+                        probeKb.onTouchEvent(e2)
+                        probeKb.onTouchEvent(e3)
+                        e1.recycle()
+                        e2.recycle()
+                        e3.recycle()
+                    }
+                }
+            } finally {
+                uiLatch.countDown()
+            }
+        }
+        uiLatch.await(3, java.util.concurrent.TimeUnit.SECONDS)
+
+        check("NumAlphaDeadZone", dzGap >= dp(10).toFloat() && dzMidHit == null && deadZoneChars.isEmpty(), "gapPx=${"%.1f".format(dzGap)} midHit=$dzMidHit dzChars=$deadZoneChars")
+        check(
+            "ShiftNumberSymbols",
+            row0Normal == listOf("1","2","3","4","5","6","7","8","9","0") &&
+                row0Shifted == listOf("!","@","#","$","%","&","*","(",")","-") &&
+                typedChars == listOf('!') &&
+                row0AfterTap == row0Normal,
+            "shifted=$row0Shifted typed=$typedChars after=$row0AfterTap"
+        )
+        check(
+            "ArrowKey4WaySwipe",
+            movedDirs.containsAll(listOf(0 to -1, 0 to 1, -1 to 0, 1 to 0)),
+            "dirs=$movedDirs"
+        )
+
+        val boundarySess = CompositionSession(dicts, engine, converter)
+        for (c in "kyouhaiitenki") boundarySess.appendChar(c)
+        boundarySess.focusClause(0)
+        val snapSnap = boundarySess.setFocusedClauseLength(4)
+        check(
+            "DirectClauseCut",
+            snapSnap.clauses.firstOrNull()?.reading == "きょうは" && snapSnap.focusedAdjustableLen == 4,
+            "first=${snapSnap.clauses.firstOrNull()?.reading} adj=${snapSnap.focusedAdjustableKana}:${snapSnap.focusedAdjustableLen}"
+        )
+
         val header = if (allPassed) "PASS\n" else "FAIL\n"
         val report = header + sb.toString()
         if (writeFile) {
@@ -1757,7 +1877,7 @@ class MainActivity : AppCompatActivity() {
 
         fun updateUiFromScale(scale: Float, updateSeek: Boolean) {
             val pct = (scale * 100f).roundToInt().coerceIn(65, 155)
-            val baseDp = if (settings.showNumberRow) 252f else 224f
+            val baseDp = if (settings.showNumberRow) 264f else 224f
             val approxDp = (baseDp * scale).roundToInt()
             valueLabel.text = "${pct}% · ${approxDp}dp"
             blueprintView.heightScale = scale

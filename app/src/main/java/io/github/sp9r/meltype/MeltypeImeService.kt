@@ -88,14 +88,18 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
 
     private lateinit var rootContainer: LinearLayout
     private lateinit var clauseBar: LinearLayout
+    private lateinit var clauseTopRow: LinearLayout
     private lateinit var clauseScroll: HorizontalScrollView
     private lateinit var clausePillRow: LinearLayout
     private lateinit var prevClauseBtn: TextView
     private lateinit var nextClauseBtn: TextView
-    private lateinit var shrinkClauseBtn: TextView
-    private lateinit var extendClauseBtn: TextView
     private lateinit var partialCommitBtn: TextView
     private lateinit var langSwitchBtn: TextView
+    private lateinit var boundaryBar: LinearLayout
+    private lateinit var shrinkClauseBtn: TextView
+    private lateinit var boundaryScroll: HorizontalScrollView
+    private lateinit var boundaryKanaRow: LinearLayout
+    private lateinit var extendClauseBtn: TextView
 
     private lateinit var topBar: LinearLayout
     private lateinit var traceBadge: TextView
@@ -169,15 +173,23 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             )
         }
 
-        // Clause focus & boundary adjustment bar (visible while composing)
+        // Clause focus & 1-tap boundary adjustment bar (visible while composing)
         clauseBar = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
+            orientation = LinearLayout.VERTICAL
             visibility = View.GONE
             setPadding(dp(6), dp(3), dp(6), dp(2))
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
-                dp(40)
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        }
+
+        clauseTopRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                dp(34)
             )
         }
 
@@ -191,21 +203,13 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         }
         clauseScroll.addView(clausePillRow)
 
-        prevClauseBtn = makeRailButton("◀").apply {
+        prevClauseBtn = makeRailButton("‹").apply {
+            minWidth = dp(30)
             setOnClickListener { renderSnapshot(session.moveFocus(-1)) }
         }
-        nextClauseBtn = makeRailButton("▶").apply {
+        nextClauseBtn = makeRailButton("›").apply {
+            minWidth = dp(30)
             setOnClickListener { renderSnapshot(session.moveFocus(+1)) }
-        }
-        shrinkClauseBtn = makeRailButton("短").apply {
-            setOnClickListener {
-                renderSnapshot(session.resizeFocusedClause(-1, getSurroundingTextBefore()))
-            }
-        }
-        extendClauseBtn = makeRailButton("長").apply {
-            setOnClickListener {
-                renderSnapshot(session.resizeFocusedClause(+1, getSurroundingTextBefore()))
-            }
         }
         partialCommitBtn = makeRailButton("確定✓").apply {
             setOnClickListener {
@@ -230,13 +234,54 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             setOnClickListener { onToggleLanguage() }
         }
 
-        clauseBar.addView(clauseScroll)
-        clauseBar.addView(prevClauseBtn)
-        clauseBar.addView(nextClauseBtn)
-        clauseBar.addView(shrinkClauseBtn)
-        clauseBar.addView(extendClauseBtn)
-        clauseBar.addView(partialCommitBtn)
-        clauseBar.addView(langSwitchBtn)
+        clauseTopRow.addView(clauseScroll)
+        clauseTopRow.addView(prevClauseBtn)
+        clauseTopRow.addView(nextClauseBtn)
+        clauseTopRow.addView(partialCommitBtn)
+        clauseTopRow.addView(langSwitchBtn)
+
+        boundaryBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            visibility = View.GONE
+            setPadding(0, dp(3), 0, dp(1))
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                dp(34)
+            )
+        }
+        shrinkClauseBtn = makeRailButton("◀ 短").apply {
+            minWidth = dp(52)
+            setPadding(dp(8), dp(3), dp(8), dp(3))
+            setOnClickListener {
+                renderSnapshot(session.resizeFocusedClause(-1, getSurroundingTextBefore()))
+            }
+        }
+        boundaryScroll = HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f).apply {
+                marginStart = dp(2)
+                marginEnd = dp(2)
+            }
+        }
+        boundaryKanaRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        boundaryScroll.addView(boundaryKanaRow)
+        extendClauseBtn = makeRailButton("長 ▶").apply {
+            minWidth = dp(52)
+            setPadding(dp(8), dp(3), dp(8), dp(3))
+            setOnClickListener {
+                renderSnapshot(session.resizeFocusedClause(+1, getSurroundingTextBefore()))
+            }
+        }
+        boundaryBar.addView(shrinkClauseBtn)
+        boundaryBar.addView(boundaryScroll)
+        boundaryBar.addView(extendClauseBtn)
+
+        clauseBar.addView(clauseTopRow)
+        clauseBar.addView(boundaryBar)
 
         // Top Compact-Rail bar (trace + candidate/quick-symbol chips + expand/onehand/settings)
         topBar = LinearLayout(this).apply {
@@ -973,6 +1018,27 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         }
     }
 
+    override fun onMoveCursor2D(dx: Int, dy: Int) {
+        if (dx != 0) {
+            onMoveCursor(dx)
+        }
+        if (dy != 0) {
+            if (!session.isEmpty) {
+                val raw = session.snapshot.rawInput
+                val committed = session.commitAndLearn(getSurroundingTextBefore())
+                if (committed.isNotEmpty()) {
+                    currentInputConnection?.commitText(committed, 1)
+                    if (shouldLogEval()) {
+                        evalLogger.logCommit(settings.activePromptId, raw, committed, "cursor_dpad")
+                    }
+                }
+                renderSnapshot(session.snapshot)
+            }
+            clearUndoCommit()
+            sendDownUpKeyEvents(if (dy < 0) KeyEvent.KEYCODE_DPAD_UP else KeyEvent.KEYCODE_DPAD_DOWN)
+        }
+    }
+
     override fun onToggleLanguage() {
         if (!session.isEmpty) {
             renderSnapshot(session.toggleFocusedSegmentLanguage(getSurroundingTextBefore()))
@@ -1146,27 +1212,112 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
 
             clauseBar.visibility = View.VISIBLE
             val hasClauses = snap.clauses.isNotEmpty()
-            val canPrev = snap.clauses.size > 1 && snap.focusedClauseIndex > 0
-            val canNext = snap.clauses.size > 1 && snap.focusedClauseIndex < snap.clauses.lastIndex
+            val multiClause = snap.clauses.size > 1
+            val canPrev = multiClause && snap.focusedClauseIndex > 0
+            val canNext = multiClause && snap.focusedClauseIndex < snap.clauses.lastIndex
+            prevClauseBtn.visibility = if (multiClause) View.VISIBLE else View.GONE
+            nextClauseBtn.visibility = if (multiClause) View.VISIBLE else View.GONE
             prevClauseBtn.isEnabled = canPrev
             prevClauseBtn.alpha = if (canPrev) 1.0f else 0.32f
             nextClauseBtn.isEnabled = canNext
             nextClauseBtn.alpha = if (canNext) 1.0f else 0.32f
+            partialCommitBtn.isEnabled = hasClauses
+            partialCommitBtn.alpha = if (hasClauses) 1.0f else 0.32f
+
+            val showBoundaryStrip = snap.focusedAdjustableKana.length >= 2 || snap.canShrinkClause || snap.canExtendClause
+            boundaryBar.visibility = if (showBoundaryStrip) View.VISIBLE else View.GONE
             shrinkClauseBtn.isEnabled = snap.canShrinkClause
             shrinkClauseBtn.alpha = if (snap.canShrinkClause) 1.0f else 0.32f
             extendClauseBtn.isEnabled = snap.canExtendClause
             extendClauseBtn.alpha = if (snap.canExtendClause) 1.0f else 0.32f
-            partialCommitBtn.isEnabled = hasClauses
-            partialCommitBtn.alpha = if (hasClauses) 1.0f else 0.32f
             renderClausePills(snap, dark, accent)
+            if (showBoundaryStrip) {
+                renderBoundaryKanaRow(boundaryKanaRow, boundaryScroll, snap, dark, accent)
+            } else {
+                boundaryKanaRow.removeAllViews()
+            }
         } else {
             ic?.finishComposingText()
             traceBadge.visibility = View.GONE
             clauseBar.visibility = View.GONE
+            boundaryBar.visibility = View.GONE
         }
 
         renderCandidateRow(snap, dark, accent)
         syncExpandedPanelState(snap)
+    }
+
+    private fun renderBoundaryKanaRow(
+        container: LinearLayout,
+        scrollHost: HorizontalScrollView,
+        snap: CompositionSnapshot,
+        dark: Boolean,
+        accent: Int
+    ) {
+        container.removeAllViews()
+        val adjustable = snap.focusedAdjustableKana
+        val splitLen = snap.focusedAdjustableLen.coerceIn(0, adjustable.length)
+        if (adjustable.isEmpty()) return
+
+        val border = if (dark) Color.parseColor("#323741") else Color.parseColor("#D5DAE0")
+        val bgInClause = if (dark) Color.parseColor("#2A3B52") else Color.parseColor("#E3EDF8")
+        val bgTail = if (dark) Color.parseColor("#23272D") else Color.parseColor("#FFFFFF")
+        val textIn = if (dark) Color.parseColor("#F5F7FA") else Color.parseColor("#18202A")
+        val textTail = if (dark) Color.parseColor("#9BA3AF") else Color.parseColor("#616975")
+
+        var splitView: View? = null
+        fun addSplitMarker() {
+            val marker = View(this).apply {
+                setBackgroundColor(accent)
+                layoutParams = LinearLayout.LayoutParams(dp(3), dp(22)).apply {
+                    marginStart = dp(2)
+                    marginEnd = dp(3)
+                }
+            }
+            splitView = marker
+            container.addView(marker)
+        }
+
+        for (i in adjustable.indices) {
+            if (i == splitLen) addSplitMarker()
+            val included = i < splitLen
+            val ch = adjustable[i]
+            val targetLen = i + 1
+            val pill = TextView(this).apply {
+                text = ch.toString()
+                gravity = Gravity.CENTER
+                maxLines = 1
+                minWidth = dp(26)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
+                setTypeface(null, if (included) Typeface.BOLD else Typeface.NORMAL)
+                setTextColor(if (included) textIn else textTail)
+                setPadding(dp(5), dp(2), dp(5), dp(2))
+                background = GradientDrawable().apply {
+                    setColor(if (included) bgInClause else bgTail)
+                    cornerRadius = dp(4).toFloat()
+                    setStroke(dp(1), if (included) accent else border)
+                }
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    dp(26)
+                ).apply { marginEnd = dp(2) }
+                setOnClickListener {
+                    if (targetLen != splitLen) {
+                        val nextSnap = session.setFocusedClauseLength(targetLen, getSurroundingTextBefore())
+                        renderSnapshot(nextSnap)
+                    }
+                }
+            }
+            container.addView(pill)
+        }
+        if (splitLen >= adjustable.length) addSplitMarker()
+
+        splitView?.let { anchor ->
+            scrollHost.post {
+                val targetX = (anchor.left - scrollHost.width / 2).coerceAtLeast(0)
+                scrollHost.smoothScrollTo(targetX, 0)
+            }
+        }
     }
 
     private fun renderClausePills(snap: CompositionSnapshot, dark: Boolean, accent: Int) {
@@ -1586,6 +1737,49 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             }
             expandedContent.addView(numRowToggle)
             return
+        }
+
+        if (snap.focusedAdjustableKana.length >= 2 || snap.canShrinkClause || snap.canExtendClause) {
+            val dark = isDarkTheme()
+            expandedContent.addView(TextView(this).apply {
+                text = "区切れ位置（文字をタップで直接調整）"
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+                setTextColor(mutedCol)
+                setPadding(0, 0, 0, dp(4))
+            })
+            val bRow = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(0, 0, 0, dp(8))
+            }
+            val bShrink = makePanelButton("◀ 短", cardBg, textCol, border) {
+                renderSnapshot(session.resizeFocusedClause(-1, getSurroundingTextBefore()))
+            }.apply {
+                isEnabled = snap.canShrinkClause
+                alpha = if (snap.canShrinkClause) 1.0f else 0.32f
+                layoutParams = LinearLayout.LayoutParams(dp(54), dp(30)).apply { marginEnd = dp(4) }
+            }
+            val bScroll = HorizontalScrollView(this).apply {
+                isHorizontalScrollBarEnabled = false
+                layoutParams = LinearLayout.LayoutParams(0, dp(30), 1f)
+            }
+            val bKanaRow = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+            }
+            bScroll.addView(bKanaRow)
+            val bExtend = makePanelButton("長 ▶", cardBg, textCol, border) {
+                renderSnapshot(session.resizeFocusedClause(+1, getSurroundingTextBefore()))
+            }.apply {
+                isEnabled = snap.canExtendClause
+                alpha = if (snap.canExtendClause) 1.0f else 0.32f
+                layoutParams = LinearLayout.LayoutParams(dp(54), dp(30)).apply { marginStart = dp(4) }
+            }
+            bRow.addView(bShrink)
+            bRow.addView(bScroll)
+            bRow.addView(bExtend)
+            expandedContent.addView(bRow)
+            renderBoundaryKanaRow(bKanaRow, bScroll, snap, dark, accent)
         }
 
         if (snap.scriptVariants.isNotEmpty()) {
