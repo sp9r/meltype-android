@@ -1121,6 +1121,58 @@ class MainActivity : AppCompatActivity() {
         }
         check("JpNoFalseEngSplit", noFalseSplit, "makenai/homete/tameninaru=JP")
 
+        val djSess = CompositionSession(dicts, engine, converter)
+        djSess.appendText("denjiki")
+        val djPrev = djSess.snapshot.previewText
+        check(
+            "MozcExact(denjiki)",
+            djPrev == "電磁気" && !djPrev.contains("断食"),
+            "prev='$djPrev' cands=${djSess.snapshot.candidates.take(4).map { it.text }}"
+        )
+
+        val sbCands = converter.candidates("しんぶん")
+        check(
+            "NoEmojiOutrank(shimbun)",
+            sbCands.firstOrNull() == "新聞",
+            "first='${sbCands.firstOrNull()}' top=${sbCands.take(4)}"
+        )
+
+        val jpCollisions = listOf("tsukaretanodekaeru", "kokodenohanashi", "mitemiro", "kamen").all { w ->
+            engine.segment(w).all { it.kind == io.github.sp9r.meltype.core.SegmentKind.JAPANESE }
+        }
+        val ytOk = engine.segment("youtubewomiru").any {
+            it.kind == io.github.sp9r.meltype.core.SegmentKind.ENGLISH && it.raw.equals("youtube", ignoreCase = true)
+        }
+        check("LowerProperGuard", jpCollisions && ytOk, "jpCollisions=$jpCollisions yt=$ytOk")
+
+        val qStartSess = CompositionSession(dicts, engine, converter)
+        qStartSess.appendText("qrigatou")
+        val qStartPrev = qStartSess.snapshot.previewText
+        val qVowelSess = CompositionSession(dicts, engine, converter)
+        qVowelSess.appendText("qite")
+        val qVowelCands = qVowelSess.snapshot.candidates.map { it.text }
+        val sujiSess = CompositionSession(dicts, engine, converter)
+        sujiSess.appendChar('s')
+        sujiSess.appendChar('u')
+        sujiSess.appendChar('j', spatialHints = mapOf('k' to 0.72f))
+        sujiSess.appendChar('i')
+        val sujiPrev = sujiSess.snapshot.previewText
+        val sujiCands = sujiSess.snapshot.candidates.map { it.text }
+        check(
+            "QAndJSpatialTypo",
+            (qStartPrev.contains("ありがとう") || qStartPrev.contains("有難") || qStartSess.snapshot.candidates.any { it.text.contains("ありがとう") }) &&
+                (qVowelSess.snapshot.previewText == "相手" || qVowelCands.contains("相手") || qVowelCands.contains("あいて")) &&
+                (sujiPrev == "筋" || sujiPrev == "すじ") && sujiCands.any { it == "好き" || it == "すき" },
+            "qStart='$qStartPrev' qite='${qVowelSess.snapshot.previewText}' suji='$sujiPrev' sujiCands=${sujiCands.take(8)}"
+        )
+
+        val catalog = io.github.sp9r.meltype.core.EmojiCatalog(AssetDictionarySource(applicationContext))
+        check(
+            "EmojiCatalogFull",
+            catalog.allEntries.size >= 1800 && catalog.search("egao").isNotEmpty(),
+            "count=${catalog.allEntries.size} egaoHits=${catalog.search("egao").take(4).map { it.emoji }}"
+        )
+
         val pSess = CompositionSession(dicts, engine, converter)
         pSess.appendText("kyouhagoogledekensaku")
         pSess.focusClause(0)

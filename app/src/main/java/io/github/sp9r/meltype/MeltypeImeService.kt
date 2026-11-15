@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.res.Configuration
 import android.graphics.Color
+import android.graphics.Paint
 import android.graphics.RectF
 import android.graphics.Typeface
 import android.graphics.drawable.ColorDrawable
@@ -23,6 +24,7 @@ import android.view.KeyEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.inputmethod.EditorInfo
+import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -30,13 +32,18 @@ import android.widget.TextView
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
+import androidx.recyclerview.widget.GridLayoutManager
+import androidx.recyclerview.widget.RecyclerView
 import io.github.sp9r.meltype.core.AndroidMozcConverter
 import io.github.sp9r.meltype.core.AssetDictionarySource
 import io.github.sp9r.meltype.core.CandidateItem
 import io.github.sp9r.meltype.core.CandidateKind
 import io.github.sp9r.meltype.core.CompositionSession
 import io.github.sp9r.meltype.core.CompositionSnapshot
+import io.github.sp9r.meltype.core.EmojiCatalog
+import io.github.sp9r.meltype.core.EmojiCategory
 import io.github.sp9r.meltype.core.MeltypeDictionaries
+import io.github.sp9r.meltype.core.RomajiDetector
 import io.github.sp9r.meltype.core.MozcRuntime
 import io.github.sp9r.meltype.core.ScoreEngine
 import io.github.sp9r.meltype.glide.GlideDecoder
@@ -98,23 +105,39 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
 
     private lateinit var dividerView: View
     private lateinit var keyboardView: QwertyKeyboardView
+    private lateinit var emojiCatalog: EmojiCatalog
     private lateinit var expandedPanel: LinearLayout
     private lateinit var expandedHeader: LinearLayout
+    private lateinit var expandedBodyFrame: FrameLayout
     private lateinit var expandedScroll: ScrollView
     private lateinit var expandedContent: LinearLayout
+    private lateinit var expandedRecyclerHost: FrameLayout
     private lateinit var expandedFooter: LinearLayout
 
     private var isExpandedPanelOpen: Boolean = false
     private var expandedTab: ExpandedTab = ExpandedTab.CANDIDATES
     private var selectedEmojiCategory: Int = 0
+    private var isEmojiSearchActive: Boolean = false
+    private val emojiSearchQuery = StringBuilder()
+    private var emojiTabCells: List<LinearLayout> = emptyList()
+    private var emojiRecyclerView: RecyclerView? = null
+    private var emojiAdapter: EmojiGridAdapter? = null
+    private var emojiHeaderPositions: Map<EmojiCategory, Int> = emptyMap()
+    private var emojiCategoriesInAdapter: List<EmojiCategory> = emptyList()
+    private var programmaticEmojiScroll: Boolean = false
+    private val emojiGlyphPaint = Paint().apply { textSize = 24f }
+    private val hasGlyphCache = HashMap<String, Boolean>(2200)
     private var lastUndoRawInput: String? = null
     private var lastUndoCommittedText: String? = null
+    private var lastUndoDeletedText: String? = null
     private var lastDark: Boolean = false
 
     override fun onCreate() {
         super.onCreate()
         settings = MeltypeSettings(this)
-        dictionaries = MeltypeDictionaries(AssetDictionarySource(this))
+        val dictSource = AssetDictionarySource(this)
+        dictionaries = MeltypeDictionaries(dictSource)
+        emojiCatalog = EmojiCatalog(dictSource)
         scoreEngine = ScoreEngine(dictionaries, typoCorrectionEnabled = { settings.typoCorrectionEnabled })
         converter = AndroidMozcConverter(
             dictionaries = dictionaries,
@@ -300,11 +323,17 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         expandedHeader = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
         }
-        expandedScroll = ScrollView(this).apply {
+        expandedBodyFrame = FrameLayout(this).apply {
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 0,
                 1f
+            )
+        }
+        expandedScroll = ScrollView(this).apply {
+            layoutParams = FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
             )
         }
         expandedContent = LinearLayout(this).apply {
@@ -312,18 +341,27 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             setPadding(dp(8), dp(6), dp(8), dp(8))
         }
         expandedScroll.addView(expandedContent)
+        expandedRecyclerHost = FrameLayout(this).apply {
+            visibility = View.GONE
+            layoutParams = FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
+            )
+        }
+        expandedBodyFrame.addView(expandedScroll)
+        expandedBodyFrame.addView(expandedRecyclerHost)
         expandedFooter = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
         }
         expandedPanel.addView(expandedHeader)
-        expandedPanel.addView(expandedScroll)
+        expandedPanel.addView(expandedBodyFrame)
         expandedPanel.addView(expandedFooter)
 
         rootContainer.addView(clauseBar)
         rootContainer.addView(topBar)
         rootContainer.addView(dividerView)
-        rootContainer.addView(keyboardView)
         rootContainer.addView(expandedPanel)
+        rootContainer.addView(keyboardView)
 
         ViewCompat.setOnApplyWindowInsetsListener(rootContainer) { v, insets ->
             val bars = insets.getInsets(
@@ -358,6 +396,8 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         super.onStartInputView(info, restarting)
         isPasswordField = isPasswordInputType(info)
         isExpandedPanelOpen = false
+        isEmojiSearchActive = false
+        emojiSearchQuery.setLength(0)
         expandedTab = ExpandedTab.CANDIDATES
         captureClipboardText()
         applySettingsToViews()
@@ -517,20 +557,33 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         if (rawInput.isNotEmpty() && committedText.isNotEmpty()) {
             lastUndoRawInput = rawInput
             lastUndoCommittedText = committedText
+            lastUndoDeletedText = null
         }
     }
 
     private fun clearUndoCommit() {
         lastUndoRawInput = null
         lastUndoCommittedText = null
+        lastUndoDeletedText = null
     }
 
     private fun performUndoCommit() {
+        val ic = currentInputConnection ?: return
+        val deleted = lastUndoDeletedText
+        if (deleted != null) {
+            clearUndoCommit()
+            ic.commitText(deleted, 1)
+            renderSnapshot(session.snapshot)
+            return
+        }
         val raw = lastUndoRawInput ?: return
         val committed = lastUndoCommittedText ?: return
-        val ic = currentInputConnection ?: return
-        val before = ic.getTextBeforeCursor(committed.length, 0)?.toString()
         clearUndoCommit()
+        if (committed.isEmpty()) {
+            renderSnapshot(session.restoreFromUndo(raw, getSurroundingTextBefore()))
+            return
+        }
+        val before = ic.getTextBeforeCursor(committed.length, 0)?.toString()
         if (before == committed) {
             ic.deleteSurroundingText(committed.length, 0)
             renderSnapshot(session.restoreFromUndo(raw, getSurroundingTextBefore()))
@@ -545,8 +598,14 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
 
     // --- KeyboardActionListener implementation ---
 
-    override fun onCharacter(ch: Char, directCommit: Boolean) {
+    override fun onCharacter(ch: Char, directCommit: Boolean, spatialHints: Map<Char, Float>) {
         glidePreviewSeq.incrementAndGet()
+        if (isExpandedPanelOpen && expandedTab == ExpandedTab.EMOJI && isEmojiSearchActive) {
+            if (ch == ' ') return
+            emojiSearchQuery.append(ch.lowercaseChar())
+            populateExpandedPanel(session.snapshot)
+            return
+        }
         if (isExpandedPanelOpen) {
             isExpandedPanelOpen = false
         }
@@ -579,7 +638,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             return
         }
         clearUndoCommit()
-        val snap = session.appendChar(ch, getSurroundingTextBefore())
+        val snap = session.appendChar(ch, getSurroundingTextBefore(), spatialHints)
         renderSnapshot(snap)
     }
 
@@ -670,6 +729,16 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
 
     override fun onBackspace() {
         glidePreviewSeq.incrementAndGet()
+        if (isExpandedPanelOpen && expandedTab == ExpandedTab.EMOJI && isEmojiSearchActive) {
+            if (emojiSearchQuery.isNotEmpty()) {
+                emojiSearchQuery.deleteCharAt(emojiSearchQuery.length - 1)
+                populateExpandedPanel(session.snapshot)
+            } else {
+                isEmojiSearchActive = false
+                syncExpandedPanelState(session.snapshot)
+            }
+            return
+        }
         if (isExpandedPanelOpen) isExpandedPanelOpen = false
         if (!session.isEmpty) {
             val snap = session.backspace(getSurroundingTextBefore())
@@ -683,9 +752,19 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
 
     override fun onBackspaceClearAll() {
         glidePreviewSeq.incrementAndGet()
-        if (isExpandedPanelOpen) isExpandedPanelOpen = false
+        if (isExpandedPanelOpen) {
+            isExpandedPanelOpen = false
+            isEmojiSearchActive = false
+            emojiSearchQuery.setLength(0)
+        }
         if (!session.isEmpty) {
+            val rawBefore = session.snapshot.rawInput
             val snap = session.clearAll()
+            if (rawBefore.isNotEmpty()) {
+                lastUndoRawInput = rawBefore
+                lastUndoCommittedText = ""
+                lastUndoDeletedText = null
+            }
             renderSnapshot(snap)
             currentInputConnection?.finishComposingText()
         } else {
@@ -694,8 +773,65 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         }
     }
 
+    override fun onBackspaceSwipeWord() {
+        glidePreviewSeq.incrementAndGet()
+        if (isExpandedPanelOpen) {
+            isExpandedPanelOpen = false
+            isEmojiSearchActive = false
+            emojiSearchQuery.setLength(0)
+        }
+        if (!session.isEmpty) {
+            onBackspaceClearAll()
+            return
+        }
+        val ic = currentInputConnection ?: return
+        val before = ic.getTextBeforeCursor(40, 0)?.toString().orEmpty()
+        val delCount = computeSwipeDeleteCount(before)
+        if (delCount > 0) {
+            val removed = before.substring(before.length - delCount)
+            ic.deleteSurroundingText(delCount, 0)
+            lastUndoRawInput = null
+            lastUndoCommittedText = null
+            lastUndoDeletedText = removed
+            renderSnapshot(session.snapshot)
+        } else {
+            clearUndoCommit()
+            sendDownUpKeyEvents(KeyEvent.KEYCODE_DEL)
+        }
+    }
+
+    private fun computeSwipeDeleteCount(before: String): Int {
+        if (before.isEmpty()) return 0
+        var i = before.length
+        while (i > 0 && before[i - 1].isWhitespace()) i--
+        if (i == 0) return before.length
+        val anchor = before[i - 1]
+        when {
+            anchor in 'a'..'z' || anchor in 'A'..'Z' || anchor in '0'..'9' || anchor == '_' -> {
+                while (i > 0 && (before[i - 1] in 'a'..'z' || before[i - 1] in 'A'..'Z' || before[i - 1] in '0'..'9' || before[i - 1] == '_')) i--
+            }
+            anchor in '\u3041'..'\u309F' || anchor in '\u30A0'..'\u30FF' || anchor == 'ー' || anchor in '\u4E00'..'\u9FFF' -> {
+                val maxStop = (i - 12).coerceAtLeast(0)
+                while (i > maxStop && (before[i - 1] in '\u3041'..'\u309F' || before[i - 1] in '\u30A0'..'\u30FF' || before[i - 1] == 'ー' || before[i - 1] in '\u4E00'..'\u9FFF')) i--
+            }
+            else -> i = (i - 1).coerceAtLeast(0)
+        }
+        return before.length - i
+    }
+
     override fun onSpace() {
         glidePreviewSeq.incrementAndGet()
+        if (isExpandedPanelOpen && expandedTab == ExpandedTab.EMOJI && isEmojiSearchActive) {
+            if (emojiSearchQuery.isNotEmpty()) {
+                val topEmoji = emojiCatalog.search(emojiSearchQuery.toString(), limit = 20)
+                    .firstOrNull { canRenderEmoji(it.emoji) }?.emoji
+                if (topEmoji != null) {
+                    settings.addRecentEmoji(topEmoji)
+                    commitDirectExtraText(topEmoji)
+                }
+            }
+            return
+        }
         val snap = session.snapshot
         if (!snap.isComposing) {
             clearUndoCommit()
@@ -729,6 +865,12 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
 
     override fun onEnter() {
         glidePreviewSeq.incrementAndGet()
+        if (isExpandedPanelOpen && expandedTab == ExpandedTab.EMOJI && isEmojiSearchActive) {
+            isEmojiSearchActive = false
+            emojiSearchQuery.setLength(0)
+            syncExpandedPanelState(session.snapshot)
+            return
+        }
         if (isExpandedPanelOpen) isExpandedPanelOpen = false
         if (!session.isEmpty) {
             val raw = session.snapshot.rawInput
@@ -777,9 +919,13 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
     override fun onToggleEmojiPanel() {
         if (isExpandedPanelOpen && expandedTab == ExpandedTab.EMOJI) {
             isExpandedPanelOpen = false
+            isEmojiSearchActive = false
+            emojiSearchQuery.setLength(0)
         } else {
             expandedTab = ExpandedTab.EMOJI
             isExpandedPanelOpen = true
+            isEmojiSearchActive = false
+            emojiSearchQuery.setLength(0)
         }
         syncExpandedPanelState(session.snapshot)
     }
@@ -947,8 +1093,8 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         val subCol = if (dark) Color.parseColor("#9BA1A8") else Color.parseColor("#737A84")
 
         if (!snap.isComposing && snap.candidates.isEmpty()) {
-            // Undo button right after committing a conversion
-            if (lastUndoRawInput != null && lastUndoCommittedText != null) {
+            // Undo button right after committing a conversion or swipe-deleting
+            if ((lastUndoRawInput != null && lastUndoCommittedText != null) || lastUndoDeletedText != null) {
                 val undoBtn = TextView(this).apply {
                     text = "↩ 戻す"
                     gravity = Gravity.CENTER
@@ -1084,14 +1230,17 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
     private fun updateExpandedPanelHeight() {
         if (!::keyboardView.isInitialized || !::expandedPanel.isInitialized) return
         val baseDp = keyboardView.currentBaseHeightDp() * settings.keyboardHeightScale
+        val isEmojiSearchStrip = isExpandedPanelOpen &&
+            expandedTab == ExpandedTab.EMOJI &&
+            isEmojiSearchActive
         val isWidePicker = isExpandedPanelOpen &&
-            (expandedTab == ExpandedTab.EMOJI || expandedTab == ExpandedTab.KAOMOJI)
+            ((expandedTab == ExpandedTab.EMOJI && !isEmojiSearchActive) || expandedTab == ExpandedTab.KAOMOJI)
         val screenHeightDp = resources.displayMetrics.heightPixels / resources.displayMetrics.density
-        val maxSafeDp = (screenHeightDp * 0.50f).roundToInt().coerceAtLeast(320)
-        val targetDp = if (isWidePicker) {
-            maxOf((baseDp + 104f).roundToInt(), 364).coerceAtMost(maxSafeDp)
-        } else {
-            baseDp.roundToInt().coerceIn(220, 420)
+        val maxSafeDp = (screenHeightDp * 0.54f).roundToInt().coerceAtLeast(340)
+        val targetDp = when {
+            isEmojiSearchStrip -> 118
+            isWidePicker -> maxOf((baseDp + 132f).roundToInt(), 388).coerceAtMost(maxSafeDp)
+            else -> baseDp.roundToInt().coerceIn(220, 420)
         }
         val targetPx = dp(targetDp)
         val lp = expandedPanel.layoutParams as LinearLayout.LayoutParams
@@ -1104,17 +1253,19 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
     private fun syncExpandedPanelState(snap: CompositionSnapshot) {
         expandPanelBtn.text = if (isExpandedPanelOpen) "▲" else "▼"
         if (!isExpandedPanelOpen) {
+            isEmojiSearchActive = false
             topBar.visibility = View.VISIBLE
             dividerView.visibility = View.VISIBLE
             expandedPanel.visibility = View.GONE
             keyboardView.visibility = View.VISIBLE
             return
         }
-        val hideIdleTopBar = !snap.isComposing &&
-            (expandedTab == ExpandedTab.EMOJI || expandedTab == ExpandedTab.KAOMOJI)
+        val inEmojiSearch = expandedTab == ExpandedTab.EMOJI && isEmojiSearchActive
+        val hideIdleTopBar = inEmojiSearch ||
+            (!snap.isComposing && (expandedTab == ExpandedTab.EMOJI || expandedTab == ExpandedTab.KAOMOJI))
         topBar.visibility = if (hideIdleTopBar) View.GONE else View.VISIBLE
         dividerView.visibility = if (hideIdleTopBar) View.GONE else View.VISIBLE
-        keyboardView.visibility = View.GONE
+        keyboardView.visibility = if (inEmojiSearch) View.VISIBLE else View.GONE
         expandedPanel.visibility = View.VISIBLE
         updateExpandedPanelHeight()
         populateExpandedPanel(snap)
@@ -1160,6 +1311,8 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
                 setPadding(dp(9), dp(5), dp(9), 0)
                 setOnClickListener {
                     expandedTab = tab
+                    isEmojiSearchActive = false
+                    emojiSearchQuery.setLength(0)
                     expandedScroll.scrollTo(0, 0)
                     updateExpandedPanelHeight()
                     syncExpandedPanelState(session.snapshot)
@@ -1206,6 +1359,8 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             }
             setOnClickListener {
                 isExpandedPanelOpen = false
+                isEmojiSearchActive = false
+                emojiSearchQuery.setLength(0)
                 syncExpandedPanelState(session.snapshot)
             }
         }
@@ -1216,15 +1371,21 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(1))
         })
 
+        val showContinuousEmoji = expandedTab == ExpandedTab.EMOJI && !isEmojiSearchActive
+        if (::expandedRecyclerHost.isInitialized) {
+            expandedRecyclerHost.visibility = if (showContinuousEmoji) View.VISIBLE else View.GONE
+            expandedScroll.visibility = if (showContinuousEmoji) View.GONE else View.VISIBLE
+        }
+
         when (expandedTab) {
             ExpandedTab.CANDIDATES -> populateCandidatesTab(snap, accent, cardBg, border, textCol, mutedCol)
-            ExpandedTab.EMOJI -> populateEmojiTab(dark, accent, border, textCol, mutedCol)
+            ExpandedTab.EMOJI -> populateEmojiTab(dark, accent, cardBg, border, textCol, mutedCol)
             ExpandedTab.KAOMOJI -> populateKaomojiTab(dark, border, textCol)
             ExpandedTab.TEMPLATES -> populateTemplatesTab(accent, cardBg, border, textCol, mutedCol)
             ExpandedTab.EDIT -> populateEditTab(accent, cardBg, border, textCol, mutedCol)
         }
 
-        if (expandedTab != ExpandedTab.CANDIDATES) {
+        if (expandedTab != ExpandedTab.CANDIDATES && !isEmojiSearchActive) {
             addPanelFooterActions(dark, barBg, border, textCol, mutedCol, accent)
         }
     }
@@ -1414,103 +1575,386 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         }
     }
 
+    private sealed class EmojiGridItem(val category: EmojiCategory) {
+        class Header(cat: EmojiCategory) : EmojiGridItem(cat)
+        class Glyph(cat: EmojiCategory, val emoji: String) : EmojiGridItem(cat)
+    }
+
+    private fun canRenderEmoji(emoji: String): Boolean {
+        return hasGlyphCache.getOrPut(emoji) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                runCatching { emojiGlyphPaint.hasGlyph(emoji) }.getOrDefault(true)
+            } else {
+                true
+            }
+        }
+    }
+
     private fun populateEmojiTab(
         dark: Boolean,
         accent: Int,
+        cardBg: Int,
         border: Int,
         textCol: Int,
         mutedCol: Int
     ) {
-        // Sticky compact category bar in expandedHeader
-        val catNames = listOf("履歴", "顔", "手", "記号", "動物", "食", "物")
+        if (isEmojiSearchActive) {
+            populateEmojiSearchStrip(dark, accent, cardBg, border, textCol, mutedCol)
+            return
+        }
+
+        val availDp = resources.displayMetrics.widthPixels / resources.displayMetrics.density - 8f
+        val cols = (availDp / 42f).toInt().coerceIn(8, 10)
+
+        val recentEmojis = (settings.getRecentEmojis() + DEFAULT_RECENT_EMOJIS)
+            .distinct()
+            .filter(::canRenderEmoji)
+            .take(cols * 2)
+
+        val gridItems = ArrayList<EmojiGridItem>(2000)
+        val categoriesPresent = ArrayList<EmojiCategory>(10)
+        val headerPositions = LinkedHashMap<EmojiCategory, Int>(10)
+
+        if (recentEmojis.isNotEmpty()) {
+            headerPositions[EmojiCategory.RECENT] = gridItems.size
+            categoriesPresent.add(EmojiCategory.RECENT)
+            gridItems.add(EmojiGridItem.Header(EmojiCategory.RECENT))
+            for (e in recentEmojis) {
+                gridItems.add(EmojiGridItem.Glyph(EmojiCategory.RECENT, e))
+            }
+        }
+        for (cat in EmojiCategory.CATALOG_CATEGORIES) {
+            val emojis = emojiCatalog.entriesByCategory[cat].orEmpty()
+                .map { it.emoji }
+                .filter(::canRenderEmoji)
+            if (emojis.isEmpty()) continue
+            headerPositions[cat] = gridItems.size
+            categoriesPresent.add(cat)
+            gridItems.add(EmojiGridItem.Header(cat))
+            for (e in emojis) {
+                gridItems.add(EmojiGridItem.Glyph(cat, e))
+            }
+        }
+        emojiHeaderPositions = headerPositions
+        emojiCategoriesInAdapter = categoriesPresent
+
+        // Sticky Gboard-style category icon strip + Japanese emoji search button
         val catRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
             )
-            setPadding(dp(4), 0, dp(4), 0)
+            setPadding(dp(2), 0, dp(2), 0)
         }
-        for ((idx, name) in catNames.withIndex()) {
-            val active = selectedEmojiCategory == idx
+        val tabCells = ArrayList<LinearLayout>(categoriesPresent.size)
+        val curCat = categoriesPresent.getOrNull(selectedEmojiCategory) ?: categoriesPresent.firstOrNull()
+        for ((idx, cat) in categoriesPresent.withIndex()) {
+            val active = cat == curCat
             val catCell = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
                 gravity = Gravity.CENTER_HORIZONTAL
                 layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
                 setOnClickListener {
                     selectedEmojiCategory = idx
-                    expandedScroll.scrollTo(0, 0)
-                    populateExpandedPanel(session.snapshot)
+                    updateEmojiTabHighlight(idx, accent, textCol, mutedCol)
+                    val targetPos = emojiHeaderPositions[cat] ?: 0
+                    val rv = emojiRecyclerView
+                    val lm = rv?.layoutManager as? GridLayoutManager
+                    if (lm != null) {
+                        programmaticEmojiScroll = true
+                        lm.scrollToPositionWithOffset(targetPos, 0)
+                        rv.post { programmaticEmojiScroll = false }
+                    }
                 }
             }
             catCell.addView(TextView(this).apply {
-                text = name
+                text = cat.tabIcon
                 gravity = Gravity.CENTER
                 maxLines = 1
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
-                setTypeface(null, if (active) Typeface.BOLD else Typeface.NORMAL)
-                setTextColor(if (active) textCol else mutedCol)
+                includeFontPadding = false
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 14.5f)
+                alpha = if (active) 1f else 0.58f
                 setPadding(0, dp(6), 0, dp(5))
             })
             catCell.addView(View(this).apply {
                 setBackgroundColor(if (active) accent else Color.TRANSPARENT)
                 layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(2))
             })
+            tabCells.add(catCell)
             catRow.addView(catCell)
         }
+        emojiTabCells = tabCells
+
+        val searchBtn = TextView(this).apply {
+            text = "🔍"
+            gravity = Gravity.CENTER
+            includeFontPadding = false
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14.5f)
+            setTextColor(accent)
+            background = borderlessPressedBg(dark)
+            layoutParams = LinearLayout.LayoutParams(dp(34), dp(30))
+            setOnClickListener {
+                isEmojiSearchActive = true
+                emojiSearchQuery.setLength(0)
+                syncExpandedPanelState(session.snapshot)
+            }
+        }
+        catRow.addView(searchBtn)
         expandedHeader.addView(catRow)
         expandedHeader.addView(View(this).apply {
             setBackgroundColor(border)
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(1))
         })
 
-        val emojis = when (selectedEmojiCategory) {
-            0 -> (settings.getRecentEmojis() + DEFAULT_RECENT_EMOJIS).distinct().take(27)
-            1 -> EMOJI_CAT_FACES
-            2 -> EMOJI_CAT_HANDS
-            3 -> EMOJI_CAT_HEARTS_SYMBOLS
-            4 -> EMOJI_CAT_NATURE
-            5 -> EMOJI_CAT_FOOD
-            else -> EMOJI_CAT_OBJECTS
-        }
-
-        // Dense, borderless flat glyph cells without chunky card borders
-        val availDp = resources.displayMetrics.widthPixels / resources.displayMetrics.density - 8f
-        val cols = (availDp / 45f).toInt().coerceIn(8, 10)
-        val rowHeightPx = dp(38)
-        var r = 0
-        while (r < emojis.size) {
-            val rowLayout = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                layoutParams = LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.WRAP_CONTENT
-                )
-            }
-            for (c in 0 until cols) {
-                val emoji = emojis.getOrNull(r + c)
-                if (emoji == null) {
-                    rowLayout.addView(View(this).apply {
-                        layoutParams = LinearLayout.LayoutParams(0, rowHeightPx, 1f)
-                    })
-                } else {
-                    val btn = TextView(this).apply {
-                        text = emoji
-                        gravity = Gravity.CENTER
-                        includeFontPadding = false
-                        setTextSize(TypedValue.COMPLEX_UNIT_SP, 22f)
-                        background = borderlessPressedBg(dark)
-                        layoutParams = LinearLayout.LayoutParams(0, rowHeightPx, 1f)
-                        setOnClickListener {
-                            settings.addRecentEmoji(emoji)
-                            commitDirectExtraText(emoji)
-                        }
+        val existingRv = emojiRecyclerView
+        if (existingRv == null || existingRv.parent !== expandedRecyclerHost) {
+            expandedRecyclerHost.removeAllViews()
+            val glm = GridLayoutManager(this, cols).apply {
+                spanSizeLookup = object : GridLayoutManager.SpanSizeLookup() {
+                    override fun getSpanSize(position: Int): Int {
+                        val item = emojiAdapter?.currentItems?.getOrNull(position)
+                        return if (item is EmojiGridItem.Header) spanCount else 1
                     }
-                    rowLayout.addView(btn)
                 }
             }
-            expandedContent.addView(rowLayout)
-            r += cols
+            val adapter = EmojiGridAdapter(dark, mutedCol) { emoji ->
+                settings.addRecentEmoji(emoji)
+                commitDirectExtraText(emoji)
+            }
+            adapter.submit(gridItems, dark, mutedCol)
+            val rv = RecyclerView(this).apply {
+                layoutManager = glm
+                this.adapter = adapter
+                clipToPadding = false
+                setPadding(dp(4), dp(2), dp(4), dp(4))
+                setItemViewCacheSize(24)
+                layoutParams = FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT
+                )
+                addOnScrollListener(object : RecyclerView.OnScrollListener() {
+                    override fun onScrolled(recyclerView: RecyclerView, dx: Int, dy: Int) {
+                        if (programmaticEmojiScroll || dy == 0) return
+                        val layoutMgr = recyclerView.layoutManager as? GridLayoutManager ?: return
+                        val firstVis = layoutMgr.findFirstVisibleItemPosition()
+                        if (firstVis == RecyclerView.NO_POSITION) return
+                        val visCat = emojiAdapter?.currentItems?.getOrNull(firstVis)?.category ?: return
+                        val catIdx = emojiCategoriesInAdapter.indexOf(visCat)
+                        if (catIdx >= 0 && catIdx != selectedEmojiCategory) {
+                            selectedEmojiCategory = catIdx
+                            updateEmojiTabHighlight(catIdx, accent, textCol, mutedCol)
+                        }
+                    }
+
+                    override fun onScrollStateChanged(recyclerView: RecyclerView, newState: Int) {
+                        if (newState == RecyclerView.SCROLL_STATE_IDLE) {
+                            programmaticEmojiScroll = false
+                        }
+                    }
+                })
+            }
+            emojiAdapter = adapter
+            emojiRecyclerView = rv
+            expandedRecyclerHost.addView(rv)
+        } else {
+            val glm = existingRv.layoutManager as? GridLayoutManager
+            if (glm != null && glm.spanCount != cols) {
+                glm.spanCount = cols
+            }
+            emojiAdapter?.submit(gridItems, dark, mutedCol)
+        }
+    }
+
+    private fun updateEmojiTabHighlight(activeIdx: Int, accent: Int, textCol: Int, mutedCol: Int) {
+        for ((idx, cell) in emojiTabCells.withIndex()) {
+            val active = idx == activeIdx
+            val labelView = cell.getChildAt(0) as? TextView
+            val lineView = cell.getChildAt(1)
+            labelView?.alpha = if (active) 1f else 0.58f
+            labelView?.setTextColor(if (active) textCol else mutedCol)
+            lineView?.setBackgroundColor(if (active) accent else Color.TRANSPARENT)
+        }
+    }
+
+    private fun populateEmojiSearchStrip(
+        dark: Boolean,
+        accent: Int,
+        cardBg: Int,
+        border: Int,
+        textCol: Int,
+        mutedCol: Int
+    ) {
+        val rawQ = emojiSearchQuery.toString()
+        val hiraPreview = if (rawQ.isEmpty()) {
+            ""
+        } else {
+            RomajiDetector.analyze(rawQ, strictForDetection = false).finalizedHiragana()
+        }
+
+        val searchBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(8), dp(4), dp(8), dp(4))
+        }
+        val queryBox = TextView(this).apply {
+            text = when {
+                rawQ.isEmpty() -> "🔍 下のキーボードで絵文字を検索 (例: egao, neko, ai)"
+                hiraPreview.isNotEmpty() && hiraPreview != rawQ -> "🔍 $rawQ ($hiraPreview)"
+                else -> "🔍 $rawQ"
+            }
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
+            setTextColor(if (rawQ.isEmpty()) mutedCol else textCol)
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+            setPadding(dp(8), dp(5), dp(8), dp(5))
+            background = GradientDrawable().apply {
+                setColor(cardBg)
+                cornerRadius = dp(6).toFloat()
+                setStroke(dp(1), accent)
+            }
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        searchBar.addView(queryBox)
+
+        if (rawQ.isNotEmpty()) {
+            val clearBtn = makePanelButton("クリア", cardBg, textCol, border) {
+                emojiSearchQuery.setLength(0)
+                populateExpandedPanel(session.snapshot)
+            }.apply {
+                layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(30)).apply {
+                    marginStart = dp(4)
+                }
+            }
+            searchBar.addView(clearBtn)
+        }
+        val backBtn = makePanelButton("一覧", cardBg, accent, accent) {
+            isEmojiSearchActive = false
+            emojiSearchQuery.setLength(0)
+            syncExpandedPanelState(session.snapshot)
+        }.apply {
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(30)).apply {
+                marginStart = dp(4)
+            }
+        }
+        searchBar.addView(backBtn)
+        expandedHeader.addView(searchBar)
+
+        val matches = if (rawQ.isEmpty()) {
+            (settings.getRecentEmojis() + DEFAULT_RECENT_EMOJIS)
+                .distinct()
+                .filter(::canRenderEmoji)
+                .take(24)
+        } else {
+            emojiCatalog.search(rawQ, limit = 60)
+                .map { it.emoji }
+                .filter(::canRenderEmoji)
+                .distinct()
+                .take(28)
+        }
+
+        if (matches.isEmpty()) {
+            expandedContent.addView(TextView(this).apply {
+                text = "一致する絵文字が見つかりません"
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                setTextColor(mutedCol)
+                setPadding(dp(8), dp(12), dp(8), dp(8))
+            })
+            return
+        }
+
+        val hScroll = HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        }
+        val strip = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(2), dp(2), dp(2), dp(2))
+        }
+        for (emoji in matches) {
+            val cell = TextView(this).apply {
+                text = emoji
+                gravity = Gravity.CENTER
+                includeFontPadding = false
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 23f)
+                background = borderlessPressedBg(dark)
+                layoutParams = LinearLayout.LayoutParams(dp(42), dp(42))
+                setOnClickListener {
+                    settings.addRecentEmoji(emoji)
+                    commitDirectExtraText(emoji)
+                }
+            }
+            strip.addView(cell)
+        }
+        hScroll.addView(strip)
+        expandedContent.addView(hScroll)
+    }
+
+    private inner class EmojiGridAdapter(
+        private var dark: Boolean,
+        private var headerTextColor: Int,
+        private val onEmojiTap: (String) -> Unit
+    ) : RecyclerView.Adapter<RecyclerView.ViewHolder>() {
+
+        var currentItems: List<EmojiGridItem> = emptyList()
+            private set
+
+        fun submit(items: List<EmojiGridItem>, isDark: Boolean, mutedColor: Int) {
+            currentItems = items
+            dark = isDark
+            headerTextColor = mutedColor
+            notifyDataSetChanged()
+        }
+
+        override fun getItemCount(): Int = currentItems.size
+
+        override fun getItemViewType(position: Int): Int =
+            if (currentItems[position] is EmojiGridItem.Header) 0 else 1
+
+        override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): RecyclerView.ViewHolder {
+            return if (viewType == 0) {
+                val tv = TextView(parent.context).apply {
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+                    setTypeface(null, Typeface.BOLD)
+                    setPadding(dp(6), dp(8), dp(6), dp(3))
+                    layoutParams = RecyclerView.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT
+                    )
+                }
+                object : RecyclerView.ViewHolder(tv) {}
+            } else {
+                val tv = TextView(parent.context).apply {
+                    gravity = Gravity.CENTER
+                    includeFontPadding = false
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 22.5f)
+                    layoutParams = RecyclerView.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        dp(40)
+                    )
+                }
+                object : RecyclerView.ViewHolder(tv) {}
+            }
+        }
+
+        override fun onBindViewHolder(holder: RecyclerView.ViewHolder, position: Int) {
+            val tv = holder.itemView as TextView
+            when (val item = currentItems[position]) {
+                is EmojiGridItem.Header -> {
+                    tv.text = item.category.labelJa
+                    tv.setTextColor(headerTextColor)
+                }
+                is EmojiGridItem.Glyph -> {
+                    tv.text = item.emoji
+                    tv.background = borderlessPressedBg(dark)
+                    tv.setOnClickListener { onEmojiTap(item.emoji) }
+                }
+            }
         }
     }
 
@@ -1917,61 +2361,6 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             "😀", "😂", "🤣", "😊", "🙏", "🙇", "👍", "✨", "🔥",
             "❤️", "🎉", "😭", "😅", "🤔", "👀", "✅", "☀️", "🌸",
             "👌", "🙌", "💻", "🫡", "🥹", "🫶", "💪", "🚀", "☕"
-        )
-
-        private val EMOJI_CAT_FACES = listOf(
-            "😀", "😃", "😄", "😁", "😆", "😅", "😂", "🤣", "🥹",
-            "😊", "😇", "🙂", "🙃", "😉", "😌", "😍", "🥰", "😘",
-            "😗", "😋", "😛", "😜", "🤪", "😝", "🫠", "🤔", "🫡",
-            "🤭", "🤫", "😐", "😑", "😶", "😏", "😒", "🙄", "😬",
-            "😔", "😪", "😴", "😷", "🤒", "😵", "🤯", "🥳", "😎",
-            "🤓", "🧐", "😕", "😟", "🙁", "😮", "😯", "😲", "😳",
-            "🥺", "😢", "😭", "😱", "😖", "😣", "😞", "😓", "😡"
-        )
-
-        private val EMOJI_CAT_HANDS = listOf(
-            "👍", "👎", "👌", "🫶", "✌️", "🤞", "🤟", "🤘", "🤙",
-            "👈", "👉", "👆", "👇", "☝️", "✋", "🤚", "👋", "👏",
-            "🙌", "👐", "🤲", "🙏", "🤝", "💪", "✍️", "🙇", "🙋",
-            "💁", "🙆", "🙅", "🤷", "🤦", "👀", "💬", "💭", "💯",
-            "🔥", "💥", "💫", "💦", "💤", "🎉", "🎊", "🫡", "🫰",
-            "👊", "✊", "🖐️", "🫂", "🧠", "🫀", "🫶🏻", "👍🏻", "🙏🏻"
-        )
-
-        private val EMOJI_CAT_HEARTS_SYMBOLS = listOf(
-            "❤️", "🧡", "💛", "💚", "💙", "💜", "🖤", "🤍", "🩷",
-            "💔", "❤️‍🔥", "💕", "💞", "💓", "💗", "💖", "💘", "💝",
-            "⭐", "🌟", "✨", "⚡", "⭕", "❌", "❗", "❓", "‼️",
-            "⁉️", "✅", "❎", "✔️", "⚠️", "⛔", "🚫", "ℹ️", "🔔",
-            "🎵", "🎶", "📌", "📍", "🔗", "🔍", "🔒", "🔓", "⚙️",
-            "💡", "➡️", "⬅️", "⬆️", "⬇️", "🔄", "♻️", "🏁", "🆘"
-        )
-
-        private val EMOJI_CAT_NATURE = listOf(
-            "🐶", "🐱", "🐭", "🐹", "🐰", "🦊", "🐻", "🐼", "🐨",
-            "🐯", "🦁", "🐸", "🐵", "🐧", "🐦", "🐥", "🦉", "🐝",
-            "🦋", "🐢", "🐳", "🐬", "🐟", "🐙", "🦈", "🐊", "🦕",
-            "🌸", "🌹", "🌺", "🌻", "🌷", "🌱", "🌲", "🌳", "🍀",
-            "🍁", "🍂", "🌿", "🌾", "☀️", "🌤️", "⛅", "☁️", "🌧️",
-            "⛈️", "❄️", "🌈", "🌙", "⭐", "🌊", "🌋", "🏔️", "🌍"
-        )
-
-        private val EMOJI_CAT_FOOD = listOf(
-            "🍚", "🍙", "🍣", "🍤", "🍜", "🍝", "🍞", "🥐", "🥖",
-            "🍔", "🍟", "🍕", "🌭", "🥪", "🌮", "🥟", "🍲", "🍛",
-            "🍱", "🍢", "🍡", "🍳", "🥚", "🥩", "🍗", "🥗", "🍰",
-            "🎂", "🍫", "🍬", "🍮", "🍩", "🍪", "🍦", "🧁", "☕",
-            "🍵", "🧋", "🧃", "🥤", "🍺", "🍻", "🍷", "🍶", "🍎",
-            "🍊", "🍋", "🍌", "🍓", "🍇", "🍉", "🍑", "🍒", "🥝"
-        )
-
-        private val EMOJI_CAT_OBJECTS = listOf(
-            "📱", "💻", "⌨️", "🖥️", "🖱️", "📷", "🎧", "🎤", "⌚",
-            "🔋", "🔌", "💾", "💿", "📖", "📚", "📝", "✏️", "📅",
-            "📆", "⏰", "⌛", "📦", "✉️", "📩", "🔑", "🔧", "🔨",
-            "🏠", "🏢", "🏫", "🏥", "🏪", "🚉", "🚆", "🚌", "🚗",
-            "🚲", "✈️", "🚀", "🛸", "⚽", "🏀", "🎮", "🎸", "🎨",
-            "🎁", "🎈", "🏆", "🥇", "💰", "💳", "🧾", "🛒", "🧳"
         )
 
         private val COMMON_KAOMOJI = listOf(

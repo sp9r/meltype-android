@@ -306,9 +306,9 @@ and Australian word list.  It is under the following copyright:
   SUCH DAMAGE.
 ```
 
-### 絵文字の辞書 (dictionaries/emoji-cldr.txt)
+### 絵文字の辞書・カタログ (dictionaries/emoji-cldr.txt, dictionaries/emoji-catalog.txt)
 
-Unicode CLDR の絵文字の日本語の名前・キーワード (common/annotations/ja.xml, common/annotationsDerived/ja.xml) から、読みを付けて作りました。Unicode License v3 (SPDX: Unicode-3.0) です。
+`dictionaries/emoji-cldr.txt` は Unicode CLDR の絵文字の日本語の名前・キーワード (`common/annotations/ja.xml`, `common/annotationsDerived/ja.xml`) から読みを付けて作りました。`dictionaries/emoji-catalog.txt` は Unicode UTS #51 の公式 `emoji-test.txt` (`fully-qualified` エントリ) からカテゴリと英語名を取り出して作りました。どちらも Unicode License v3 (SPDX: Unicode-3.0) です。
 
 ```
 UNICODE LICENSE V3

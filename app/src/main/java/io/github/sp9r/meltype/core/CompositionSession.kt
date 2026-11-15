@@ -52,6 +52,7 @@ class CompositionSession(
     private val typoCorrectionEnabled: () -> Boolean = { true }
 ) {
     private val buffer = StringBuilder()
+    private val bufferSpatialHints = ArrayList<Map<Char, Float>>()
     private val overrides = LinkedHashMap<IntRange, SegmentKind>()
     private val selectedClauseTextByKey = LinkedHashMap<String, String>()
     private val customClauseSplits = LinkedHashMap<Int, MutableList<Int>>()
@@ -76,15 +77,21 @@ class CompositionSession(
 
     val isEmpty: Boolean get() = buffer.isEmpty()
 
-    fun appendChar(ch: Char, surroundingContext: String? = null): CompositionSnapshot {
+    fun appendChar(
+        ch: Char,
+        surroundingContext: String? = null,
+        spatialHints: Map<Char, Float> = emptyMap()
+    ): CompositionSnapshot {
         clearLastGlideHint()
         buffer.append(ch)
+        bufferSpatialHints.add(spatialHints)
         return recompute(surroundingContext)
     }
 
     fun appendText(text: String, surroundingContext: String? = null): CompositionSnapshot {
         clearLastGlideHint()
         buffer.append(text)
+        repeat(text.length) { bufferSpatialHints.add(emptyMap()) }
         return recompute(surroundingContext)
     }
 
@@ -103,11 +110,13 @@ class CompositionSession(
             val lastSeg = cachedSnapshot.clauses.lastOrNull()
             if (lastSeg != null && lastSeg.isEnglish && isPrimaryEnglish) {
                 buffer.append(' ')
+                bufferSpatialHints.add(emptyMap())
                 addedSpace = true
             }
         }
         val start = buffer.length
         buffer.append(primaryWord)
+        repeat(primaryWord.length) { bufferSpatialHints.add(emptyMap()) }
         val end = buffer.length - 1
         lastGlideRange = if (primaryWord.isNotEmpty()) start..end else null
         lastGlideLeadingSpace = addedSpace
@@ -128,6 +137,12 @@ class CompositionSession(
         overrides.remove(range)
         customClauseSplits.clear()
         buffer.replace(range.first, range.last + 1, word)
+        while (bufferSpatialHints.size > buffer.length) {
+            bufferSpatialHints.removeAt(bufferSpatialHints.lastIndex)
+        }
+        while (bufferSpatialHints.size < buffer.length) {
+            bufferSpatialHints.add(emptyMap())
+        }
         val newRange = range.first until (range.first + word.length)
         lastGlideRange = if (word.isNotEmpty()) newRange else null
         if (newRange.first <= newRange.last) {
@@ -151,6 +166,9 @@ class CompositionSession(
             }
             overrides.keys.filter { it.last >= delStart }.toList().forEach { overrides.remove(it) }
             buffer.delete(delStart, buffer.length)
+            while (bufferSpatialHints.size > buffer.length) {
+                bufferSpatialHints.removeAt(bufferSpatialHints.lastIndex)
+            }
             clearLastGlideHint()
             return recompute(surroundingContext)
         }
@@ -160,11 +178,15 @@ class CompositionSession(
         val toRemove = overrides.keys.filter { removeAt in it }
         toRemove.forEach { overrides.remove(it) }
         buffer.deleteCharAt(removeAt)
+        if (removeAt < bufferSpatialHints.size) {
+            bufferSpatialHints.removeAt(removeAt)
+        }
         return recompute(surroundingContext)
     }
 
     fun clearAll(): CompositionSnapshot {
         buffer.setLength(0)
+        bufferSpatialHints.clear()
         overrides.clear()
         selectedClauseTextByKey.clear()
         customClauseSplits.clear()
@@ -175,6 +197,7 @@ class CompositionSession(
 
     fun restoreFromUndo(rawInput: String, surroundingContext: String? = null): CompositionSnapshot {
         buffer.setLength(0)
+        bufferSpatialHints.clear()
         overrides.clear()
         selectedClauseTextByKey.clear()
         customClauseSplits.clear()
@@ -182,6 +205,7 @@ class CompositionSession(
         focusedClauseIdx = 0
         if (rawInput.isNotEmpty()) {
             buffer.append(rawInput)
+            repeat(rawInput.length) { bufferSpatialHints.add(emptyMap()) }
         }
         return recompute(surroundingContext)
     }
@@ -386,8 +410,18 @@ class CompositionSession(
             }
         }
 
+        val tailSpatial = if (targetSeg.endIndex < bufferSpatialHints.size) {
+            bufferSpatialHints.subList(targetSeg.endIndex, bufferSpatialHints.size).toList()
+        } else {
+            emptyList()
+        }
         buffer.setLength(0)
         buffer.append(newRaw)
+        bufferSpatialHints.clear()
+        repeat(remInSameSeg.length) { bufferSpatialHints.add(emptyMap()) }
+        bufferSpatialHints.addAll(tailSpatial)
+        while (bufferSpatialHints.size < buffer.length) bufferSpatialHints.add(emptyMap())
+        while (bufferSpatialHints.size > buffer.length) bufferSpatialHints.removeAt(bufferSpatialHints.lastIndex)
         overrides.clear()
         overrides.putAll(nextOverrides)
         selectedClauseTextByKey.clear()
@@ -480,10 +514,15 @@ class CompositionSession(
                     var rawTypoFallback: String? = null
                     var unreadableFixApplied = false
 
+                    val segSpatial = if (seg.startIndex >= 0 && seg.endIndex <= bufferSpatialHints.size) {
+                        bufferSpatialHints.subList(seg.startIndex, seg.endIndex)
+                    } else {
+                        emptyList()
+                    }
                     if (useTypoFix && seg.raw.all { it in 'a'..'z' || it in 'A'..'Z' }) {
                         val hasUnreadable = typoEngine.firstUnreadableOffset(rawLower, final = false) >= 0
                         if (hasUnreadable) {
-                            val fix = typoEngine.fixUnreadable(rawLower, final = false)
+                            val fix = typoEngine.fixUnreadable(rawLower, final = false, spatialWeights = segSpatial)
                             if (fix != null) {
                                 effectiveRaw = fix.right
                                 rawTypoFallback = RomajiDetector.analyze(rawLower, strictForDetection = false).finalizedHiragana()
@@ -506,7 +545,8 @@ class CompositionSession(
                         val readableFixes = typoEngine.suggestReadableTypos(
                             rawLower,
                             convertibleHira,
-                            allowFinalTailTrim = (segIdx < segments.lastIndex)
+                            allowFinalTailTrim = (segIdx < segments.lastIndex),
+                            spatialWeights = segSpatial
                         )
                         if (readableFixes.isNotEmpty()) {
                             val top = readableFixes.first()
@@ -517,16 +557,32 @@ class CompositionSession(
                                 (top.right.length == rawLower.length &&
                                     readableFixes[1].right.length != rawLower.length &&
                                     readableFixes[1].cost - top.cost >= 0.12)
+                            val hasRareQCluster = convertibleHira.contains("くぁ") ||
+                                convertibleHira.contains("くぃ") ||
+                                convertibleHira.contains("くぇ") ||
+                                convertibleHira.contains("くぉ")
                             val rawNotCohesive = !typoEngine.isKnownReading(convertibleHira) || rawSegCost >= 1.95
-                            if (top.isSingleWholeWord &&
-                                rawLower.length >= 5 &&
+                            val minLenOk = rawLower.length >= 5 || (hasRareQCluster && rawLower.length >= 4)
+                            val canConsiderRewrite = top.isSingleWholeWord &&
+                                minLenOk &&
                                 marginOk &&
                                 !typoEngine.isKnownWord(convertibleHira) &&
                                 !typoEngine.hasKnownReadingPrefix(convertibleHira) &&
                                 rawNotCohesive
-                            ) {
-                                rawTypoFallback = convertibleHira
-                                activeHira = top.kana
+                            if (canConsiderRewrite) {
+                                // Double-check whether Mozc already converts the raw reading cleanly into Kanji (e.g. 電磁気 for でんじき).
+                                val rawMozc = converter.convertClauses(convertibleHira, segContext)
+                                val rawMozcCohesive = rawMozc != null &&
+                                    rawMozc.isNotEmpty() &&
+                                    rawMozc.size <= 2 &&
+                                    rawMozc.all { cl ->
+                                        cl.reading.length >= 2 &&
+                                            cl.text.any { ch -> ch in '\u4E00'..'\u9FFF' }
+                                    }
+                                if (!rawMozcCohesive) {
+                                    rawTypoFallback = convertibleHira
+                                    activeHira = top.kana
+                                }
                             }
                             for (rf in readableFixes.take(2)) {
                                 converter.convertClauses(rf.kana, surroundingContext)?.joinToString("") { it.text }?.let {
@@ -534,6 +590,14 @@ class CompositionSession(
                                 }
                                 didyouMeanForWholeSeg.add(rf.kana)
                             }
+                        }
+                        // Add high-confidence spatial border suggestions ("もしかして") without overwriting valid words.
+                        val spatialAlts = typoEngine.suggestSpatialAlternatives(rawLower, activeHira, segSpatial)
+                        for (alt in spatialAlts) {
+                            converter.convertClauses(alt.kana, segContext)?.joinToString("") { it.text }?.let {
+                                didyouMeanForWholeSeg.add(it)
+                            }
+                            didyouMeanForWholeSeg.add(alt.kana)
                         }
                     }
 
@@ -594,11 +658,14 @@ class CompositionSession(
                             val rawFbList = if (cIdx == 0 && rawTypoFallback != null) listOf(rawTypoFallback) else emptyList()
 
                             val isLockedPrefixClause = usingCustomSplit && cIdx < (lockedLens?.size ?: 0)
+                            val primaryRaw = rawCands.take(3)
+                            val tailRaw = rawCands.drop(3)
                             val allCands = (
                                 (if (isExactMisspelling) misspellingCands else emptyList()) +
                                     (if (isLockedPrefixClause) listOf(preferredText) else emptyList()) +
+                                    primaryRaw +
                                     utilCands +
-                                    rawCands +
+                                    tailRaw +
                                     misspellingCands +
                                     typoList +
                                     listOf(preferredText, c.text, c.reading, kata, halfKata) +

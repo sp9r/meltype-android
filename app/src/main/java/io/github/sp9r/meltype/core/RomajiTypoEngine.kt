@@ -214,7 +214,11 @@ class RomajiTypoEngine(private val dictionaries: MeltypeDictionaries) {
      * Attempts automatic 1-edit recovery when [letters] has an unreadable consonant cluster or mistyped key.
      * Protected against rewriting valid English words or incomplete live typing prefixes.
      */
-    fun fixUnreadable(letters: String, final: Boolean): RomajiFix? {
+    fun fixUnreadable(
+        letters: String,
+        final: Boolean,
+        spatialWeights: List<Map<Char, Float>> = emptyList()
+    ): RomajiFix? {
         val lower = letters.lowercase()
         if (lower.length < 3 || !lower.all { it in 'a'..'z' }) return null
         if (dictionaries.englishAllWords.contains(lower) || dictionaries.properNounCanonical.containsKey(lower)) {
@@ -222,9 +226,9 @@ class RomajiTypoEngine(private val dictionaries: MeltypeDictionaries) {
         }
 
         val first = firstUnreadableOffset(lower, final)
-        if (first <= 0) return null
+        if (first < 0) return null
 
-        // Wait until >= 2 characters follow an internal unreadable consonant while still typing live.
+        // Wait until >= 2 characters follow an unreadable consonant while still typing live.
         if (!final && lower.length - first - 1 < 2) return null
 
         // Trailing extra neighbor consonant (e.g. "yoroshikuy" where 'y' is next to 'u')
@@ -252,20 +256,22 @@ class RomajiTypoEngine(private val dictionaries: MeltypeDictionaries) {
             }
         }
 
-        val kStart = maxOf(1, first - 2)
+        val kStart = maxOf(0, first - 2)
         val kEnd = minOf(lower.length, first + 2)
         for (k in kStart..kEnd) {
             if (k < lower.length) {
                 val c = lower[k]
                 val near = NEIGHBORS[c]
-                // 1. Neighbor key hit (e.g. arigatpu -> arigatou, watasji -> watashi)
+                // 1. Neighbor key hit (e.g. arigatpu -> arigatou, watasji -> watashi, qrigatou -> arigatou)
                 if (near != null) {
+                    val spatialForIdx = spatialWeights.getOrNull(k)
                     for (n in near) {
-                        consider(lower.substring(0, k) + n + lower.substring(k + 1), k, 0.30)
+                        val sb = (spatialForIdx?.get(n) ?: 0f).coerceIn(0f, 1f)
+                        consider(lower.substring(0, k) + n + lower.substring(k + 1), k, 0.30 - sb * 0.20)
                     }
                 }
                 // 2. Accidental extra neighbor or doubled key press
-                val prev = lower[k - 1]
+                val prev = if (k > 0) lower[k - 1] else '\u0000'
                 val next = if (k + 1 < lower.length) lower[k + 1] else '\u0000'
                 if (c == prev || (near != null && (prev in near || next in near))) {
                     consider(lower.substring(0, k) + lower.substring(k + 1), k, 0.45)
@@ -344,7 +350,12 @@ class RomajiTypoEngine(private val dictionaries: MeltypeDictionaries) {
      * Finds correction candidates even when [letters] is accidentally readable romaji
      * (e.g. "arigayou" -> "arigatou", "arigatoi" -> "arigatou", "watashu" -> "watashi", "ohayoi" -> "ohayou").
      */
-    fun suggestReadableTypos(letters: String, currentHira: String, allowFinalTailTrim: Boolean): List<RomajiFix> {
+    fun suggestReadableTypos(
+        letters: String,
+        currentHira: String,
+        allowFinalTailTrim: Boolean,
+        spatialWeights: List<Map<Char, Float>> = emptyList()
+    ): List<RomajiFix> {
         val lower = letters.lowercase()
         if (lower.length < 4 || !lower.all { it in 'a'..'z' }) return emptyList()
         if (dictionaries.englishAllWords.contains(lower) || dictionaries.properNounCanonical.containsKey(lower)) {
@@ -379,8 +390,10 @@ class RomajiTypoEngine(private val dictionaries: MeltypeDictionaries) {
             val c = lower[i]
             val near = NEIGHBORS[c]
             if (near != null) {
+                val spatialForIdx = spatialWeights.getOrNull(i)
                 for (n in near) {
-                    tryCand(lower.substring(0, i) + n + lower.substring(i + 1), 0.35)
+                    val sb = (spatialForIdx?.get(n) ?: 0f).coerceIn(0f, 1f)
+                    tryCand(lower.substring(0, i) + n + lower.substring(i + 1), 0.35 - sb * 0.25)
                 }
             }
             // Also try deleting an accidentally doubled/neighbor vowel or trailing extra letter
@@ -405,34 +418,54 @@ class RomajiTypoEngine(private val dictionaries: MeltypeDictionaries) {
             if (subT != null) tryCand(subT, 0.55)
         }
 
-        // Fifty-sound row / voiced/semi-voiced kana corrections for whole words
-        for (i in currentHira.indices) {
-            val ch = currentHira[i]
-            val row = KANA_VOWEL_ROWS.firstOrNull { ch in it }
-            if (row != null) {
-                for (alt in row) {
-                    if (alt == ch) continue
-                    val altHira = currentHira.substring(0, i) + alt + currentHira.substring(i + 1)
-                    if (altHira !in seenKana && altHira in words) {
-                        seenKana.add(altHira)
-                        val rom = GlideDecoder.kanaToRomaji(altHira) ?: lower
-                        results.add(RomajiFix(letters, rom, altHira, 1.35, isSingleWholeWord = true))
-                    }
-                }
-            }
-            val toggledVoiced = VOICED_TOGGLE[ch]
-            if (toggledVoiced != null) {
-                val altHira = currentHira.substring(0, i) + toggledVoiced + currentHira.substring(i + 1)
-                if (altHira !in seenKana && altHira in words) {
-                    seenKana.add(altHira)
-                    val rom = GlideDecoder.kanaToRomaji(altHira) ?: lower
-                    results.add(RomajiFix(letters, rom, altHira, 1.10, isSingleWholeWord = true))
-                }
-            }
-        }
-
         results.sortBy { it.cost }
         return results.take(5)
+    }
+
+    /**
+     * Suggests non-destructive alternate readings for taps that landed near an adjacent key edge
+     * (e.g. 'q' near 'a', or 'j' near 'k') without ever overwriting valid words.
+     */
+    fun suggestSpatialAlternatives(
+        letters: String,
+        currentHira: String,
+        spatialWeights: List<Map<Char, Float>>
+    ): List<RomajiFix> {
+        val lower = letters.lowercase()
+        if (lower.length < 3 || spatialWeights.isEmpty() || !lower.all { it in 'a'..'z' }) return emptyList()
+        val results = ArrayList<RomajiFix>()
+        val seenKana = HashSet<String>()
+        seenKana.add(currentHira)
+
+        val limit = min(lower.length, spatialWeights.size)
+        for (i in 0 until limit) {
+            val weights = spatialWeights[i]
+            if (weights.isEmpty()) continue
+            val near = NEIGHBORS[lower[i]] ?: continue
+            for ((n, weight) in weights) {
+                if (weight < 0.40f || n !in near) continue
+                val candLetters = lower.substring(0, i) + n + lower.substring(i + 1)
+                if (firstUnreadableOffset(candLetters, final = true) >= 0) continue
+                val kana = RomajiDetector.analyze(candLetters, strictForDetection = false).finalizedHiragana()
+                if (kana.length < 2 || !RomajiDetector.isHiraganaOnly(kana) || kana in seenKana) continue
+                val inVocab = kana in words
+                if (!inVocab && !isKnownReading(kana)) continue
+                val (segCost, _) = segmentKana(kana, -1)
+                if (!inVocab && segCost > 2.2) continue
+                seenKana.add(kana)
+                results.add(
+                    RomajiFix(
+                        wrong = letters,
+                        right = candLetters,
+                        kana = kana,
+                        cost = segCost - weight.toDouble() - if (inVocab) 0.5 else 0.0,
+                        isSingleWholeWord = inVocab
+                    )
+                )
+            }
+        }
+        results.sortBy { it.cost }
+        return results.take(3)
     }
 
     private fun rawSegmentPenalty(rawText: String): Double {
@@ -467,25 +500,6 @@ class RomajiTypoEngine(private val dictionaries: MeltypeDictionaries) {
             'つ' to "たちてと", 'ぬ' to "なにねの", 'ぶ' to "ばびべぼ", 'む' to "まみめも",
             'る' to "らりれろ"
         )
-
-        private val KANA_VOWEL_ROWS = listOf(
-            "あいうえお", "かきくけこ", "さしすせそ", "たちつてと", "なにぬねの",
-            "はひふへほ", "まみむめも", "やゆよ", "らりるれろ", "わを",
-            "がぎぐげご", "ざじずぜぞ", "だぢづでど", "ばびぶべぼ", "ぱぴぷぺぽ"
-        )
-
-        private val VOICED_TOGGLE: Map<Char, Char> = buildMap {
-            val pairs = listOf(
-                'か' to 'が', 'き' to 'ぎ', 'く' to 'ぐ', 'け' to 'げ', 'こ' to 'ご',
-                'さ' to 'ざ', 'し' to 'じ', 'す' to 'ず', 'せ' to 'ぜ', 'そ' to 'ぞ',
-                'た' to 'だ', 'ち' to 'ぢ', 'つ' to 'づ', 'て' to 'で', 'と' to 'ど',
-                'は' to 'ば', 'ひ' to 'び', 'ふ' to 'ぶ', 'へ' to 'べ', 'ほ' to 'ぼ'
-            )
-            for ((a, b) in pairs) {
-                put(a, b)
-                put(b, a)
-            }
-        }
 
         private val CORE_PARTICLE_TAILS = setOf(
             "は", "が", "を", "に", "で", "と", "も", "へ", "の", "や", "か", "ね", "よ", "な", "わ", "から", "まで", "より", "です", "ます"

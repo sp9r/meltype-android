@@ -169,20 +169,26 @@ class AndroidMozcConverter(
 
     private fun mergeCandidates(reading: String, mozc: List<String>, extras: List<String>): List<String> {
         val out = LinkedHashSet<String>()
-        out.addAll(extras)
+        out.addAll(collectPriorityExtras(reading))
         out.addAll(mozc)
+        out.addAll(extras)
         out.add(reading)
         out.add(RomajiDetector.toKatakana(reading))
+        dictionaries?.emojiCandidates?.get(reading)?.let { out.addAll(it) }
+        return out.toList()
+    }
+
+    private fun collectPriorityExtras(reading: String): List<String> {
+        val out = LinkedHashSet<String>()
+        userDictProvider()[reading]?.let { out.add(it) }
+        dictionaries?.readingToPhrases?.get(reading)?.let { out.add(it) }
         return out.toList()
     }
 
     private fun collectExtraCandidates(reading: String): List<String> {
         val out = LinkedHashSet<String>()
-        userDictProvider()[reading]?.let { out.add(it) }
-        dictionaries?.readingToPhrases?.get(reading)?.let { out.add(it) }
-        dictionaries?.extraCandidates?.get(reading)?.let { out.addAll(it) }
         dictionaries?.kanaToBrandsAndLoanwords?.get(reading)?.let { out.addAll(it) }
-        dictionaries?.emojiCandidates?.get(reading)?.let { out.addAll(it) }
+        dictionaries?.extraCandidates?.get(reading)?.let { out.addAll(it) }
         return out.toList()
     }
 

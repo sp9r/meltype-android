@@ -385,14 +385,31 @@ class ScoreEngine(
             val sliceLower = sliceRaw.lowercase()
             val isFinal = endedByDelimiter || j < segments.size
             val fix = typoEngine.fixUnreadable(sliceLower, final = isFinal)
-            if (fix != null) {
+            val resolvedKana = if (fix != null) {
+                fix.kana
+            } else if (sliceLower.length >= 4 &&
+                sliceLower.all { it in 'a'..'z' } &&
+                segments[i].kind == SegmentKind.ENGLISH &&
+                segments[i].raw.length == 1
+            ) {
+                val sliceHira = RomajiDetector.analyze(sliceLower, strictForDetection = false).finalizedHiragana()
+                val readableFix = typoEngine.suggestReadableTypos(
+                    sliceLower,
+                    sliceHira,
+                    allowFinalTailTrim = isFinal
+                ).firstOrNull { it.isSingleWholeWord }
+                readableFix?.kana
+            } else {
+                null
+            }
+            if (resolvedKana != null) {
                 out.add(
                     ScoredSegment(
                         kind = SegmentKind.JAPANESE,
                         raw = sliceRaw,
                         startIndex = baseOffset + startOff,
                         endIndex = baseOffset + endOff,
-                        hiragana = fix.kana
+                        hiragana = resolvedKana
                     )
                 )
             } else {
@@ -467,9 +484,11 @@ class ScoreEngine(
             }
         }
 
-        // Penalize long random-looking romaji only if it's ALSO a real English word
+        // Penalize long random-looking romaji only if it's ALSO an uncolliding English word
         if (effectiveSub.length >= 2 && dictionaries.englishAllWords.contains(effectiveSub) &&
             !dictionaries.japaneseWords.contains(effectiveSub) &&
+            !dictionaries.readingsSet.contains(finalizedHira) &&
+            finalizedHira !in COMMON_COLLIDING_KANA &&
             effectiveSub !in dictionaries.japaneseOriginEnglishWords
         ) {
             if (dictionaries.properNounCanonical.containsKey(effectiveSub) || dictionaries.englishFocusedWords.contains(effectiveSub)) {
@@ -551,9 +570,20 @@ class ScoreEngine(
         }
 
         var score = len * 1.45
+        val subKana = if (isPureStrictRomaji) analysisStrict.finalizedHiragana() else ""
+        val isCommonJpReading = isPureStrictRomaji && subKana.length >= 2 && (
+            dictionaries.japaneseWords.contains(sub) ||
+                dictionaries.readingsSet.contains(subKana) ||
+                subKana in COMMON_COLLIDING_KANA
+            )
+        val isLowerStrictCollidingProper = isProper && !hasUppercase && isPureStrictRomaji &&
+            (isCommonJpReading || len <= 5)
 
         if (isProper) {
-            score += 9.0
+            if (isLowerStrictCollidingProper && isCommonJpReading) {
+                return -2.5
+            }
+            score += if (isLowerStrictCollidingProper) 1.5 else 9.0
         } else if (isFocused) {
             score += 6.0
         } else if (!isPureStrictRomaji) {
@@ -563,29 +593,31 @@ class ScoreEngine(
             // Valid pure romaji AND in broad English dictionary (e.g. "time", "banana", "radio", "camera", "hero").
             val precededByParticle = prevIdx > 0 && PARTICLES.any { fullRun.substring(0, prevIdx).endsWith(it) }
             val fullAnalysis = RomajiDetector.analyze(fullRun, strictForDetection = true)
-            val fullIsPureJp = fullAnalysis.isStrictValid && fullAnalysis.pendingTail.isEmpty()
+            val fullIsPureJp = isStrictJapaneseRomaji(fullAnalysis)
             if (!isFocused && !isProper && !hasUppercase && ((prevIdx > 0 && !precededByParticle) || (prevIdx == 0 && nextPos < totalLen && fullIsPureJp))) {
                 return -4.0
             }
             score += if (isReadable) 1.5 else 3.2
             if (dictionaries.japaneseWords.contains(sub) ||
-                dictionaries.readingsSet.contains(analysisStrict.finalizedHiragana())
+                dictionaries.readingsSet.contains(subKana)
             ) {
                 score -= 2.8
             }
         }
 
-        // Guard against focused/broad romaji-valid English words ("make", "home", "tame", "same", "hare") chopping
-        // contiguous lowercase Japanese stems ("makenai", "homete", "tameninaru", "samenai", "hareta") without clean boundaries.
-        if (isPureStrictRomaji && analysisStrict.pendingTail.isEmpty() && !isProper && !hasUppercase && (prevIdx > 0 || nextPos < totalLen)) {
+        // Guard against lowercase romaji-valid English words or colliding proper nouns ("make", "home", "node", "deno", "miro", "siri")
+        // chopping contiguous lowercase Japanese stems ("makenai", "tsukaretanodekaeru", "kokodenohanashi", "mitemiro").
+        if (isPureStrictRomaji &&
+            (analysisStrict.pendingTail.isEmpty() || (isProper && analysisStrict.pendingTail == "n")) &&
+            (!isProper || isLowerStrictCollidingProper) &&
+            !hasUppercase &&
+            (prevIdx > 0 || nextPos < totalLen)
+        ) {
             val fullAnalysis = RomajiDetector.analyze(fullRun, strictForDetection = true)
-            val fullIsPureJp = fullAnalysis.isStrictValid && fullAnalysis.pendingTail.isEmpty()
+            val fullIsPureJp = isStrictJapaneseRomaji(fullAnalysis)
             if (fullIsPureJp) {
                 val precededByParticle = prevIdx > 0 && PARTICLES.any { fullRun.substring(0, prevIdx).endsWith(it) }
                 val followedByParticle = nextPos < totalLen && CASE_PARTICLES.any { fullRun.startsWith(it, nextPos) }
-                val subKana = analysisStrict.finalizedHiragana()
-                val isCommonJpReading = subKana.length >= 2 &&
-                    (dictionaries.japaneseWords.contains(sub) || dictionaries.readingsSet.contains(subKana))
                 val missingBoundary = (prevIdx > 0 && !precededByParticle) ||
                     (nextPos < totalLen && !followedByParticle) ||
                     (len <= 4 && isCommonJpReading)
@@ -648,6 +680,11 @@ class ScoreEngine(
     companion object {
         private val PARTICLES = listOf("kara", "made", "ha", "ga", "wo", "ni", "de", "to", "no", "mo", "wa", "he", "ya")
         private val CASE_PARTICLES = listOf("kara", "made", "ha", "ga", "wo", "ni", "de", "mo")
+        private val COMMON_COLLIDING_KANA = setOf("での", "みろ", "ので", "しり", "すいか", "かれん", "まや", "かめん", "かれ", "くれ", "とり", "もり")
+
+        private fun isStrictJapaneseRomaji(analysis: RomajiAnalysis): Boolean {
+            return analysis.isStrictValid && (analysis.pendingTail.isEmpty() || analysis.pendingTail == "n")
+        }
 
         private val SHORT_AMBIGUOUS_STOPWORDS = setOf(
             "a", "an", "as", "at", "be", "by", "do", "go", "ha", "he", "hi", "in", "is", "it",

@@ -20,10 +20,13 @@ import kotlin.math.abs
 import kotlin.math.hypot
 
 interface KeyboardActionListener {
-    fun onCharacter(ch: Char, directCommit: Boolean = false)
+    fun onCharacter(ch: Char, directCommit: Boolean = false, spatialHints: Map<Char, Float> = emptyMap())
     fun onPunctuation(isPeriod: Boolean)
     fun onBackspace()
     fun onBackspaceClearAll()
+    fun onBackspaceSwipeWord() {
+        onBackspaceClearAll()
+    }
     fun onSpace()
     fun onEnter()
     fun onMoveCursor(delta: Int)
@@ -133,6 +136,7 @@ class QwertyKeyboardView @JvmOverloads constructor(
     private var lastShiftTapTime = 0L
     private var lastGlidePreviewTime = 0L
     private var backspaceLongPressed = false
+    private var backspaceSwipeTriggered = false
     private var cursorLongPressed = false
     private var verticalFlickActive = false
     private var subLongPressActive = false
@@ -660,6 +664,7 @@ class QwertyKeyboardView @JvmOverloads constructor(
                 isSpaceSliding = false
                 spaceSlideAccumX = 0f
                 backspaceLongPressed = false
+                backspaceSwipeTriggered = false
                 cursorLongPressed = false
                 verticalFlickActive = false
                 subLongPressActive = false
@@ -723,6 +728,17 @@ class QwertyKeyboardView @JvmOverloads constructor(
                 val totalDist = hypot((x - downX).toDouble(), (y - downY).toDouble()).toFloat()
                 if (totalDist > keyWidthAvg * 0.34f) {
                     handler.removeCallbacks(subLongPressRunnable)
+                }
+
+                if (dk?.kind == KeyKind.BACKSPACE && !backspaceLongPressed) {
+                    val leftSwipe = downX - x
+                    if (leftSwipe > keyWidthAvg * 0.45f) {
+                        handler.removeCallbacks(bsRepeatRunnable)
+                    }
+                    if (!backspaceSwipeTriggered && leftSwipe > keyWidthAvg * 1.15f) {
+                        backspaceSwipeTriggered = true
+                        performHaptic()
+                    }
                 }
 
                 val hover = findKeyAt(x, y)
@@ -804,6 +820,7 @@ class QwertyKeyboardView @JvmOverloads constructor(
                 isSpaceSliding = false
                 spaceSlideAccumX = 0f
                 backspaceLongPressed = false
+                backspaceSwipeTriggered = false
                 cursorLongPressed = false
                 verticalFlickActive = false
                 subLongPressActive = false
@@ -847,6 +864,7 @@ class QwertyKeyboardView @JvmOverloads constructor(
                 isSpaceSliding = false
                 verticalFlickActive = false
                 subLongPressActive = false
+                backspaceSwipeTriggered = false
                 glideTrail.clear()
                 invalidate()
                 return true
@@ -871,8 +889,8 @@ class QwertyKeyboardView @JvmOverloads constructor(
             return
         }
         if (dk?.kind == KeyKind.BACKSPACE) {
-            if (downX - endX > keyWidthAvg * 1.4f && !backspaceLongPressed) {
-                listener?.onBackspaceClearAll()
+            if ((backspaceSwipeTriggered || downX - endX > keyWidthAvg * 1.15f) && !backspaceLongPressed) {
+                listener?.onBackspaceSwipeWord()
             } else if (!backspaceLongPressed) {
                 listener?.onBackspace()
             }
@@ -924,7 +942,12 @@ class QwertyKeyboardView @JvmOverloads constructor(
             KeyKind.CHAR -> {
                 val out = target.outputChar
                 if (out != '\u0000') {
-                    listener?.onCharacter(out, directCommit = (layer == Layer.NUMPAD))
+                    val hints = if (layer == Layer.QWERTY && target === dk) {
+                        computeSpatialHints(target, downX, downY)
+                    } else {
+                        emptyMap()
+                    }
+                    listener?.onCharacter(out, directCommit = (layer == Layer.NUMPAD), spatialHints = hints)
                     if (layer == Layer.QWERTY && shiftState == ShiftState.ONCE) {
                         shiftState = ShiftState.OFF
                         rebuildLayout()
@@ -1029,6 +1052,35 @@ class QwertyKeyboardView @JvmOverloads constructor(
             }
         }
         return if (bestDist <= dp(24f)) best else null
+    }
+
+    private fun computeSpatialHints(target: VisualKey, tapX: Float, tapY: Float): Map<Char, Float> {
+        val base = target.outputChar.lowercaseChar()
+        if (base !in 'a'..'z' || keyWidthAvg <= 1f || keyHeightAvg <= 1f) return emptyMap()
+        val dSelf = hypot(
+            ((tapX - target.rect.centerX()) / keyWidthAvg).toDouble(),
+            ((tapY - target.rect.centerY()) / keyHeightAvg).toDouble()
+        ).toFloat()
+        var out: HashMap<Char, Float>? = null
+        for (other in keys) {
+            if (other === target || other.kind != KeyKind.CHAR) continue
+            val ch = other.outputChar.lowercaseChar()
+            if (ch !in 'a'..'z' || ch == base) continue
+            val dOther = hypot(
+                ((tapX - other.rect.centerX()) / keyWidthAvg).toDouble(),
+                ((tapY - other.rect.centerY()) / keyHeightAvg).toDouble()
+            ).toFloat()
+            val gap = dOther - dSelf
+            if (gap < 0.54f) {
+                val weight = ((0.54f - gap) / 0.54f).coerceIn(0f, 1f)
+                if (weight >= 0.15f) {
+                    val map = out ?: HashMap<Char, Float>(4).also { out = it }
+                    val prev = map[ch] ?: 0f
+                    if (weight > prev) map[ch] = weight
+                }
+            }
+        }
+        return out ?: emptyMap()
     }
 
     private fun performHaptic() {

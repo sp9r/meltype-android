@@ -2,15 +2,19 @@ package io.github.sp9r.meltype
 
 import io.github.sp9r.meltype.core.AndroidMozcConverter
 import io.github.sp9r.meltype.core.CompositionSession
+import io.github.sp9r.meltype.core.EmojiCatalog
+import io.github.sp9r.meltype.core.EmojiCategory
 import io.github.sp9r.meltype.core.FileDictionarySource
 import io.github.sp9r.meltype.core.MeltypeDictionaries
 import io.github.sp9r.meltype.core.RomajiDetector
+import io.github.sp9r.meltype.core.RomajiTypoEngine
 import io.github.sp9r.meltype.core.ScoreEngine
 import io.github.sp9r.meltype.core.SegmentKind
 import io.github.sp9r.meltype.core.UtilityConverter
 import io.github.sp9r.meltype.glide.GlideDecoder
 import io.github.sp9r.meltype.glide.KeyLayoutGeometry
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.BeforeClass
 import org.junit.Test
@@ -405,5 +409,131 @@ class MeltypeEngineTest {
         }
         val avgMs = (totalNs / convGlideTargets.size) / 1_000_000.0
         assertTrue("Expected avg full glide decode <= 35ms on JVM, got ${avgMs}ms", avgMs <= 35.0)
+    }
+
+    @Test
+    fun denjikiNeverMisconvertsToDanjiki() {
+        val converter = AndroidMozcConverter(dictionaries)
+        val typoEngine = RomajiTypoEngine(dictionaries)
+
+        val fixes = typoEngine.suggestReadableTypos("denjiki", "でんじき", allowFinalTailTrim = false)
+        assertFalse("denjiki must never suggest だんじき", fixes.any { it.kana == "だんじき" })
+
+        val session = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "denjiki") session.appendChar(ch)
+        val snap = session.snapshot
+        assertEquals("でんじき", snap.clauses.firstOrNull()?.reading)
+        assertFalse("Preview must not become だんじき: ${snap.previewText}", snap.previewText.contains("だんじき"))
+        assertFalse("Preview must not become 断食: ${snap.previewText}", snap.previewText.contains("断食"))
+    }
+
+    @Test
+    fun lowercaseCollidingProperNounsStayJapanese() {
+        val pureJapaneseInputs = listOf(
+            "tsukaretanodekaeru",
+            "kokodenohanashi",
+            "mitemiro",
+            "kamen",
+            "siri",
+            "karen"
+        )
+        for (input in pureJapaneseInputs) {
+            val segs = scoreEngine.segment(input)
+            assertTrue(
+                "Expected '$input' to segment cleanly as JAPANESE, got $segs",
+                segs.all { it.kind == SegmentKind.JAPANESE }
+            )
+        }
+
+        // Capitalized proper nouns and non-colliding English must still segment as ENGLISH
+        assertTrue(scoreEngine.segment("Node").all { it.kind == SegmentKind.ENGLISH })
+        assertTrue(scoreEngine.segment("Siri").all { it.kind == SegmentKind.ENGLISH })
+        val ytSegs = scoreEngine.segment("youtubewomiru")
+        assertTrue(ytSegs.any { it.kind == SegmentKind.ENGLISH && it.raw.equals("youtube", ignoreCase = true) })
+    }
+
+    @Test
+    fun mobileQwertyQAndJSlipsRecoverWithoutFalsePositives() {
+        val converter = AndroidMozcConverter(dictionaries)
+
+        // 1. Index-0 'q' -> 'a' recovery ("qrigatou" -> "ありがとう")
+        val qStart = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "qrigatou") qStart.appendChar(ch)
+        assertTrue(
+            "Expected qrigatou -> ありがとう, got ${qStart.snapshot.previewText} / ${qStart.snapshot.candidates.map { it.text }}",
+            qStart.snapshot.previewText.contains("ありがとう") ||
+                qStart.snapshot.candidates.any { it.text.contains("ありがとう") || it.text.contains("有り難") }
+        )
+
+        // 2. Readable 'q' + vowel cluster recovery ("qite" -> "あいて", "kqeru" -> "かえる")
+        val qVowel = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "qite") qVowel.appendChar(ch)
+        assertTrue(
+            "Expected qite -> あいて, got ${qVowel.snapshot.previewText} / ${qVowel.snapshot.candidates.map { it.text }}",
+            qVowel.snapshot.clauses.any { it.reading == "あいて" } ||
+                qVowel.snapshot.candidates.any { it.text == "あいて" || it.text == "相手" }
+        )
+
+        // 3. Valid word "suji" must NOT auto-overwrite to "suki" even with near-edge touch,
+        //    yet high spatial weight toward 'k' offers "すき" in candidates!
+        val sujiCenter = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "suji") sujiCenter.appendChar(ch)
+        assertEquals("すじ", sujiCenter.snapshot.clauses.firstOrNull()?.reading)
+
+        val sujiNearK = CompositionSession(dictionaries, scoreEngine, converter)
+        sujiNearK.appendChar('s')
+        sujiNearK.appendChar('u')
+        sujiNearK.appendChar('j', spatialHints = mapOf('k' to 0.72f))
+        sujiNearK.appendChar('i')
+        assertEquals("すじ", sujiNearK.snapshot.clauses.firstOrNull()?.reading)
+        assertTrue(
+            "Expected spatial 'k' suggestion 'すき' in candidates for border tap: ${sujiNearK.snapshot.candidates.map { it.text }}",
+            sujiNearK.snapshot.candidates.any { it.text == "すき" }
+        )
+
+        // 4. Non-word 'j' -> 'k' slip ("jaikei" -> "かいけい")
+        val jaikei = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "jaikei") jaikei.appendChar(ch)
+        assertTrue(
+            "Expected jaikei -> かいけい, got ${jaikei.snapshot.previewText} / ${jaikei.snapshot.candidates.map { it.text }}",
+            jaikei.snapshot.clauses.any { it.reading == "かいけい" } ||
+                jaikei.snapshot.candidates.any { it.text == "かいけい" || it.text == "会計" }
+        )
+    }
+
+    @Test
+    fun primaryCandidatesExcludeEmojiAndDatesAtIndexZero() {
+        val converter = AndroidMozcConverter(dictionaries)
+        val shinbunCands = converter.candidates("しんぶん")
+        assertFalse(
+            "First candidate for しんぶん must not be emoji: $shinbunCands",
+            shinbunCands.firstOrNull() == "📰"
+        )
+
+        val kyouSess = CompositionSession(dictionaries, scoreEngine, converter)
+        kyouSess.appendText("kyou")
+        val firstCand = kyouSess.snapshot.candidates.firstOrNull()?.text.orEmpty()
+        assertFalse(
+            "First candidate for 'kyou' should not be slash/ISO date ahead of 今日: $firstCand",
+            firstCand.contains('/') || firstCand.contains('-')
+        )
+    }
+
+    @Test
+    fun emojiCatalogLoadsFullUnicodeAndSupportsJapaneseSearch() {
+        val dictDir = File("app/src/main/assets/dictionaries").let {
+            if (it.exists()) it else File("src/main/assets/dictionaries")
+        }
+        val catalog = EmojiCatalog(FileDictionarySource(dictDir))
+        assertTrue("Expected >= 1800 base RGI emojis, got ${catalog.allEntries.size}", catalog.allEntries.size >= 1800)
+        for (cat in EmojiCategory.CATALOG_CATEGORIES) {
+            assertTrue("Expected non-empty category ${cat.name}", catalog.entriesByCategory[cat].orEmpty().isNotEmpty())
+        }
+        val smileMatches = catalog.search("えがお").map { it.emoji }
+        assertTrue("Expected smile matches for えがお, got $smileMatches", smileMatches.isNotEmpty())
+        val romajiMatches = catalog.search("egao").map { it.emoji }
+        assertTrue("Expected smile matches for egao, got $romajiMatches", romajiMatches.isNotEmpty())
+        val englishMatches = catalog.search("heart").map { it.emoji }
+        assertTrue("Expected matches for 'heart', got $englishMatches", englishMatches.any { it.contains("❤") || it == "🩷" })
     }
 }
