@@ -1290,20 +1290,10 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             return
         }
         if (!session.isEmpty) {
-            val snap = session.snapshot
-            if (snap.clauses.size > 1) {
-                val atEdgeShrink = delta < 0 && snap.focusedClauseIndex == 0 && snap.canShrinkClause
-                val atEdgeExtend = delta > 0 && snap.focusedClauseIndex == snap.clauses.lastIndex && snap.canExtendClause
-                val nextSnap = if (atEdgeShrink || atEdgeExtend) {
-                    session.resizeFocusedClause(delta)
-                } else {
-                    session.moveFocus(delta)
-                }
-                renderSnapshot(nextSnap)
-            } else {
-                val nextSnap = session.resizeFocusedClause(delta)
-                renderSnapshot(nextSnap)
-            }
+            // While converting, ◀▶ shorten / lengthen the focused clause (English words included).
+            // The focus moves with ‹ › on the clause bar or by tapping a clause.
+            noteFix("resize")
+            renderSnapshot(session.resizeFocusedClause(delta, getSurroundingTextBefore()))
         } else {
             clearUndoCommit()
             val code = if (delta < 0) KeyEvent.KEYCODE_DPAD_LEFT else KeyEvent.KEYCODE_DPAD_RIGHT

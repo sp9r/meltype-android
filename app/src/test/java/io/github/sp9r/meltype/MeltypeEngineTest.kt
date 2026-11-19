@@ -804,4 +804,39 @@ class MeltypeEngineTest {
         assertEquals("hello", en.snapshot.rawInput)
         assertTrue(en.snapshot.clauses.all { it.isEnglish })
     }
+
+    @Test
+    fun englishClausesResizeLetterByLetter() {
+        val converter = AndroidMozcConverter(dictionaries)
+        val s = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "kyouhagoogledekensaku") s.appendChar(ch)
+        val conv = s.startConversion()
+        val enIdx = conv.clauses.indexOfFirst { it.isEnglish }
+        assertTrue("english clause in ${conv.clauses.map { it.raw }}", enIdx >= 0)
+        assertEquals("google", conv.clauses[enIdx].raw)
+        val focused = s.focusClause(enIdx)
+        assertTrue(focused.canShrinkClause)
+        assertTrue(focused.canExtendClause)
+        // Shorter: the released letter joins the Japanese after it.
+        val shrunk = s.resizeFocusedClause(-1)
+        assertEquals("googl", shrunk.clauses[shrunk.focusedClauseIndex].raw)
+        assertTrue(shrunk.clauses[shrunk.focusedClauseIndex].isEnglish)
+        val after = shrunk.clauses.drop(shrunk.focusedClauseIndex + 1).joinToString("") { it.reading }
+        assertTrue(after, after.startsWith("え"))
+        // Longer again.
+        val back = s.resizeFocusedClause(+1)
+        assertEquals("google", back.clauses[back.focusedClauseIndex].raw)
+        assertEquals("kyouhagoogledekensaku", back.rawInput)
+
+        // A Japanese clause right before an English word takes its first kana.
+        val j = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "kyouhagoogledekensaku") j.appendChar(ch)
+        val jc = j.startConversion()
+        val en2 = jc.clauses.indexOfFirst { it.isEnglish }
+        val jf = j.focusClause(en2 - 1)
+        assertTrue(jf.canExtendClause)
+        val ext = j.resizeFocusedClause(+1)
+        assertTrue(ext.clauses[en2 - 1].reading, ext.clauses[en2 - 1].reading.endsWith("ご"))
+        assertEquals("ogle", ext.clauses.first { it.isEnglish }.raw)
+    }
 }

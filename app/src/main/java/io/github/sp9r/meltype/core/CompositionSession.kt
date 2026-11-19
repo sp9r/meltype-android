@@ -506,10 +506,100 @@ class CompositionSession(
     fun resizeFocusedClause(deltaKana: Int, surroundingContext: String? = null): CompositionSnapshot {
         if (deltaKana == 0) return cachedSnapshot
         leaveEditing()
-        return updateFocusedClauseSplit(
+        val focused = cachedSnapshot.clauses.getOrNull(focusedClauseIdx) ?: return cachedSnapshot
+        // A clause read as English is resized letter by letter; the letters it gives up become Japanese.
+        if (focused.isEnglish) return resizeEnglishClause(focused, deltaKana, surroundingContext)
+        val before = cachedSnapshot
+        val resized = updateFocusedClauseSplit(
             targetLenProvider = { currentLen, _ -> currentLen + deltaKana },
             surroundingContext = surroundingContext
         )
+        if (resized === before && deltaKana > 0) {
+            // A Japanese clause right before an English one takes that word's first kana.
+            extendJapaneseIntoEnglish(focused, surroundingContext)?.let { return it }
+        }
+        return resized
+    }
+
+    private fun isWordChar(c: Char) = c.isLetterOrDigit() || c == '\''
+
+    private fun clearOverridesIn(first: Int, last: Int) {
+        overrides.keys.filter { it.first <= last && it.last >= first }.toList().forEach { overrides.remove(it) }
+    }
+
+    /** Forgets clause splits and picked conversions from segment [segIdx] on (their indices may shift). */
+    private fun dropClauseStateFrom(segIdx: Int) {
+        customClauseSplits.keys.filter { it >= segIdx }.toList().forEach { customClauseSplits.remove(it) }
+        selectedClauseTextByKey.keys.filter { (it.substringBefore(':').toIntOrNull() ?: 0) >= segIdx }
+            .toList().forEach { selectedClauseTextByKey.remove(it) }
+    }
+
+    private fun resizeEnglishClause(
+        focused: DisplayClause,
+        delta: Int,
+        surroundingContext: String?
+    ): CompositionSnapshot {
+        val segs = scoreEngine.segment(buffer.toString(), overrides)
+        val seg = segs.getOrNull(focused.segmentIndex) ?: return cachedSnapshot
+        if (seg.kind != SegmentKind.ENGLISH) return cachedSnapshot
+        val start = seg.startIndex
+        val end = seg.endIndex
+        val next = segs.getOrNull(focused.segmentIndex + 1)?.takeIf { it.startIndex == end }
+        if (delta < 0) {
+            if (end - start <= 1) return cachedSnapshot
+            val newEnd = end - 1
+            // The released letter joins the Japanese run after the word, or becomes its own.
+            val jpEnd = if (next != null && next.kind == SegmentKind.JAPANESE) next.endIndex else end
+            clearOverridesIn(start, jpEnd - 1)
+            overrides[start until newEnd] = SegmentKind.ENGLISH
+            overrides[newEnd until jpEnd] = SegmentKind.JAPANESE
+        } else {
+            if (next == null || next.kind == SegmentKind.LITERAL || end >= buffer.length || !isWordChar(buffer[end])) {
+                return cachedSnapshot
+            }
+            val nextEnd = next.endIndex
+            clearOverridesIn(start, nextEnd - 1)
+            overrides[start..end] = SegmentKind.ENGLISH
+            if (end + 1 < nextEnd) overrides[(end + 1) until nextEnd] = next.kind
+        }
+        dropClauseStateFrom(focused.segmentIndex)
+        converting = true
+        clearLastGlideHint()
+        return recompute(surroundingContext, keepFocus = true)
+    }
+
+    /** Raw letters at the head of [raw] that make one whole kana (e.g. "ha", "tte"), or 0. */
+    private fun leadingKanaRawLength(raw: String): Int {
+        for (n in 1..minOf(4, raw.length)) {
+            val a = RomajiDetector.analyze(raw.substring(0, n), strictForDetection = false)
+            if (a.pendingTail.isEmpty() && RomajiDetector.isHiraganaOnly(a.hiragana)) return n
+        }
+        return 0
+    }
+
+    private fun extendJapaneseIntoEnglish(focused: DisplayClause, surroundingContext: String?): CompositionSnapshot? {
+        val clauses = cachedSnapshot.clauses
+        if (focused.isEnglish || !RomajiDetector.isHiraganaOnly(focused.reading)) return null
+        val nextClause = clauses.getOrNull(focusedClauseIdx + 1) ?: return null
+        if (!nextClause.isEnglish || nextClause.segmentIndex != focused.segmentIndex + 1) return null
+        val segs = scoreEngine.segment(buffer.toString(), overrides)
+        val a = segs.getOrNull(focused.segmentIndex) ?: return null
+        val b = segs.getOrNull(focused.segmentIndex + 1) ?: return null
+        if (a.kind != SegmentKind.JAPANESE || b.kind != SegmentKind.ENGLISH || a.endIndex != b.startIndex) return null
+        val take = leadingKanaRawLength(b.raw)
+        if (take == 0) return null
+        val gained = RomajiDetector.analyze(b.raw.substring(0, take), strictForDetection = false).hiragana.length
+        val lens = clauses.filter { it.segmentIndex == focused.segmentIndex }.map { it.reading.length }.toMutableList()
+        if (lens.isEmpty()) return null
+        lens[lens.lastIndex] = lens.last() + gained
+        clearOverridesIn(a.startIndex, b.endIndex - 1)
+        overrides[a.startIndex until (a.endIndex + take)] = SegmentKind.JAPANESE
+        if (a.endIndex + take < b.endIndex) overrides[(a.endIndex + take) until b.endIndex] = SegmentKind.ENGLISH
+        dropClauseStateFrom(focused.segmentIndex)
+        customClauseSplits[focused.segmentIndex] = lens
+        converting = true
+        clearLastGlideHint()
+        return recompute(surroundingContext, keepFocus = true)
     }
 
     /** Directly snaps the focused Japanese clause boundary to [targetKanaLen] characters. */
@@ -1279,7 +1369,15 @@ class CompositionSession(
 
         val scriptVariants = buildScriptVariants(focused, displayClauses.count { it.segmentIndex == focused?.segmentIndex })
         val nextClause = displayClauses.getOrNull(focusedClauseIdx + 1)
-        val canShrink = focused != null && !focused.isEnglish && RomajiDetector.isHiraganaOnly(focused.reading) && focused.reading.length >= 2
+        val focusedSeg = focused?.let { segments.getOrNull(it.segmentIndex) }
+        val segAfterFocused = focused?.let { segments.getOrNull(it.segmentIndex + 1) }
+            ?.takeIf { focusedSeg != null && it.startIndex == focusedSeg.endIndex }
+        val englishFocused = focused != null && focused.isEnglish && focusedSeg?.kind == SegmentKind.ENGLISH
+        val canShrink = if (englishFocused) {
+            focusedSeg!!.endIndex - focusedSeg.startIndex >= 2
+        } else {
+            focused != null && !focused.isEnglish && RomajiDetector.isHiraganaOnly(focused.reading) && focused.reading.length >= 2
+        }
         val canExtendSameOrAdj = if (focused != null && !focused.isEnglish && nextClause != null && !nextClause.isEnglish && RomajiDetector.isHiraganaOnly(nextClause.reading)) {
             if (nextClause.segmentIndex == focused.segmentIndex) {
                 true
@@ -1293,7 +1391,17 @@ class CompositionSession(
         } else {
             false
         }
-        val canExtend = canExtendSameOrAdj
+        val canExtend = if (englishFocused) {
+            segAfterFocused != null && segAfterFocused.kind != SegmentKind.LITERAL &&
+                focusedSeg!!.endIndex < raw.length && isWordChar(raw[focusedSeg.endIndex])
+        } else {
+            canExtendSameOrAdj || (
+                focused != null && !focused.isEnglish && RomajiDetector.isHiraganaOnly(focused.reading) &&
+                    nextClause != null && nextClause.isEnglish && nextClause.segmentIndex == focused.segmentIndex + 1 &&
+                    focusedSeg?.kind == SegmentKind.JAPANESE && segAfterFocused?.kind == SegmentKind.ENGLISH &&
+                    leadingKanaRawLength(segAfterFocused.raw) > 0
+                )
+        }
         val hasGlideUndo = lastGlideRange != null && lastGlideRange!!.last == raw.length - 1
         val adjustableBuf = StringBuilder()
         var focusedAdjLen = 0
