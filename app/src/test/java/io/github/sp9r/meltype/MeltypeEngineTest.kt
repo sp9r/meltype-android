@@ -1,6 +1,7 @@
 package io.github.sp9r.meltype
 
 import io.github.sp9r.meltype.core.AndroidMozcConverter
+import io.github.sp9r.meltype.core.CandidateKind
 import io.github.sp9r.meltype.core.CompositionSession
 import io.github.sp9r.meltype.core.EmojiCatalog
 import io.github.sp9r.meltype.core.EmojiCategory
@@ -711,10 +712,36 @@ class MeltypeEngineTest {
         assertEquals(rawBefore, reverted.rawInput)
         assertFalse(reverted.isConverting)
         assertTrue(reverted.isEditing)
+        assertTrue(reverted.isKanaView)
         assertEquals("googleでけんさく", reverted.previewText)
         // The next Backspace deletes one kana.
         val shorter = s.backspace()
         assertEquals(reverted.previewText.dropLast(1), shorter.previewText)
+    }
+
+    @Test
+    fun pickingCandidateCommitsUpToItsClause() {
+        val converter = AndroidMozcConverter(dictionaries)
+        val s = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "kyouhagoogledekensaku") s.appendChar(ch)
+        s.startConversion()
+        val first = s.snapshot.clauses.first()
+        val pick = s.snapshot.candidates.first {
+            it.kind == CandidateKind.CONVERSION && (it.targetClauseIndex == 0 || it.targetClauseIndex < 0)
+        }
+        assertTrue(s.prepareCandidateCommit(pick))
+        val committed = s.commitFocusedPrefix()
+        assertEquals(pick.text, committed)
+        assertFalse(s.isEmpty)
+        assertTrue(s.snapshot.rawInput.isNotEmpty())
+        assertFalse("first clause ${first.reading} left in composition", s.snapshot.previewText.startsWith(first.text))
+        // A single-clause composition is committed whole.
+        val one = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "ame") one.appendChar(ch)
+        val c = one.snapshot.candidates.first { it.kind == CandidateKind.CONVERSION }
+        assertTrue(one.prepareCandidateCommit(c))
+        assertEquals(c.text, one.commitFocusedPrefix())
+        assertTrue(one.isEmpty)
     }
 
     @Test
@@ -725,17 +752,23 @@ class MeltypeEngineTest {
         // Two kana left: きょうは|あめ
         val moved = s.moveCaret(-2)
         assertTrue(moved.isEditing)
-        assertEquals("きょうはあめ", moved.previewText)
-        assertEquals(4, moved.caretOffset)
+        assertFalse(moved.isKanaView)
+        // The conversion stays on screen; the badge has the kana with the caret.
+        assertEquals(moved.clauses.joinToString("") { it.text }, moved.previewText)
+        assertEquals("きょうはあめ", moved.editKana)
+        assertEquals(4, moved.editKanaCaret)
+        val before = moved.previewText.substring(0, moved.caretOffset)
+        assertTrue("caret after は: ${moved.previewText} @${moved.caretOffset}", before.endsWith("は"))
         // Delete は and type が at the caret.
         val deleted = s.backspace()
-        assertEquals("きょうあめ", deleted.previewText)
-        assertEquals(3, deleted.caretOffset)
+        assertEquals("きょうあめ", deleted.editKana)
+        assertEquals(3, deleted.editKanaCaret)
         s.appendChar('g')
         val inserted = s.appendChar('a')
         assertEquals("kyougaame", inserted.rawInput)
-        assertEquals("きょうがあめ", inserted.previewText)
-        assertEquals(4, inserted.caretOffset)
+        assertEquals("きょうがあめ", inserted.editKana)
+        assertEquals(4, inserted.editKanaCaret)
+        assertFalse(inserted.isKanaView)
         // Moving back to the end returns to live conversion.
         val end = s.moveCaret(+5)
         assertFalse(end.isEditing)

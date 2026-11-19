@@ -51,10 +51,15 @@ data class CompositionSnapshot(
     val focusedAdjustableLen: Int = 0,
     /** Conversion state (after Space / clause focus): Enter commits clause by clause from the first. */
     val isConverting: Boolean = false,
-    /** Kana editing view: the composition is shown unconverted, with a caret that can move inside it. */
+    /** Editing view: a caret sits inside the composition (or Backspace reverted it to kana). */
     val isEditing: Boolean = false,
     /** Caret offset in [previewText] while [isEditing]; -1 otherwise. */
-    val caretOffset: Int = -1
+    val caretOffset: Int = -1,
+    /** The composition is shown unconverted (Backspace during conversion). */
+    val isKanaView: Boolean = false,
+    /** The composition as kana and the caret offset in it, for the reading badge while [isEditing]. */
+    val editKana: String = "",
+    val editKanaCaret: Int = -1
 )
 
 /**
@@ -237,8 +242,8 @@ class CompositionSession(
     }
 
     /**
-     * Moves the editing caret by [delta] kana units inside the composition. The composition switches
-     * to the unconverted kana view while the caret is inside it.
+     * Moves the editing caret by [delta] kana units inside the composition. The conversion stays
+     * on screen; the caret is mapped into the converted text.
      */
     fun moveCaret(delta: Int, surroundingContext: String? = null): CompositionSnapshot {
         if (buffer.isEmpty() || delta == 0) return cachedSnapshot
@@ -586,6 +591,24 @@ class CompositionSession(
         return true
     }
 
+    /**
+     * Candidate tap: applies [item] and focuses its clause so the caller can commit up to it
+     * (Gboard style: picking a conversion confirms it). Returns false when [item] is not one to commit.
+     */
+    fun prepareCandidateCommit(item: CandidateItem, surroundingContext: String? = null): Boolean {
+        if (item.kind == CandidateKind.GLIDE_ALT || item.kind == CandidateKind.CORRECTION) return false
+        val clauses = cachedSnapshot.clauses
+        if (clauses.isEmpty()) return false
+        val idx = (if (item.targetClauseIndex in clauses.indices) item.targetClauseIndex else focusedClauseIdx)
+            .coerceIn(0, clauses.lastIndex)
+        leaveEditing()
+        selectedClauseTextByKey[clauseKey(clauses[idx])] = item.text
+        converting = true
+        focusedClauseIdx = idx
+        recompute(surroundingContext, keepFocus = true)
+        return true
+    }
+
     fun selectCandidate(
         item: CandidateItem,
         surroundingContext: String? = null,
@@ -675,7 +698,7 @@ class CompositionSession(
     fun commitAndLearn(surroundingContext: String? = null): String {
         val snap = cachedSnapshot
         val committed = snap.previewText
-        if (snap.isEditing) {
+        if (snap.isKanaView) {
             // The kana view is committed as shown; it is not a conversion result to learn from.
             committedHistory.clear()
             clearAll()
@@ -1290,11 +1313,19 @@ class CompositionSession(
         val editing = caretRaw != null || kanaRevert
         var preview = displayClauses.joinToString("") { it.text }
         var caretOffset = -1
+        var editKana = ""
+        var editKanaCaret = -1
         if (editing) {
             val units = editUnits()
-            preview = units.joinToString("") { it.text }
+            editKana = units.joinToString("") { it.text }
             val p = caretRaw ?: raw.length
-            caretOffset = units.filter { it.rawStart < p }.sumOf { it.text.length }
+            editKanaCaret = units.filter { it.rawStart < p }.sumOf { it.text.length }
+            if (kanaRevert) {
+                preview = editKana
+                caretOffset = editKanaCaret
+            } else {
+                caretOffset = previewCaretFor(p, segments, displayClauses, units).coerceIn(0, preview.length)
+            }
         }
         val trace = segments.joinToString("|") { it.raw }
         cachedSnapshot = CompositionSnapshot(
@@ -1313,9 +1344,69 @@ class CompositionSession(
             focusedAdjustableLen = focusedAdjLen,
             isConverting = converting,
             isEditing = editing,
-            caretOffset = caretOffset
+            caretOffset = caretOffset,
+            isKanaView = editing && kanaRevert,
+            editKana = editKana,
+            editKanaCaret = editKanaCaret
         )
         return cachedSnapshot
+    }
+
+    /** Maps the raw caret [p] to an offset in the converted preview (clause boundaries are exact). */
+    private fun previewCaretFor(
+        p: Int,
+        segments: List<ScoredSegment>,
+        clauses: List<DisplayClause>,
+        units: List<EditUnit>
+    ): Int {
+        val starts = IntArray(clauses.size)
+        var off = 0
+        for (i in clauses.indices) {
+            starts[i] = off
+            off += clauses[i].text.length
+        }
+        val total = off
+        fun startOfSegmentsFrom(pos: Int): Int {
+            val ci = clauses.indices.firstOrNull { (segments.getOrNull(clauses[it].segmentIndex)?.startIndex ?: -1) >= pos }
+            return if (ci == null) total else starts[ci]
+        }
+        val segIdx = segments.indexOfFirst { p >= it.startIndex && p < it.endIndex }
+        if (segIdx < 0) return startOfSegmentsFrom(p)
+        val seg = segments[segIdx]
+        val segClauses = clauses.indices.filter { clauses[it].segmentIndex == segIdx }
+        if (segClauses.isEmpty()) return startOfSegmentsFrom(p)
+        if (seg.kind != SegmentKind.JAPANESE) {
+            val ci = segClauses.first()
+            return starts[ci] + mapInClause(clauses[ci], p - seg.startIndex)
+        }
+        val k = units.filter { it.rawStart >= seg.startIndex && it.rawEnd <= p }.sumOf { it.text.length }
+        for (ci in segClauses) {
+            val c = clauses[ci]
+            if (k < c.readingOffset + c.reading.length) {
+                return starts[ci] + mapInClause(c, k - c.readingOffset)
+            }
+        }
+        val last = segClauses.last()
+        return starts[last] + clauses[last].text.length
+    }
+
+    /** Kana offset [i] in a clause's reading -> offset in its text (okurigana kept, kanji runs scaled). */
+    private fun mapInClause(c: DisplayClause, i: Int): Int {
+        val r = RomajiDetector.toKatakana(c.reading)
+        val t = RomajiDetector.toKatakana(c.text)
+        if (i <= 0) return 0
+        if (i >= r.length) return c.text.length
+        if (r == t) return i
+        var pre = 0
+        while (pre < r.length && pre < t.length && r[pre] == t[pre]) pre++
+        var suf = 0
+        while (suf < r.length - pre && suf < t.length - pre && r[r.length - 1 - suf] == t[t.length - 1 - suf]) suf++
+        if (i <= pre) return i
+        if (i >= r.length - suf) return c.text.length - (r.length - i)
+        val rm = r.length - pre - suf
+        val tm = t.length - pre - suf
+        if (rm <= 0) return pre
+        return (pre + ((i - pre) * tm + rm / 2) / rm).coerceIn(0, c.text.length)
     }
 
     private fun buildScriptVariants(focused: DisplayClause?, clausesInSeg: Int): List<Pair<String, String>> {

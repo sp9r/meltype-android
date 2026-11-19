@@ -1244,6 +1244,24 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
     private fun selectCandidateAndLog(snap: CompositionSnapshot, item: CandidateItem, closeExpanded: Boolean) {
         val rawBefore = snap.rawInput
         val focusedClause = snap.clauses.getOrNull(snap.focusedClauseIndex)
+        if (session.prepareCandidateCommit(item, getSurroundingTextBefore())) {
+            // Picking a conversion candidate confirms it (and the clauses before it).
+            if (shouldLogEval()) {
+                evalLogger.logCandidatePicked(
+                    promptId = settings.activePromptId,
+                    clauseReading = focusedClause?.reading.orEmpty(),
+                    pickedText = item.text,
+                    kind = item.kind.name,
+                    previewAfter = session.snapshot.previewText
+                )
+            }
+            commitFocusedPrefixAndRender("candidate")
+            if (closeExpanded || session.isEmpty) {
+                isExpandedPanelOpen = false
+                renderSnapshot(session.snapshot)
+            }
+            return
+        }
         val nextSnap = session.selectCandidate(
             item,
             getSurroundingTextBefore(),
@@ -1329,8 +1347,8 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             if (!snap.isEditing) ic?.setComposingText(spanned, 1)
 
             val clauseTrace = if (snap.isEditing) {
-                val c = snap.caretOffset.coerceIn(0, snap.previewText.length)
-                snap.previewText.substring(0, c) + "｜" + snap.previewText.substring(c)
+                val c = snap.editKanaCaret.coerceIn(0, snap.editKana.length)
+                snap.editKana.substring(0, c) + "｜" + snap.editKana.substring(c)
             } else {
                 snap.clauses.joinToString("│") { it.reading }.ifEmpty { snap.romajiTrace }
             }
@@ -1924,15 +1942,20 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             for ((tag, value) in snap.scriptVariants) {
                 val chip = makePanelButton("$tag: $value", cardBg, textCol, accent) {
                     val wasLast = snap.focusedClauseIndex >= snap.clauses.lastIndex
-                    val nextSnap = session.applyFocusedClauseSurface(
+                    session.applyFocusedClauseSurface(
                         value,
                         getSurroundingTextBefore(),
-                        advanceFocus = true
+                        advanceFocus = false
                     )
                     if (wasLast || snap.clauses.size <= 1) {
                         isExpandedPanelOpen = false
                     }
-                    renderSnapshot(nextSnap)
+                    // Picking a script variant confirms it like a candidate.
+                    commitFocusedPrefixAndRender("variant")
+                    if (session.isEmpty) {
+                        isExpandedPanelOpen = false
+                        renderSnapshot(session.snapshot)
+                    }
                 }
                 chip.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(34)).apply {
                     marginEnd = dp(5)
