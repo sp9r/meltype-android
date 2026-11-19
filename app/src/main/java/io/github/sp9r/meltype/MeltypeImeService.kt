@@ -491,8 +491,113 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         }
     }
 
+    // ---- Password manager: inline autofill suggestions (Android 11+) ----
+    // The autofill service (Bitwarden etc.) renders its own chips; they are shown in the idle candidate bar.
+    private var inlineViews: List<View> = emptyList()
+    private var inlineGen = 0
+
+    override fun onCreateInlineSuggestionsRequest(uiExtras: android.os.Bundle): android.view.inputmethod.InlineSuggestionsRequest? {
+        if (Build.VERSION.SDK_INT < 30) return null
+        return try {
+            val dark = isDarkTheme()
+            val bg = android.graphics.drawable.Icon.createWithResource(
+                this, if (dark) R.drawable.inline_chip_bg_dark else R.drawable.inline_chip_bg
+            )
+            val textCol = if (dark) Color.parseColor("#ECEEF0") else Color.parseColor("#202328")
+            val subCol = if (dark) Color.parseColor("#9BA1A8") else Color.parseColor("#737A84")
+            val chip = androidx.autofill.inline.common.ViewStyle.Builder()
+                .setBackground(bg)
+                .setPadding(dp(10), 0, dp(10), 0)
+                .build()
+            val style = androidx.autofill.inline.v1.InlineSuggestionUi.newStyleBuilder()
+                .setSingleIconChipStyle(chip)
+                .setChipStyle(chip)
+                .setTitleStyle(
+                    androidx.autofill.inline.common.TextViewStyle.Builder()
+                        .setTextColor(textCol).setTextSize(13f).build()
+                )
+                .setSubtitleStyle(
+                    androidx.autofill.inline.common.TextViewStyle.Builder()
+                        .setTextColor(subCol).setTextSize(11f).build()
+                )
+                .build()
+            val styles = androidx.autofill.inline.UiVersions.newStylesBuilder().addStyle(style).build()
+            val spec = android.widget.inline.InlinePresentationSpec.Builder(
+                android.util.Size(dp(80), dp(33)),
+                android.util.Size(dp(300), dp(33))
+            ).setStyle(styles).build()
+            android.view.inputmethod.InlineSuggestionsRequest.Builder(listOf(spec))
+                .setMaxSuggestionCount(6)
+                .build()
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    override fun onInlineSuggestionsResponse(response: android.view.inputmethod.InlineSuggestionsResponse): Boolean {
+        if (Build.VERSION.SDK_INT < 30) return false
+        val list = response.inlineSuggestions
+        val gen = ++inlineGen
+        if (list.isEmpty()) {
+            inlineViews = emptyList()
+            if (::candidateRow.isInitialized) renderSnapshot(session.snapshot)
+            return true
+        }
+        val views = arrayOfNulls<View>(list.size)
+        var remaining = list.size
+        for ((i, sug) in list.withIndex()) {
+            try {
+                sug.inflate(
+                    this,
+                    android.util.Size(ViewGroup.LayoutParams.WRAP_CONTENT, dp(33)),
+                    mainExecutor
+                ) { v ->
+                    views[i] = v
+                    remaining--
+                    if (remaining == 0 && gen == inlineGen) {
+                        inlineViews = views.filterNotNull()
+                        if (::candidateRow.isInitialized) renderSnapshot(session.snapshot)
+                    }
+                }
+            } catch (_: Throwable) {
+                remaining--
+            }
+        }
+        return true
+    }
+
+    override fun onFinishInput() {
+        super.onFinishInput()
+        inlineGen++
+        inlineViews = emptyList()
+    }
+
+    /** The app behind the system autofill service (e.g. Bitwarden), for the fallback button. */
+    private fun passwordManagerApp(): Pair<String, String>? {
+        return try {
+            val am = getSystemService(android.view.autofill.AutofillManager::class.java)
+            val pkg = am?.autofillServiceComponentName?.packageName ?: return null
+            val pm = packageManager
+            if (pm.getLaunchIntentForPackage(pkg) == null) return null
+            val label = pm.getApplicationLabel(pm.getApplicationInfo(pkg, 0)).toString()
+            pkg to label
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    private fun openPasswordManager(pkg: String) {
+        try {
+            val intent = packageManager.getLaunchIntentForPackage(pkg) ?: return
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            startActivity(intent)
+        } catch (_: Throwable) {
+        }
+    }
+
     // Paste suggestion: text copied in another app shows up at the head of the idle candidate bar.
     private var pasteOfferText: String? = null
+    private var pasteOfferSensitive = false
     private var pasteOfferSince = 0L
     private var lastHandledClip: String? = null
 
@@ -507,7 +612,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
     }
 
     private fun offerPaste(txt: String?, desc: android.content.ClipDescription?, sensitive: Boolean) {
-        if (txt.isNullOrEmpty() || sensitive || txt == lastHandledClip) return
+        if (txt.isNullOrEmpty() || txt == lastHandledClip) return
         val now = SystemClock.elapsedRealtime()
         val ts = if (Build.VERSION.SDK_INT >= 26 && desc != null) desc.timestamp else 0L
         // The copy time is wall-clock on recent Android; accept either time base.
@@ -523,14 +628,17 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             pasteOfferText = txt
             pasteOfferSince = copiedAt
         }
+        pasteOfferSensitive = sensitive
     }
 
     private fun currentPasteOffer(): String? {
         val t = pasteOfferText ?: return null
-        if (isPasswordField || SystemClock.elapsedRealtime() - pasteOfferSince > PASTE_OFFER_MS) {
+        if (SystemClock.elapsedRealtime() - pasteOfferSince > PASTE_OFFER_MS) {
             pasteOfferText = null
             return null
         }
+        // A password copied from a password manager is offered only in password fields.
+        if (pasteOfferSensitive && !isPasswordField) return null
         return t
     }
 
@@ -1657,10 +1765,48 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         val subCol = if (dark) Color.parseColor("#9BA1A8") else Color.parseColor("#737A84")
 
         if (!snap.isComposing && snap.candidates.isEmpty()) {
+            // Password-manager suggestions first, then the fallback button in password fields.
+            for (v in inlineViews) {
+                (v.parent as? ViewGroup)?.removeView(v)
+                v.layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    dp(33)
+                ).apply { marginEnd = dp(5) }
+                candidateRow.addView(v)
+            }
+            if (isPasswordField && inlineViews.isEmpty()) {
+                passwordManagerApp()?.let { (pkg, label) ->
+                    val btn = TextView(this).apply {
+                        text = "\uD83D\uDD11 " + label
+                        gravity = Gravity.CENTER
+                        maxLines = 1
+                        setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+                        setTextColor(textCol)
+                        setPadding(dp(10), dp(4), dp(10), dp(4))
+                        background = GradientDrawable().apply {
+                            setColor(chipAltBg)
+                            cornerRadius = dp(5).toFloat()
+                            setStroke(dp(1), accent)
+                        }
+                        layoutParams = LinearLayout.LayoutParams(
+                            ViewGroup.LayoutParams.WRAP_CONTENT,
+                            dp(33)
+                        ).apply { marginEnd = dp(5) }
+                        contentDescription = "パスワード管理アプリを開く"
+                        setOnClickListener { openPasswordManager(pkg) }
+                    }
+                    candidateRow.addView(btn)
+                }
+            }
             currentPasteOffer()?.let { clip ->
                 val oneLine = clip.replace(Regex("\\s+"), " ")
+                val masked = isPasswordField || pasteOfferSensitive
                 val chip = TextView(this).apply {
-                    text = "\uD83D\uDCCB " + (if (oneLine.length > 16) oneLine.take(15) + "…" else oneLine)
+                    text = "\uD83D\uDCCB " + when {
+                        masked -> "••••••"
+                        oneLine.length > 16 -> oneLine.take(15) + "…"
+                        else -> oneLine
+                    }
                     gravity = Gravity.CENTER
                     maxLines = 1
                     setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
