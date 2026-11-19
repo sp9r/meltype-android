@@ -134,6 +134,9 @@ class MainActivity : AppCompatActivity() {
         resolvePalette()
         buildUi()
         initEngineAsync(runSelfTest = intent.getBooleanExtra("selftest", false))
+        if (intent.getBooleanExtra("conveval", false)) {
+            executor.execute { runConversionEval() }
+        }
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -149,6 +152,108 @@ class MainActivity : AppCompatActivity() {
         if (intent.getBooleanExtra("selftest", false)) {
             executor.execute { runEngineSelfTest(writeFile = true) }
         }
+        if (intent.getBooleanExtra("conveval", false)) {
+            executor.execute { runConversionEval() }
+        }
+    }
+
+    /**
+     * Batch conversion audit: reads files/conv_eval_in.txt (romaji<TAB>expected per line),
+     * types each line char-by-char through the live CompositionSession, and also converts the
+     * plain romaji->kana reading with Mozc alone, so Meltype-specific regressions can be isolated.
+     * Writes files/conv_eval_out.tsv. Debug-only tooling; nothing is learned.
+     */
+    private fun runConversionEval() {
+        val inFile = File(filesDir, "conv_eval_in.txt")
+        val outFile = File(filesDir, "conv_eval_out.tsv")
+        if (!inFile.exists()) {
+            outFile.writeText("ERROR\tmissing conv_eval_in.txt\n", Charsets.UTF_8)
+            return
+        }
+        val dicts = dictionaries ?: AppEngineHolder.getDictionaries(applicationContext).also { dictionaries = it }
+        MozcRuntime.ensureInitialized(applicationContext)
+        val engine = ScoreEngine(dicts)
+        val converter = AndroidMozcConverter(dicts)
+        val sb = StringBuilder("romaji\texpected\tmeltype\tmozc_only\tkana\tclauses\tms\n")
+        for (line in inFile.readLines(Charsets.UTF_8)) {
+            if (line.isBlank() || line.startsWith("#")) continue
+            val parts = line.split('\t')
+            val romaji = parts[0].trim()
+            val expected = parts.getOrElse(1) { "" }.trim()
+            val t0 = System.nanoTime()
+            val session = CompositionSession(dicts, engine, converter)
+            for (ch in romaji) session.appendChar(ch)
+            val ms = (System.nanoTime() - t0) / 1_000_000
+            val snap = session.snapshot
+            val kana = io.github.sp9r.meltype.core.RomajiDetector.analyze(romaji).finalizedHiragana()
+            val mozcOnly = runCatching { converter.convertClauses(kana)?.joinToString("") { it.text } }
+                .getOrNull() ?: ""
+            val clauses = snap.clauses.joinToString("|") {
+                (if (it.isEnglish) "E:" else "J:") + it.raw + "=" + it.text
+            }
+            sb.append(romaji).append('\t').append(expected).append('\t')
+                .append(snap.previewText).append('\t').append(mozcOnly).append('\t')
+                .append(kana).append('\t').append(clauses).append('\t').append(ms).append('\n')
+        }
+        // Typo simulation: one same-row neighbor substitution per Japanese line, with the tap
+        // landing near the border of the intended key (hint weight 0.6).
+        sb.append("\n#typo\tromaji\texpected\ttyped\tpreview\tauto_ok\tchip_ok\tchips\n")
+        val rows = listOf("qwertyuiop", "asdfghjkl", "zxcvbnm")
+        for (line in inFile.readLines(Charsets.UTF_8)) {
+            if (line.isBlank() || line.startsWith("#")) continue
+            val parts = line.split('\t')
+            val romaji = parts[0].trim()
+            val expected = parts.getOrElse(1) { "" }.trim()
+            if (romaji.any { it !in 'a'..'z' && it != '-' } || expected.any { it in 'A'..'Z' || it in 'a'..'z' }) continue
+            val positions = romaji.indices.filter { it >= 1 && romaji[it] in 'a'..'z' }
+            if (positions.isEmpty()) continue
+            val k = positions[Math.floorMod(romaji.hashCode(), positions.size)]
+            val intended = romaji[k]
+            val row = rows.first { intended in it }
+            val ci = row.indexOf(intended)
+            val wrong = if (Math.floorMod(romaji.hashCode() / 7, 2) == 0 && ci > 0) row[ci - 1]
+                else if (ci + 1 < row.length) row[ci + 1] else row[ci - 1]
+            val typed = romaji.substring(0, k) + wrong + romaji.substring(k + 1)
+            val session = CompositionSession(dicts, engine, converter)
+            for ((idx, ch) in typed.withIndex()) {
+                session.appendChar(ch, null, if (idx == k) mapOf(intended to 0.6f) else emptyMap())
+            }
+            val snap = session.snapshot
+            val chips = snap.candidates.filter { it.subtitle == "補正" }.map { it.text }
+            sb.append("typo\t").append(romaji).append('\t').append(expected).append('\t')
+                .append(typed).append('\t').append(snap.previewText).append('\t')
+                .append(snap.previewText == expected).append('\t')
+                .append(chips.contains(expected)).append('\t')
+                .append(chips.joinToString("|")).append('\n')
+        }
+
+        // Context: the committed previous phrase should steer the next conversion.
+        sb.append("\n#ctx\tprev\tnext\texpected\twith_ctx\twithout_ctx\n")
+        val ctxCases = listOf(
+            Triple("byouinni", "itta", "行った"),
+            Triple("gakkoumade", "aruita", "歩いた"),
+            Triple("senseini", "kiita", "聞いた"),
+            Triple("kusuriwo", "nonda", "飲んだ"),
+            Triple("eigawo", "mita", "見た"),
+            Triple("denshani", "notta", "乗った"),
+            Triple("kareha", "souitta", "そう言った"),
+            Triple("ashitaha", "hareru", "晴れる")
+        )
+        for ((prev, next, expected) in ctxCases) {
+            val first = CompositionSession(dicts, engine, converter)
+            for (ch in prev) first.appendChar(ch)
+            val prevSnap = first.snapshot
+            val prevText = prevSnap.previewText
+            val second = CompositionSession(dicts, engine, converter)
+            second.rememberCommitted(prevSnap.clauses.map { Triple(it.reading, it.text, it.isEnglish) })
+            for (ch in next) second.appendChar(ch, prevText)
+            val plain = CompositionSession(dicts, engine, converter)
+            for (ch in next) plain.appendChar(ch)
+            sb.append("ctx\t").append(prev).append('\t').append(next).append('\t').append(expected).append('\t')
+                .append(prevText).append('+').append(second.snapshot.previewText).append('\t')
+                .append(plain.snapshot.previewText).append('\n')
+        }
+        outFile.writeText(sb.toString(), Charsets.UTF_8)
     }
 
     private fun applyLaunchIntentOptions(launchIntent: Intent?) {
@@ -951,6 +1056,7 @@ class MainActivity : AppCompatActivity() {
             showSubLabels = settings.showSubLabels
             oneHandedMode = settings.oneHandedMode
             punctuationStyle = settings.punctuationStyle
+            bottomKeyMode = settings.bottomKeyMode
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
@@ -1004,6 +1110,39 @@ class MainActivity : AppCompatActivity() {
             settings.punctuationStyle = style
             blueprintView.punctuationStyle = style
         }
+        modeCard.addView(hairline())
+        // Gboard's "絵文字キー" / "言語切り替えキー": the other function moves to a long-press.
+        addOptionGroup(
+            modeCard,
+            "、の右のキー（他方は長押し）",
+            listOf(
+                "☺ 絵文字（Gboard標準）" to (settings.bottomKeyMode == BottomKeyMode.EMOJI),
+                "日/英 言語切替" to (settings.bottomKeyMode == BottomKeyMode.LANGUAGE)
+            )
+        ) { idx ->
+            val mode = BottomKeyMode.entries[idx]
+            settings.bottomKeyMode = mode
+            blueprintView.bottomKeyMode = mode
+        }
+        modeCard.addView(hairline())
+        // One-tap presets: Gboard as shipped, or Gboard with the number row and language key turned on.
+        addOptionGroup(
+            modeCard,
+            "配置プリセット",
+            listOf(
+                "Gboard標準" to (settings.bottomKeyMode == BottomKeyMode.EMOJI && !settings.showNumberRow),
+                "数字段＋言語キー" to (settings.bottomKeyMode == BottomKeyMode.LANGUAGE && settings.showNumberRow)
+            )
+        ) { idx ->
+            if (idx == 0) {
+                settings.bottomKeyMode = BottomKeyMode.EMOJI
+                settings.showNumberRow = false
+            } else {
+                settings.bottomKeyMode = BottomKeyMode.LANGUAGE
+                settings.showNumberRow = true
+            }
+            recreate()
+        }
         pane.addView(modeCard)
 
         // 3. Engine & Key Interaction Switch Matrix
@@ -1026,7 +1165,7 @@ class MainActivity : AppCompatActivity() {
             blueprintView.showNumberRow = it
         }
         switchCard.addView(hairline())
-        addSwitchRow(switchCard, "キー右上の数字・記号ヒントを表示", "0.38秒長押しで数字・記号を入力（補助キーは上フリック対応）", settings.showSubLabels) {
+        addSwitchRow(switchCard, "キー右上の数字・記号ヒントを表示", "0.3秒長押し（Gboard既定と同じ）で数字・記号を入力、補助キーは上フリックも可", settings.showSubLabels) {
             settings.showSubLabels = it
             blueprintView.showSubLabels = it
         }

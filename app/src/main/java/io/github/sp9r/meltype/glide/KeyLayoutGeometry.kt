@@ -52,10 +52,11 @@ object KeyLayoutGeometry {
             map[ch] = kc
             keyByIndex[ch - 'a'] = kc
         }
-        // Row 1: 9 keys indented by 0.5 key width -> centers at (i + 1.0) / 10
+        // Row 1: a..l from the left edge plus "ー" at the right end (Gboard Japanese QWERTY)
+        // -> centers at (i + 0.5) / 10
         for (i in ROWS[1].indices) {
             val ch = ROWS[1][i]
-            val nx = (i + 1.0f) / 10f * ASPECT_RATIO
+            val nx = (i + 0.5f) / 10f * ASPECT_RATIO
             val ny = 3f / 6f
             val kc = KeyCenter(ch, 1, i, nx, ny)
             map[ch] = kc

@@ -12,6 +12,7 @@ import android.util.AttributeSet
 import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.View
+import io.github.sp9r.meltype.BottomKeyMode
 import io.github.sp9r.meltype.OneHandedMode
 import io.github.sp9r.meltype.PunctuationStyle
 import io.github.sp9r.meltype.ThemeMode
@@ -83,6 +84,14 @@ class QwertyKeyboardView @JvmOverloads constructor(
                 field = value
                 rebuildLayout()
                 requestLayout()
+                invalidate()
+            }
+        }
+    var bottomKeyMode: BottomKeyMode = BottomKeyMode.EMOJI
+        set(value) {
+            if (field != value) {
+                field = value
+                rebuildLayout()
                 invalidate()
             }
         }
@@ -416,8 +425,8 @@ class QwertyKeyboardView @JvmOverloads constructor(
                     val ch = if (upper) r1Chars[i].uppercaseChar() else r1Chars[i]
                     val sym = r1Syms[i]
                     1f to VisualKeyBuilder(ch.toString(), sym.toString(), KeyKind.CHAR, ch, sym, false)
-                }
-                addRowKeys(rOffset + 1, r1, insetUnits = 0.5f)
+                } + listOf(1f to VisualKeyBuilder("ー", "〜", KeyKind.CHAR, outputChar = '-', subOutputChar = '〜', isFn = false))
+                addRowKeys(rOffset + 1, r1)
 
                 val r2 = ArrayList<Pair<Float, VisualKeyBuilder>>()
                 val shiftLabel = when (shiftState) {
@@ -439,15 +448,23 @@ class QwertyKeyboardView @JvmOverloads constructor(
                 addRowKeys(
                     rOffset + 3,
                     listOf(
-                        1.05f to VisualKeyBuilder("?123", "123", KeyKind.LAYER_SYM, subOutputChar = '\u0001', isFn = true),
-                        0.85f to VisualKeyBuilder("日/英", "☺", KeyKind.LANG_TOGGLE, subOutputChar = '\u0002', isFn = true),
-                        0.80f to VisualKeyBuilder(punctuationStyle.comma, "！", KeyKind.COMMA, subOutputChar = '！', isFn = false),
-                        0.80f to VisualKeyBuilder("◀", "↕", KeyKind.CURSOR_LEFT, isFn = true),
-                        2.50f to VisualKeyBuilder("空白", "", KeyKind.SPACE, isFn = false),
-                        0.80f to VisualKeyBuilder("▶", "↕", KeyKind.CURSOR_RIGHT, isFn = true),
-                        0.80f to VisualKeyBuilder("ー", "〜", KeyKind.CHAR, outputChar = '-', subOutputChar = '〜', isFn = false),
-                        0.80f to VisualKeyBuilder(punctuationStyle.period, "？", KeyKind.PERIOD, subOutputChar = '？', isFn = false),
-                        1.60f to VisualKeyBuilder("⏎", "", KeyKind.ENTER, isFn = true)
+                        1.50f to VisualKeyBuilder("?123", "123", KeyKind.LAYER_SYM, subOutputChar = '\u0001', isFn = true),
+                        // Gboard: emoji key (default) or language key; the other one moves to a long-press.
+                        if (bottomKeyMode == BottomKeyMode.LANGUAGE) {
+                            1.00f to VisualKeyBuilder(punctuationStyle.comma, "☺", KeyKind.COMMA, subOutputChar = '\u0002', isFn = false)
+                        } else {
+                            1.00f to VisualKeyBuilder(punctuationStyle.comma, "！", KeyKind.COMMA, subOutputChar = '！', isFn = false)
+                        },
+                        if (bottomKeyMode == BottomKeyMode.LANGUAGE) {
+                            1.00f to VisualKeyBuilder("日/英", "", KeyKind.LANG_TOGGLE, isFn = true)
+                        } else {
+                            1.00f to VisualKeyBuilder("☺", "日/英", KeyKind.EMOJI, subOutputChar = '\u0003', isFn = true)
+                        },
+                        2.00f to VisualKeyBuilder("空白", "", KeyKind.SPACE, isFn = false),
+                        1.00f to VisualKeyBuilder(punctuationStyle.period, "？", KeyKind.PERIOD, subOutputChar = '？', isFn = false),
+                        1.00f to VisualKeyBuilder("◀", "↕", KeyKind.CURSOR_LEFT, isFn = true),
+                        1.00f to VisualKeyBuilder("▶", "↕", KeyKind.CURSOR_RIGHT, isFn = true),
+                        1.50f to VisualKeyBuilder("⏎", "", KeyKind.ENTER, isFn = true)
                     )
                 )
             }
@@ -478,11 +495,11 @@ class QwertyKeyboardView @JvmOverloads constructor(
                     listOf(
                         1.15f to VisualKeyBuilder("ABC", "", KeyKind.LAYER_ABC, isFn = true),
                         1.15f to VisualKeyBuilder("テンキー", "", KeyKind.LAYER_NUMPAD, isFn = true),
-                        0.80f to VisualKeyBuilder(",", "！", KeyKind.CHAR, ',', '！', isFn = false),
-                        0.80f to VisualKeyBuilder("◀", "↕", KeyKind.CURSOR_LEFT, isFn = true),
-                        2.70f to VisualKeyBuilder("スペース", "", KeyKind.SPACE, isFn = false),
-                        0.80f to VisualKeyBuilder("▶", "↕", KeyKind.CURSOR_RIGHT, isFn = true),
-                        0.80f to VisualKeyBuilder(".", "？", KeyKind.CHAR, '.', '？', isFn = false),
+                        0.85f to VisualKeyBuilder(",", "！", KeyKind.CHAR, ',', '！', isFn = false),
+                        2.30f to VisualKeyBuilder("スペース", "", KeyKind.SPACE, isFn = false),
+                        0.85f to VisualKeyBuilder(".", "？", KeyKind.CHAR, '.', '？', isFn = false),
+                        0.85f to VisualKeyBuilder("◀", "↕", KeyKind.CURSOR_LEFT, isFn = true),
+                        0.85f to VisualKeyBuilder("▶", "↕", KeyKind.CURSOR_RIGHT, isFn = true),
                         1.80f to VisualKeyBuilder("⏎", "", KeyKind.ENTER, isFn = true)
                     )
                 )
@@ -512,11 +529,11 @@ class QwertyKeyboardView @JvmOverloads constructor(
                     listOf(
                         1.15f to VisualKeyBuilder("ABC", "", KeyKind.LAYER_ABC, isFn = true),
                         1.15f to VisualKeyBuilder("テンキー", "", KeyKind.LAYER_NUMPAD, isFn = true),
-                        0.80f to VisualKeyBuilder("<", "", KeyKind.CHAR, '<', isFn = false),
-                        0.80f to VisualKeyBuilder("◀", "↕", KeyKind.CURSOR_LEFT, isFn = true),
-                        2.70f to VisualKeyBuilder("スペース", "", KeyKind.SPACE, isFn = false),
-                        0.80f to VisualKeyBuilder("▶", "↕", KeyKind.CURSOR_RIGHT, isFn = true),
-                        0.80f to VisualKeyBuilder(">", "", KeyKind.CHAR, '>', isFn = false),
+                        0.85f to VisualKeyBuilder("<", "", KeyKind.CHAR, '<', isFn = false),
+                        2.30f to VisualKeyBuilder("スペース", "", KeyKind.SPACE, isFn = false),
+                        0.85f to VisualKeyBuilder(">", "", KeyKind.CHAR, '>', isFn = false),
+                        0.85f to VisualKeyBuilder("◀", "↕", KeyKind.CURSOR_LEFT, isFn = true),
+                        0.85f to VisualKeyBuilder("▶", "↕", KeyKind.CURSOR_RIGHT, isFn = true),
                         1.80f to VisualKeyBuilder("⏎", "", KeyKind.ENTER, isFn = true)
                     )
                 )
@@ -744,7 +761,7 @@ class QwertyKeyboardView @JvmOverloads constructor(
                         handler.postDelayed(cursorRepeatRunnable, 320L)
                     } else {
                         if (hit.subOutputChar != '\u0000') {
-                            handler.postDelayed(subLongPressRunnable, 380L)
+                            handler.postDelayed(subLongPressRunnable, 300L)
                         }
                         if (glideEnabled && layer == Layer.QWERTY && isLetterCharKey(hit)) {
                             glideTrail.add(TouchPoint(x, y, event.eventTime))
@@ -914,7 +931,7 @@ class QwertyKeyboardView @JvmOverloads constructor(
                         handler.postDelayed(cursorRepeatRunnable, 320L)
                     } else {
                         if (hit.subOutputChar != '\u0000') {
-                            handler.postDelayed(subLongPressRunnable, 380L)
+                            handler.postDelayed(subLongPressRunnable, 300L)
                         }
                         if (glideEnabled && layer == Layer.QWERTY && isLetterCharKey(hit)) {
                             glideTrail.add(TouchPoint(downX, downY, event.eventTime))
@@ -1013,8 +1030,11 @@ class QwertyKeyboardView @JvmOverloads constructor(
                         rebuildLayout()
                         requestLayout()
                     }
-                    dk.kind == KeyKind.LANG_TOGGLE && dk.subOutputChar == '\u0002' -> {
+                    dk.subOutputChar == '\u0002' -> {
                         listener?.onToggleEmojiPanel()
+                    }
+                    dk.subOutputChar == '\u0003' -> {
+                        listener?.onToggleLanguage()
                     }
                     else -> {
                         listener?.onCharacter(dk.subOutputChar, directCommit = (layer == Layer.NUMPAD))

@@ -15,6 +15,8 @@ import io.github.sp9r.meltype.glide.GlideDecoder
 import io.github.sp9r.meltype.glide.KeyLayoutGeometry
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.BeforeClass
 import org.junit.Test
@@ -171,7 +173,7 @@ class MeltypeEngineTest {
         session.appendGlideResult("google", true, listOf("google" to true, "goggle" to true))
         for (ch in "dekensaku") session.appendChar(ch)
 
-        assertEquals("今日はgoogleで検索", session.snapshot.previewText)
+        assertEquals("今日はGoogleで検索", session.snapshot.previewText)
 
         // Language toggle flips last clause
         val toggled = session.toggleFocusedSegmentLanguage()
@@ -385,7 +387,7 @@ class MeltypeEngineTest {
         val committed = partialSession.commitFocusedPrefix()
         assertEquals(firstClauseText, committed)
         assertTrue(partialSession.snapshot.isComposing)
-        assertTrue(partialSession.snapshot.previewText.contains("google"))
+        assertTrue(partialSession.snapshot.previewText.contains("google", ignoreCase = true))
 
         // 3. Conversational Japanese phrases & fast decode latency
         val convGlideTargets = listOf(
@@ -629,5 +631,26 @@ class MeltypeEngineTest {
         assertTrue(mixedInit.focusedAdjustableKana.length >= 5)
         val extendedAcross = mixedSess.setFocusedClauseLength(4)
         assertEquals(4, extendedAcross.clauses[0].reading.length)
+    }
+
+    @Test
+    fun zSequencesFollowGoogleIme() {
+        val converter = AndroidMozcConverter(dictionaries)
+        val s = CompositionSession(dictionaries, scoreEngine, converter)
+        s.appendChar('z')
+        assertNotNull(s.tryZSymbol('.'))
+        assertEquals("…", s.snapshot.rawInput)
+
+        val arrow = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "kaz") arrow.appendChar(ch)
+        assertNotNull(arrow.tryZSymbol('l'))
+        assertEquals("ka→", arrow.snapshot.rawInput)
+
+        // English words ending in z are not touched.
+        val quiz = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "quiz") quiz.appendChar(ch)
+        assertNull(quiz.tryZSymbol('.'))
+        // Keys outside the z table are not touched.
+        assertNull(arrow.tryZSymbol('a'))
     }
 }

@@ -530,6 +530,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         keyboardView.showSubLabels = settings.showSubLabels
         keyboardView.letterFlickEnabled = settings.letterFlickEnabled
         keyboardView.showNumberRow = settings.showNumberRow
+        keyboardView.bottomKeyMode = settings.bottomKeyMode
         keyboardView.autoReturnFromSymbols = settings.autoReturnFromSymbols
         keyboardView.flickSensitivity = settings.flickSensitivity
         keyboardView.themeMode = settings.themeMode
@@ -682,6 +683,14 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             currentInputConnection?.commitText(ch.toString(), 1)
             return
         }
+        if (!session.isEmpty) {
+            val zSnap = session.tryZSymbol(ch, getSurroundingTextBefore())
+            if (zSnap != null) {
+                clearUndoCommit()
+                renderSnapshot(zSnap)
+                return
+            }
+        }
         if (directCommit) {
             if (!session.isEmpty) {
                 val raw = session.snapshot.rawInput
@@ -780,6 +789,14 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         if (isPasswordField) {
             currentInputConnection?.commitText(if (isPeriod) "." else ",", 1)
             return
+        }
+        if (!session.isEmpty) {
+            val zSnap = session.tryZSymbol(if (isPeriod) '.' else ',', getSurroundingTextBefore())
+            if (zSnap != null) {
+                clearUndoCommit()
+                renderSnapshot(zSnap)
+                return
+            }
         }
         val snap = session.snapshot
         val lastIsEnglish = snap.clauses.lastOrNull()?.isEnglish == true
@@ -1455,7 +1472,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
                 gravity = Gravity.CENTER_VERTICAL
                 setPadding(dp(10), dp(2), dp(10), dp(2))
                 val isSelected = item.kind == CandidateKind.CONVERSION && item.text == focusedText && idx == 0
-                val isGlide = item.kind == CandidateKind.GLIDE_ALT
+                val isGlide = item.kind == CandidateKind.GLIDE_ALT || item.kind == CandidateKind.CORRECTION
                 background = GradientDrawable().apply {
                     setColor(if (isGlide) chipAltBg else chipBg)
                     cornerRadius = dp(5).toFloat()
@@ -1852,7 +1869,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
                             label,
                             cardBg,
                             textCol,
-                            if (item.kind == CandidateKind.GLIDE_ALT) accent else border
+                            if (item.kind == CandidateKind.GLIDE_ALT || item.kind == CandidateKind.CORRECTION) accent else border
                         ) {
                             val wasLast = snap.focusedClauseIndex >= snap.clauses.lastIndex
                             val close = item.kind == CandidateKind.GLIDE_ALT || wasLast || snap.clauses.size <= 1

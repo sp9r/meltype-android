@@ -35,6 +35,20 @@ enum class PunctuationStyle(val key: String, val comma: String, val period: Stri
     }
 }
 
+/**
+ * The key between 、 and the space bar, mirroring Gboard's "絵文字キー" / "言語切り替えキー" settings.
+ * EMOJI: ☺ key (long-press = 日/英), 、 long-press = ！ (Gboard default).
+ * LANGUAGE: 日/英 key, 、 long-press = emoji panel (Gboard with the language key turned on).
+ */
+enum class BottomKeyMode(val key: String, val labelJa: String) {
+    EMOJI("emoji", "絵文字キー"),
+    LANGUAGE("lang", "言語切替キー");
+
+    companion object {
+        fun fromKey(key: String?): BottomKeyMode = entries.firstOrNull { it.key == key } ?: EMOJI
+    }
+}
+
 data class UserDictEntry(
     val reading: String,
     val word: String
@@ -67,6 +81,18 @@ class MeltypeSettings(context: Context) {
     var showNumberRow: Boolean
         get() = prefs.getBoolean(KEY_SHOW_NUMBER_ROW, true)
         set(value) = prefs.edit().putBoolean(KEY_SHOW_NUMBER_ROW, value).apply()
+
+    var bottomKeyMode: BottomKeyMode
+        get() {
+            if (!prefs.contains(KEY_BOTTOM_KEY)) {
+                // Existing installs keep the language key they already had; fresh installs follow Gboard.
+                val mode = if (prefs.all.isEmpty()) BottomKeyMode.EMOJI else BottomKeyMode.LANGUAGE
+                prefs.edit().putString(KEY_BOTTOM_KEY, mode.key).apply()
+                return mode
+            }
+            return BottomKeyMode.fromKey(prefs.getString(KEY_BOTTOM_KEY, null))
+        }
+        set(value) = prefs.edit().putString(KEY_BOTTOM_KEY, value.key).apply()
 
     var autoReturnFromSymbols: Boolean
         get() = prefs.getBoolean(KEY_AUTO_RETURN_SYMBOLS, false)
@@ -206,6 +232,7 @@ class MeltypeSettings(context: Context) {
         private const val KEY_ONE_HANDED = "one_handed_mode"
         private const val KEY_HEIGHT_SCALE = "keyboard_height_scale"
         private const val KEY_SHOW_NUMBER_ROW = "show_number_row"
+        private const val KEY_BOTTOM_KEY = "bottom_key_mode"
         private const val KEY_AUTO_RETURN_SYMBOLS = "auto_return_symbols"
         private const val KEY_FLICK_SENSITIVITY = "flick_sensitivity"
         private const val KEY_AUTO_COMMIT_PUNCT = "auto_commit_punct"

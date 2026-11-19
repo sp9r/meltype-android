@@ -120,6 +120,8 @@ class MeltypeDictionaries(source: DictionarySource) {
                 }
             }
         }
+        // Hyphenated canonical forms that users type without the hyphen.
+        properMap.putIfAbsent("wifi", "Wi-Fi")
         properNounCanonical = properMap
         englishFocusedWords = SortedWordList(engFocused)
 

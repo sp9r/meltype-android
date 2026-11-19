@@ -125,7 +125,10 @@ class ScoreEngine(
                 }
                 val alphaRun = input.substring(i, end)
                 val followedByDelimiter = end < input.length && (input[end].isWhitespace() || input[end] in "。、.,!?！？")
-                out.addAll(segmentAlphaRun(alphaRun, i, endedByDelimiter = followedByDelimiter))
+                // A romaji run touching "-" (ー) is usually part of a katakana word ("insuto-rushita", "repo-to").
+                val touchesLongVowel = (end < input.length && input[end] == '-') ||
+                    (i >= 2 && input[i - 1] == '-' && isAsciiAlpha(input[i - 2]))
+                out.addAll(segmentAlphaRun(alphaRun, i, endedByDelimiter = followedByDelimiter, touchesLongVowel = touchesLongVowel))
                 i = end
                 continue
             }
@@ -207,7 +210,12 @@ class ScoreEngine(
     /**
      * Viterbi dynamic programming segmentation of a contiguous ASCII letter run into JAPANESE and ENGLISH segments.
      */
-    private fun segmentAlphaRun(run: String, baseOffset: Int, endedByDelimiter: Boolean = false): List<ScoredSegment> {
+    private fun segmentAlphaRun(
+        run: String,
+        baseOffset: Int,
+        endedByDelimiter: Boolean = false,
+        touchesLongVowel: Boolean = false
+    ): List<ScoredSegment> {
         val n = run.length
         if (n == 0) return emptyList()
 
@@ -250,6 +258,12 @@ class ScoreEngine(
             val hiragana: String = ""
         )
 
+        // Japanese-first guard: when the whole lowercase run is already valid romaji
+        // (e.g. "jouhouriron", "chottomatte", "happyounojunbi"), never carve ordinary English
+        // words out of it ("hour", "matte", "happy"). Only a few brand words that are
+        // themselves readable romaji may still be embedded (e.g. "youtubewomiru").
+        val wholeRunReadable = isJapaneseFirstRun(run, lowerRun, endedByDelimiter, touchesLongVowel)
+
         val dp = Array<Choice?>(n + 1) { null }
         dp[0] = Choice(0.0, -1, SegmentKind.JAPANESE)
 
@@ -276,7 +290,11 @@ class ScoreEngine(
                 }
 
                 // Option B: ENGLISH segment (avoid 1-char splits unless invalid romaji like q/l/v/x at boundary)
-                val enScore = scoreEnglishSpan(sub, run.substring(i, j), prevIdx = i, nextPos = j, totalLen = n, fullRun = lowerRun)
+                val enScore = if (wholeRunReadable && sub !in READABLE_EMBEDDED_BRANDS) {
+                    null
+                } else {
+                    scoreEnglishSpan(sub, run.substring(i, j), prevIdx = i, nextPos = j, totalLen = n, fullRun = lowerRun)
+                }
                 if (enScore != null) {
                     val candidateScore = cur.score + enScore
                     val existing = dp[j]
@@ -677,7 +695,36 @@ class ScoreEngine(
         return if (hasLetter && hasDigit) idx else -1
     }
 
+    private fun isJapaneseFirstRun(
+        run: String,
+        lowerRun: String,
+        endedByDelimiter: Boolean,
+        touchesLongVowel: Boolean
+    ): Boolean {
+        if (run.any { it.isUpperCase() }) return false
+        // l/q/x/v and a bare 'c' are rare in everyday romaji but common in English ("hello", "cute").
+        if (lowerRun.any { it == 'l' || it == 'q' || it == 'x' || it == 'v' }) return false
+        for (k in lowerRun.indices) {
+            if (lowerRun[k] == 'c' && lowerRun.getOrNull(k + 1) != 'h') return false
+        }
+        if (typoEngine.firstUnreadableOffset(lowerRun, final = endedByDelimiter) >= 0) return false
+        val analysis = RomajiDetector.analyze(lowerRun, strictForDetection = false)
+        // Rare youon spellings (gwo, kwa, twe, ...) usually mean an English word was read as romaji
+        // ("meeting" -> め・え・ち・ん・ぐぉ...).
+        if (analysis.chunks.any { c -> c.rawRomaji.length >= 3 && c.rawRomaji[1] == 'w' && c.rawRomaji[0] != 'w' }) return false
+        // A trailing consonant still being typed ("jouhourir", "...ron") does not make the run English.
+        if (analysis.pendingTail.length > 2) return false
+        val kana = analysis.hiragana
+        if (kana.any { it in 'a'..'z' }) return false
+        if (touchesLongVowel && kana.length >= 2) return true
+        return kana.length >= 5 || typoEngine.isKnownReading(kana)
+    }
+
     companion object {
+        /** Brand words that are also readable romaji; still allowed as English inside a readable run. */
+        private val READABLE_EMBEDDED_BRANDS = setOf(
+            "youtube", "wifi", "amazon", "notion", "gemini", "java", "ubuntu", "office"
+        )
         private val PARTICLES = listOf("kara", "made", "ha", "ga", "wo", "ni", "de", "to", "no", "mo", "wa", "he", "ya")
         private val CASE_PARTICLES = listOf("kara", "made", "ha", "ga", "wo", "ni", "de", "mo")
         private val COMMON_COLLIDING_KANA = setOf("での", "みろ", "ので", "しり", "すいか", "かれん", "まや", "かめん", "かれ", "くれ", "とり", "もり")

@@ -8,6 +8,7 @@ import android.graphics.RectF
 import android.graphics.Typeface
 import android.util.AttributeSet
 import android.view.View
+import io.github.sp9r.meltype.BottomKeyMode
 import io.github.sp9r.meltype.OneHandedMode
 import io.github.sp9r.meltype.PunctuationStyle
 import kotlin.math.roundToInt
@@ -32,6 +33,11 @@ class KeyboardBlueprintView @JvmOverloads constructor(
             invalidate()
         }
     var showNumberRow: Boolean = true
+        set(value) {
+            field = value
+            invalidate()
+        }
+    var bottomKeyMode: BottomKeyMode = BottomKeyMode.EMOJI
         set(value) {
             field = value
             invalidate()
@@ -168,10 +174,11 @@ class KeyboardBlueprintView @JvmOverloads constructor(
                 }
                 "asdfghjkl" -> {
                     for (i in rStr.indices) {
-                        val x0 = kbLeft + (0.5f + i) * unitW + padX
-                        val x1 = kbLeft + (1.5f + i) * unitW - padX
+                        val x0 = kbLeft + i * unitW + padX
+                        val x1 = kbLeft + (1f + i) * unitW - padX
                         drawMiniKey(canvas, x0, y0, x1, y1, rStr[i].toString(), "", rKey, keyBg, keyBorder, textCol, mutedCol, accentCol, false)
                     }
+                    drawMiniKey(canvas, kbLeft + 9f * unitW + padX, y0, kbRight - padX, y1, "ー", "", rKey, keyBg, keyBorder, textCol, mutedCol, accentCol, false)
                 }
                 "zxcvbnm" -> {
                     drawMiniKey(canvas, kbLeft + padX, y0, kbLeft + 1.5f * unitW - padX, y1, "⇧", "", rKey, fnBg, keyBorder, textCol, mutedCol, accentCol, false)
@@ -185,14 +192,13 @@ class KeyboardBlueprintView @JvmOverloads constructor(
                 "BOTTOM" -> {
                     val specs = listOf(
                         1.0f to "?123",
-                        0.85f to "日/英",
-                        0.85f to punctuationStyle.comma,
-                        0.75f to "◀",
-                        2.75f to "空白",
-                        0.75f to "▶",
-                        0.85f to "ー",
-                        0.85f to punctuationStyle.period,
-                        1.35f to "↵"
+                        0.7f to punctuationStyle.comma,
+                        0.7f to (if (bottomKeyMode == BottomKeyMode.LANGUAGE) "日/英" else "☺"),
+                        3.0f to "空白",
+                        0.7f to punctuationStyle.period,
+                        0.7f to "◀",
+                        0.7f to "▶",
+                        1.5f to "↵"
                     )
                     var ux = 0f
                     for ((idx, spec) in specs.withIndex()) {

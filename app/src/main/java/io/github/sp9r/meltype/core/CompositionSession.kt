@@ -7,14 +7,22 @@ enum class CandidateKind {
     GLIDE_ALT,
     ENGLISH_CASE,
     UTILITY,
-    EMOJI
+    EMOJI,
+    /** Typo correction ("補正") or the literal "そのまま" reading of an auto-corrected segment. */
+    CORRECTION
 }
 
 data class CandidateItem(
     val text: String,
     val subtitle: String = "",
     val kind: CandidateKind = CandidateKind.CONVERSION,
-    val targetClauseIndex: Int = -1
+    val targetClauseIndex: Int = -1,
+    /** CORRECTION: replace buffer[replaceStart, replaceEnd) with [replaceRaw]. */
+    val replaceStart: Int = -1,
+    val replaceEnd: Int = -1,
+    val replaceRaw: String? = null,
+    /** CORRECTION: keep the segment starting here exactly as typed (disable auto correction). */
+    val keepLiteralStart: Int = -1
 )
 
 data class DisplayClause(
@@ -58,6 +66,12 @@ class CompositionSession(
     private val overrides = LinkedHashMap<IntRange, SegmentKind>()
     private val selectedClauseTextByKey = LinkedHashMap<String, String>()
     private val customClauseSplits = LinkedHashMap<Int, MutableList<Int>>()
+    /** Segment start offsets the user asked to keep literal ("そのまま"). */
+    private val noTypoFixStarts = HashSet<Int>()
+    /** Correction chips per segment index, rebuilt on every recompute. */
+    private val segmentCorrections = HashMap<Int, MutableList<CandidateItem>>()
+    /** Last committed Japanese clauses (reading + surface), used as conversion context. */
+    private val committedHistory = ArrayDeque<ConversionClause>()
     private var focusedClauseIdx = 0
 
     // Tracks last inserted glide span for 1-tap alternative switching and 1-tap backspace undo
@@ -88,6 +102,27 @@ class CompositionSession(
         buffer.append(ch)
         bufferSpatialHints.add(spatialHints)
         return recompute(surroundingContext)
+    }
+
+    /**
+     * Google IME style "z" sequences (z. -> …, zh -> ← etc.). Applies only when the trailing "z"
+     * is a pending romaji prefix of a readable run, so English words like "quiz." stay intact.
+     * Returns null when [key] does not complete a z sequence.
+     */
+    fun tryZSymbol(key: Char, surroundingContext: String? = null): CompositionSnapshot? {
+        val sym = Z_SYMBOLS[key] ?: return null
+        if (buffer.isEmpty() || buffer.last() != 'z') return null
+        val lastIdx = buffer.length - 1
+        if (overrides.keys.any { lastIdx in it }) return null
+        if (cachedSnapshot.clauses.lastOrNull()?.isEnglish == true) return null
+        var s = buffer.length
+        while (s > 0 && buffer[s - 1] in 'a'..'z') s--
+        if (s > 0 && buffer[s - 1] in 'A'..'Z') return null
+        val analysis = RomajiDetector.analyze(buffer.substring(s), strictForDetection = false)
+        if (!analysis.isStrictValid || analysis.pendingTail != "z") return null
+        buffer.setLength(lastIdx)
+        bufferSpatialHints.removeAt(bufferSpatialHints.lastIndex)
+        return appendText(sym, surroundingContext)
     }
 
     fun appendText(text: String, surroundingContext: String? = null): CompositionSnapshot {
@@ -138,6 +173,7 @@ class CompositionSession(
         if (range.first < 0 || range.last >= buffer.length) return cachedSnapshot
         overrides.remove(range)
         customClauseSplits.clear()
+        noTypoFixStarts.clear()
         buffer.replace(range.first, range.last + 1, word)
         while (bufferSpatialHints.size > buffer.length) {
             bufferSpatialHints.removeAt(bufferSpatialHints.lastIndex)
@@ -180,6 +216,7 @@ class CompositionSession(
         val toRemove = overrides.keys.filter { removeAt in it }
         toRemove.forEach { overrides.remove(it) }
         buffer.deleteCharAt(removeAt)
+        noTypoFixStarts.removeAll { it >= buffer.length }
         if (removeAt < bufferSpatialHints.size) {
             bufferSpatialHints.removeAt(removeAt)
         }
@@ -192,6 +229,7 @@ class CompositionSession(
         overrides.clear()
         selectedClauseTextByKey.clear()
         customClauseSplits.clear()
+        noTypoFixStarts.clear()
         clearLastGlideHint()
         focusedClauseIdx = 0
         return recompute(null)
@@ -203,6 +241,7 @@ class CompositionSession(
         overrides.clear()
         selectedClauseTextByKey.clear()
         customClauseSplits.clear()
+        noTypoFixStarts.clear()
         clearLastGlideHint()
         focusedClauseIdx = 0
         if (rawInput.isNotEmpty()) {
@@ -339,6 +378,9 @@ class CompositionSession(
             val isEn = item.subtitle.startsWith("英")
             return replaceLastGlideAlternative(item.text, isEn, surroundingContext)
         }
+        if (item.kind == CandidateKind.CORRECTION) {
+            return applyCorrection(item, surroundingContext)
+        }
         val clauses = cachedSnapshot.clauses
         if (clauses.isEmpty()) return cachedSnapshot
         val idx = (if (item.targetClauseIndex in clauses.indices) item.targetClauseIndex else focusedClauseIdx)
@@ -349,6 +391,31 @@ class CompositionSession(
             focusedClauseIdx = idx + 1
         }
         return recompute(surroundingContext, keepFocus = true)
+    }
+
+    private fun applyCorrection(item: CandidateItem, surroundingContext: String?): CompositionSnapshot {
+        if (item.keepLiteralStart >= 0) {
+            noTypoFixStarts.add(item.keepLiteralStart)
+            selectedClauseTextByKey.clear()
+            customClauseSplits.clear()
+            return recompute(surroundingContext)
+        }
+        val newRaw = item.replaceRaw ?: return cachedSnapshot
+        val start = item.replaceStart
+        val end = item.replaceEnd
+        if (start < 0 || end > buffer.length || start >= end) return cachedSnapshot
+        clearLastGlideHint()
+        val oldLen = end - start
+        buffer.replace(start, end, newRaw)
+        val keptHints = if (newRaw.length == oldLen) bufferSpatialHints.subList(start, end).toList() else List(newRaw.length) { emptyMap() }
+        for (k in 0 until oldLen) if (start < bufferSpatialHints.size) bufferSpatialHints.removeAt(start)
+        bufferSpatialHints.addAll(start.coerceAtMost(bufferSpatialHints.size), keptHints)
+        while (bufferSpatialHints.size < buffer.length) bufferSpatialHints.add(emptyMap())
+        while (bufferSpatialHints.size > buffer.length) bufferSpatialHints.removeAt(bufferSpatialHints.lastIndex)
+        if (newRaw.length != oldLen) overrides.clear()
+        selectedClauseTextByKey.clear()
+        customClauseSplits.clear()
+        return recompute(surroundingContext)
     }
 
     fun applyFocusedClauseSurface(
@@ -392,8 +459,65 @@ class CompositionSession(
         if (mozcClauses.isNotEmpty()) {
             converter.learn(surroundingContext, mozcClauses)
         }
+        rememberCommitted(snap.clauses.map { Triple(it.reading, it.text, it.isEnglish) })
         clearAll()
         return committed
+    }
+
+    /**
+     * Records committed clauses so the next composition can be converted with them as context
+     * (e.g. committed 学校に + typed "itta" -> 行った rather than 言った).
+     */
+    fun rememberCommitted(clauses: List<Triple<String, String, Boolean>>) {
+        for ((reading, text, isEnglish) in clauses) {
+            if (isEnglish || reading.isEmpty() || !RomajiDetector.isHiraganaOnly(reading)) {
+                committedHistory.clear()
+            } else {
+                committedHistory.addLast(ConversionClause(reading, text))
+            }
+        }
+        while (committedHistory.size > 2) committedHistory.removeFirst()
+    }
+
+    /** Returns (reading, surface) of the recent committed clauses that the text before the cursor still ends with. */
+    private fun historyPrefix(context: String?): Pair<String, String>? {
+        if (context.isNullOrEmpty() || committedHistory.isEmpty()) return null
+        val items = committedHistory.toList()
+        for (take in items.size downTo 1) {
+            val tail = items.takeLast(take)
+            val reading = tail.joinToString("") { it.reading }
+            val text = tail.joinToString("") { it.text }
+            if (reading.length in 2..10 && context.endsWith(text)) return reading to text
+        }
+        return null
+    }
+
+    /**
+     * Converts [hira] with the committed clauses prepended as reading, so Mozc sees the real
+     * sentence. The result is used only when Mozc reproduces the committed text exactly with a
+     * clause boundary at the join; otherwise falls back to converting [hira] alone.
+     */
+    private fun convertWithHistory(hira: String, context: String?): List<ConversionClause>? {
+        val prefix = historyPrefix(context)
+        if (prefix != null && hira.isNotEmpty()) {
+            val (pReading, pText) = prefix
+            val outerContext = context?.dropLast(pText.length)?.ifEmpty { null }
+            val full = converter.convertClauses(pReading + hira, outerContext)
+            if (full != null) {
+                var acc = 0
+                var idx = 0
+                val sb = StringBuilder()
+                while (idx < full.size && acc < pReading.length) {
+                    acc += full[idx].reading.length
+                    sb.append(full[idx].text)
+                    idx++
+                }
+                if (acc == pReading.length && idx < full.size && sb.toString() == pText) {
+                    return full.subList(idx, full.size)
+                }
+            }
+        }
+        return converter.convertClauses(hira, context)
     }
 
     /**
@@ -410,6 +534,7 @@ class CompositionSession(
 
         val committedClauses = clauses.subList(0, cutIdx + 1)
         val committed = committedClauses.joinToString("") { it.text }
+        rememberCommitted(committedClauses.map { Triple(it.reading, it.text, it.isEnglish) })
         val mozcClauses = committedClauses
             .filter { !it.isEnglish && RomajiDetector.isHiraganaOnly(it.reading) }
             .map { ConversionClause(it.reading, it.text) }
@@ -457,6 +582,7 @@ class CompositionSession(
         overrides.putAll(nextOverrides)
         selectedClauseTextByKey.clear()
         customClauseSplits.clear()
+        noTypoFixStarts.clear()
         clearLastGlideHint()
         focusedClauseIdx = 0
         recompute((surroundingContext ?: "") + committed, keepFocus = true)
@@ -467,6 +593,19 @@ class CompositionSession(
         lastGlideRange = null
         lastGlideLeadingSpace = false
         lastGlideAlternatives = emptyList()
+    }
+
+    /** True when [fixed] differs from [typed] by substitutions whose taps landed near the substituted key. */
+    private fun spatiallySupported(typed: String, fixed: String, hints: List<Map<Char, Float>>): Boolean {
+        if (typed.length != fixed.length || hints.isEmpty()) return false
+        var diffs = 0
+        for (k in typed.indices) {
+            if (typed[k] == fixed[k]) continue
+            diffs++
+            val w = hints.getOrNull(k)?.get(fixed[k]) ?: return false
+            if (w < 0.25f) return false
+        }
+        return diffs in 1..2
     }
 
     private fun clauseKey(c: DisplayClause): String = "${c.segmentIndex}:${c.readingOffset}:${c.raw}:${c.reading}"
@@ -481,6 +620,7 @@ class CompositionSession(
         val segments = scoreEngine.segment(raw, overrides)
         val displayClauses = ArrayList<DisplayClause>()
         val segContextBuf = StringBuilder(surroundingContext ?: "")
+        segmentCorrections.clear()
 
         for ((segIdx, seg) in segments.withIndex()) {
             val segContext = segContextBuf.toString().ifEmpty { null }
@@ -493,7 +633,10 @@ class CompositionSession(
                     val upper = seg.raw.uppercase()
                     val hiraVersion = RomajiDetector.analyze(lower, strictForDetection = false).finalizedHiragana()
                     val kataVersion = RomajiDetector.toKatakana(hiraVersion)
-                    val cands = linkedSetOf(seg.raw)
+                    // Lowercase-typed brand/proper nouns show their canonical casing (google -> Google);
+                    // the literal lowercase spelling stays as the next candidate.
+                    val preferProper = proper != null && seg.raw == lower && proper != lower
+                    val cands = if (preferProper) linkedSetOf(proper!!, seg.raw) else linkedSetOf(seg.raw)
                     if (proper != null) cands.add(proper)
                     cands.add(title)
                     cands.add(upper)
@@ -502,7 +645,7 @@ class CompositionSession(
                         cands.add(kataVersion)
                     }
                     val tempKey = "$segIdx:0:${seg.raw}:${seg.raw}"
-                    val chosen = selectedClauseTextByKey[tempKey] ?: seg.raw
+                    val chosen = selectedClauseTextByKey[tempKey] ?: cands.first()
                     displayClauses.add(
                         DisplayClause(
                             segmentIndex = segIdx,
@@ -550,14 +693,35 @@ class CompositionSession(
                     } else {
                         emptyList()
                     }
+                    val literalLocked = seg.startIndex in noTypoFixStarts
+                    val corrections = ArrayList<CandidateItem>()
+                    val correctionKana = HashSet<String>()
+                    fun addCorrection(fixedRaw: String, kana: String) {
+                        if (kana.isEmpty() || !correctionKana.add(kana) || corrections.size >= 3) return
+                        val text = converter.convertClauses(kana, segContext)?.joinToString("") { it.text } ?: kana
+                        corrections.add(
+                            CandidateItem(
+                                text = text,
+                                subtitle = "補正",
+                                kind = CandidateKind.CORRECTION,
+                                replaceStart = seg.startIndex,
+                                replaceEnd = seg.endIndex,
+                                replaceRaw = fixedRaw
+                            )
+                        )
+                    }
                     if (useTypoFix && seg.raw.all { it in 'a'..'z' || it in 'A'..'Z' }) {
                         val hasUnreadable = typoEngine.firstUnreadableOffset(rawLower, final = false) >= 0
                         if (hasUnreadable) {
                             val fix = typoEngine.fixUnreadable(rawLower, final = false, spatialWeights = segSpatial)
                             if (fix != null) {
-                                effectiveRaw = fix.right
-                                rawTypoFallback = RomajiDetector.analyze(rawLower, strictForDetection = false).finalizedHiragana()
-                                unreadableFixApplied = true
+                                if (literalLocked) {
+                                    addCorrection(fix.right, fix.kana)
+                                } else {
+                                    effectiveRaw = fix.right
+                                    rawTypoFallback = RomajiDetector.analyze(rawLower, strictForDetection = false).finalizedHiragana()
+                                    unreadableFixApplied = true
+                                }
                             }
                         }
                     }
@@ -594,12 +758,21 @@ class CompositionSession(
                                 convertibleHira.contains("くぉ")
                             val rawNotCohesive = !typoEngine.isKnownReading(convertibleHira) || rawSegCost >= 1.95
                             val minLenOk = rawLower.length >= 5 || (hasRareQCluster && rawLower.length >= 4)
-                            val canConsiderRewrite = top.isSingleWholeWord &&
+                            val wordRewrite = top.isSingleWholeWord &&
                                 minLenOk &&
                                 marginOk &&
                                 !typoEngine.isKnownWord(convertibleHira) &&
                                 !typoEngine.hasKnownReadingPrefix(convertibleHira) &&
                                 rawNotCohesive
+                            // Sentence-level rewrite: the typed reading contains an unknown piece, the fix
+                            // makes the whole reading known, and the tap actually landed near the fixed key.
+                            val sentenceRewrite = !wordRewrite &&
+                                rawLower.length >= 6 &&
+                                marginOk &&
+                                !typoEngine.isKnownReading(convertibleHira) &&
+                                typoEngine.isKnownReading(top.kana) &&
+                                spatiallySupported(rawLower, top.right, segSpatial)
+                            val canConsiderRewrite = !literalLocked && (wordRewrite || sentenceRewrite)
                             if (canConsiderRewrite) {
                                 // Double-check whether Mozc already converts the raw reading cleanly into Kanji (e.g. 電磁気 for でんじき).
                                 val rawMozc = converter.convertClauses(convertibleHira, segContext)
@@ -615,22 +788,32 @@ class CompositionSession(
                                     activeHira = top.kana
                                 }
                             }
-                            for (rf in readableFixes.take(2)) {
-                                converter.convertClauses(rf.kana, surroundingContext)?.joinToString("") { it.text }?.let {
-                                    didyouMeanForWholeSeg.add(it)
-                                }
-                                didyouMeanForWholeSeg.add(rf.kana)
+                            for (rf in readableFixes.take(3)) {
+                                if (rf.kana != activeHira) addCorrection(rf.right, rf.kana)
                             }
                         }
-                        // Add high-confidence spatial border suggestions ("もしかして") without overwriting valid words.
+                        // Spatial border suggestions (tap landed near the edge of a neighbor key).
                         val spatialAlts = typoEngine.suggestSpatialAlternatives(rawLower, activeHira, segSpatial)
                         for (alt in spatialAlts) {
-                            converter.convertClauses(alt.kana, segContext)?.joinToString("") { it.text }?.let {
-                                didyouMeanForWholeSeg.add(it)
-                            }
-                            didyouMeanForWholeSeg.add(alt.kana)
+                            if (alt.kana != activeHira) addCorrection(alt.right, alt.kana)
                         }
                     }
+                    val literalHira = rawTypoFallback
+                    if (literalHira != null && activeHira.isNotEmpty() && literalHira != activeHira) {
+                        // Auto-corrected: offer the literal reading as "そのまま".
+                        val literalText = converter.convertClauses(literalHira, segContext)?.joinToString("") { it.text }
+                            ?: literalHira
+                        corrections.add(
+                            0,
+                            CandidateItem(
+                                text = literalText,
+                                subtitle = "そのまま",
+                                kind = CandidateKind.CORRECTION,
+                                keepLiteralStart = seg.startIndex
+                            )
+                        )
+                    }
+                    if (corrections.isNotEmpty()) segmentCorrections[segIdx] = corrections
 
                     if (activeHira.isNotEmpty()) {
                         val lockedLens = customClauseSplits[segIdx]
@@ -667,8 +850,12 @@ class CompositionSession(
                             lockedClauses + tailClauses
                         } else {
                             if (lockedLens != null) customClauseSplits.remove(segIdx)
-                            converter.convertClauses(activeHira, segContext)
-                                ?: listOf(ConversionClause(activeHira, activeHira))
+                            val converted = if (segIdx == 0) {
+                                convertWithHistory(activeHira, segContext)
+                            } else {
+                                converter.convertClauses(activeHira, segContext)
+                            }
+                            converted ?: listOf(ConversionClause(activeHira, activeHira))
                         }
 
                         var readingCursor = 0
@@ -816,6 +1003,16 @@ class CompositionSession(
             }
         }
 
+        // Typo corrections ("補正") come right after the current conversion so they are visible
+        // without scrolling; the literal conversion stays first and on the space key.
+        val focusedCorrections = focused?.let { segmentCorrections[it.segmentIndex] }.orEmpty()
+            .filter { c -> c.text != focused?.text }
+            .distinctBy { it.text }
+        if (focusedCorrections.isNotEmpty()) {
+            val insertAt = if (barCandidates.isNotEmpty()) 1 else 0
+            barCandidates.addAll(insertAt, focusedCorrections)
+        }
+
         val scriptVariants = buildScriptVariants(focused, displayClauses.count { it.segmentIndex == focused?.segmentIndex })
         val nextClause = displayClauses.getOrNull(focusedClauseIdx + 1)
         val canShrink = focused != null && !focused.isEnglish && RomajiDetector.isHiraganaOnly(focused.reading) && focused.reading.length >= 2
@@ -918,6 +1115,12 @@ class CompositionSession(
     }
 
     companion object {
+        /** Google IME (Mozc) z-table. */
+        val Z_SYMBOLS = mapOf(
+            '.' to "…", ',' to "‥", '/' to "・", '-' to "〜", '[' to "『", ']' to "』",
+            'h' to "←", 'j' to "↓", 'k' to "↑", 'l' to "→"
+        )
+
         private val FULL_TO_HALF_KATA = mapOf(
             'ア' to "ｱ", 'イ' to "ｲ", 'ウ' to "ｳ", 'エ' to "ｴ", 'オ' to "ｵ",
             'カ' to "ｶ", 'キ' to "ｷ", 'ク' to "ｸ", 'ケ' to "ｹ", 'コ' to "ｺ",
