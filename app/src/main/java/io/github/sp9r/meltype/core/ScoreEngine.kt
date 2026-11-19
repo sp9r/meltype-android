@@ -80,8 +80,8 @@ class ScoreEngine(
                 continue
             }
 
-            // URL prefix or sigil tokens (/cmd, @mention, $var)
-            if (ch == '/' || ch == '@' || ch == '$') {
+            // URL prefix or sigil tokens (/cmd at token start, @mention, $var)
+            if ((ch == '/' && (i == 0 || input[i - 1].isWhitespace())) || ch == '@' || ch == '$') {
                 var end = i + 1
                 while (end < input.length && !input[end].isWhitespace()) end++
                 out.add(ScoredSegment(SegmentKind.LITERAL, input.substring(i, end), i, end))
@@ -99,9 +99,9 @@ class ScoreEngine(
                 continue
             }
 
-            // Model numbers / alphanumerics like RTX4090, iPhone16, M4, 128*16=
+            // Model numbers / alphanumerics like RTX4090, iPhone16, M4, 16GB, 4K
             if (isAsciiAlpha(ch) || ch.isDigit()) {
-                val modelEnd = detectModelNumberSpan(input, i)
+                val modelEnd = detectModelNumberSpan(input, i, overrides)
                 if (modelEnd > i) {
                     out.add(
                         ScoredSegment(
@@ -120,7 +120,13 @@ class ScoreEngine(
                 var end = i
                 while (end < input.length && isAsciiAlpha(input[end])) {
                     if (overrides.keys.any { it.first == end }) break
-                    if (end > i && detectModelNumberSpan(input, end) > end) break
+                    if (end > i) {
+                        val canSplitHere = input[end].isUpperCase() ||
+                            input[end - 1].lowercaseChar() in charArrayOf('a', 'i', 'u', 'e', 'o', 'n')
+                        if (canSplitHere && detectModelNumberSpan(input, end, overrides, requireExplicitPrefix = !input[end].isUpperCase()) > end) {
+                            break
+                        }
+                    }
                     end++
                 }
                 val alphaRun = input.substring(i, end)
@@ -145,7 +151,35 @@ class ScoreEngine(
                 continue
             }
 
-            // Other punctuation, digits, whitespace
+            // Numbers, decimals, fractions, and math expressions (1.6, 1/3, 40, 128*16=)
+            if (ch.isDigit()) {
+                var end = i + 1
+                while (end < input.length) {
+                    if (overrides.keys.any { it.first == end }) break
+                    val nc = input[end]
+                    if (nc.isDigit()) {
+                        end++
+                    } else if ((nc == '.' || nc == ',') && end + 1 < input.length && input[end + 1].isDigit() &&
+                        !overrides.keys.any { it.first == end + 1 }
+                    ) {
+                        end++
+                    } else if (nc in charArrayOf('+', '-', '*', '/') && end + 1 < input.length && input[end + 1].isDigit() &&
+                        !overrides.keys.any { it.first == end + 1 }
+                    ) {
+                        end++
+                    } else if (nc == '=' && input.substring(i, end).any { it in charArrayOf('+', '-', '*', '/') }) {
+                        end++
+                        break
+                    } else {
+                        break
+                    }
+                }
+                out.add(ScoredSegment(SegmentKind.LITERAL, input.substring(i, end), i, end))
+                i = end
+                continue
+            }
+
+            // Other punctuation, whitespace
             var end = i + 1
             while (end < input.length && !isAsciiAlpha(input[end]) && !isJapaneseScript(input[end]) &&
                 input[end] !in charArrayOf('/', '@', '$') && !input[end].isDigit()
@@ -645,6 +679,16 @@ class ScoreEngine(
             }
         }
 
+        // Guard against English splits inside a locally readable Japanese run (even when a typo
+        // elsewhere in the run breaks whole-run Japanese detection, e.g. "onqjikuraino" -> "rain",
+        // or "sent"/"hose" inside a long Japanese sentence ending in a typo).
+        if (!hasUppercase && !isProper && sub !in READABLE_EMBEDDED_BRANDS &&
+            (prevIdx > 0 || nextPos < totalLen) &&
+            isInsideLocalJapaneseRun(fullRun, prevIdx, nextPos)
+        ) {
+            return -5.0
+        }
+
         if (hasUppercase) score += 4.0
 
         // Context boundary check: preceded by boundary/particle, followed by end/particle
@@ -667,32 +711,223 @@ class ScoreEngine(
         return score
     }
 
-    private fun detectModelNumberSpan(input: String, start: Int): Int {
-        var idx = start
-        var hasLetter = false
-        var hasDigit = false
-        while (idx < input.length) {
-            val c = input[idx]
-            if (isAsciiAlpha(c)) {
-                // Stop if we already saw digits followed by lowercase Japanese particle like "4090wo" -> split after 4090
-                if (hasDigit && c.isLowerCase()) {
-                    val rest = input.substring(idx).lowercase()
-                    if (PARTICLES.any { rest.startsWith(it) } || rest.startsWith("de") || rest.startsWith("kara")) {
-                        break
-                    }
-                }
-                hasLetter = true
-                idx++
-            } else if (c.isDigit()) {
-                hasDigit = true
-                idx++
-            } else if ((c == '-' || c == '_') && idx + 1 < input.length && (isAsciiAlpha(input[idx + 1]) || input[idx + 1].isDigit())) {
-                idx++
+    private fun isInsideLocalJapaneseRun(fullRun: String, prevIdx: Int, nextPos: Int): Boolean {
+        fun isJpLetterAt(k: Int): Boolean {
+            val c = fullRun[k]
+            if (c !in 'a'..'z') return false
+            if (c == 'l' || c == 'q' || c == 'x' || c == 'v') return false
+            if (c == 'c' && fullRun.getOrNull(k + 1) != 'h') return false
+            return true
+        }
+        for (k in prevIdx until nextPos) {
+            if (!isJpLetterAt(k)) return false
+        }
+        var lo = prevIdx
+        while (lo > 0 && isJpLetterAt(lo - 1)) lo--
+        var hi = nextPos
+        while (hi < fullRun.length && isJpLetterAt(hi)) hi++
+
+        while (lo < prevIdx || hi > nextPos) {
+            val slice = fullRun.substring(lo, hi)
+            val bad = typoEngine.firstUnreadableOffset(slice, final = (hi == fullRun.length))
+            if (bad < 0) break
+            val absBad = lo + bad
+            if (absBad < prevIdx) {
+                lo = absBad + 1
+            } else if (absBad >= nextPos) {
+                hi = absBad
             } else {
-                break
+                return false
             }
         }
-        return if (hasLetter && hasDigit) idx else -1
+        if (hi - lo <= nextPos - prevIdx) return false
+        val slice = fullRun.substring(lo, hi)
+        if (!isJapaneseFirstRun(slice, slice, endedByDelimiter = (hi == fullRun.length), touchesLongVowel = false)) {
+            return false
+        }
+        val precededByParticle = prevIdx == lo || PARTICLES.any { fullRun.substring(lo, prevIdx).endsWith(it) }
+        val followedByParticle = nextPos == hi || CASE_PARTICLES.any { fullRun.startsWith(it, nextPos) }
+        val subLast = fullRun[nextPos - 1]
+        val splitsSyllable = nextPos < hi &&
+            subLast !in charArrayOf('a', 'i', 'u', 'e', 'o', 'n') &&
+            fullRun[nextPos] in charArrayOf('a', 'i', 'u', 'e', 'o', 'y')
+        return splitsSyllable || !precededByParticle || !followedByParticle
+    }
+
+    private fun detectModelNumberSpan(
+        input: String,
+        start: Int,
+        overrides: Map<IntRange, SegmentKind> = emptyMap(),
+        requireExplicitPrefix: Boolean = false
+    ): Int {
+        fun hasOverrideAt(pos: Int): Boolean = overrides.keys.any { it.first == pos }
+        if (start >= input.length) return -1
+        val first = input[start]
+
+        if (isAsciiAlpha(first)) {
+            var alphaEnd = start
+            while (alphaEnd < input.length && isAsciiAlpha(input[alphaEnd]) && !hasOverrideAt(alphaEnd)) {
+                alphaEnd++
+            }
+            if (alphaEnd >= input.length) return -1
+            var idx = alphaEnd
+            if ((input[idx] == '-' || input[idx] == '_') && idx + 1 < input.length &&
+                input[idx + 1].isDigit() && !hasOverrideAt(idx) && !hasOverrideAt(idx + 1)
+            ) {
+                idx++
+            }
+            if (idx >= input.length || !input[idx].isDigit() || hasOverrideAt(idx)) return -1
+
+            val prefix = input.substring(start, alphaEnd)
+            val prefixLower = prefix.lowercase()
+            val hasUpper = prefix.any { it.isUpperCase() }
+            if (requireExplicitPrefix && !hasUpper && !(prefix.length >= 2 && prefixLower in TECH_MODEL_PREFIXES)) {
+                return -1
+            }
+            if (!hasUpper && prefix.length >= 2 && prefixLower !in TECH_MODEL_PREFIXES) {
+                val a = RomajiDetector.analyze(prefixLower, strictForDetection = true)
+                if ((a.isStrictValid && a.pendingTail.isEmpty()) ||
+                    dictionaries.englishAllWords.contains(prefixLower) ||
+                    dictionaries.properNounCanonical.containsKey(prefixLower)
+                ) {
+                    return -1
+                }
+            }
+
+            while (idx < input.length && !hasOverrideAt(idx)) {
+                val c = input[idx]
+                if (c.isDigit()) {
+                    idx++
+                } else if ((c == '-' || c == '_' || c == '.') && idx + 1 < input.length && !hasOverrideAt(idx + 1) &&
+                    (input[idx + 1].isDigit() || (c != '.' && isAsciiAlpha(input[idx + 1])))
+                ) {
+                    if (c != '.' && isAsciiAlpha(input[idx + 1])) {
+                        var aEnd = idx + 1
+                        while (aEnd < input.length && isAsciiAlpha(input[aEnd]) && !hasOverrideAt(aEnd)) aEnd++
+                        val rem = input.substring(idx + 1, aEnd).lowercase()
+                        if (PARTICLES.any { rem.startsWith(it) } || rem.startsWith("de") || rem.startsWith("kara")) {
+                            break
+                        }
+                    }
+                    idx++
+                } else if (isAsciiAlpha(c)) {
+                    var aEnd = idx
+                    while (aEnd < input.length && isAsciiAlpha(input[aEnd]) && !hasOverrideAt(aEnd)) aEnd++
+                    val tail = input.substring(idx, aEnd)
+                    val tailLower = tail.lowercase()
+                    if (PARTICLES.any { tailLower.startsWith(it) } || tailLower.startsWith("de") || tailLower.startsWith("kara")) {
+                        break
+                    }
+                    if (tail.any { it.isUpperCase() }) {
+                        var p = idx
+                        var seenUp = false
+                        while (p < aEnd) {
+                            if (input[p].isUpperCase()) {
+                                seenUp = true
+                            } else if (seenUp) {
+                                val rem = input.substring(p, aEnd).lowercase()
+                                if (PARTICLES.any { rem.startsWith(it) } || rem.startsWith("de") || rem.startsWith("kara")) {
+                                    break
+                                }
+                            }
+                            p++
+                        }
+                        idx = p
+                        if (idx < aEnd) break
+                    } else if (tailLower in NUMERIC_UNIT_SUFFIXES) {
+                        idx = aEnd
+                    } else {
+                        val unitMatch = NUMERIC_UNIT_SUFFIXES.filter { it.length >= 2 && tailLower.startsWith(it) }
+                            .sortedByDescending { it.length }
+                            .firstOrNull { u ->
+                                val rem = tailLower.substring(u.length)
+                                PARTICLES.any { rem.startsWith(it) } || rem.startsWith("de") || rem.startsWith("kara")
+                            }
+                        if (unitMatch != null) {
+                            idx += unitMatch.length
+                            break
+                        }
+                        if (aEnd < input.length && input[aEnd].isDigit() && !hasOverrideAt(aEnd)) {
+                            idx = aEnd
+                        } else {
+                            val ta = RomajiDetector.analyze(tailLower, strictForDetection = true)
+                            if (ta.isStrictValid && (ta.pendingTail.isEmpty() || ta.pendingTail == "n")) {
+                                break
+                            }
+                            idx = aEnd
+                        }
+                    }
+                } else {
+                    break
+                }
+            }
+            return idx
+        }
+
+        if (first.isDigit()) {
+            var numEnd = start
+            while (numEnd < input.length && !hasOverrideAt(numEnd)) {
+                val c = input[numEnd]
+                if (c.isDigit()) {
+                    numEnd++
+                } else if (c == '.' && numEnd + 1 < input.length && input[numEnd + 1].isDigit() && !hasOverrideAt(numEnd + 1)) {
+                    numEnd++
+                } else {
+                    break
+                }
+            }
+            if (numEnd >= input.length || !isAsciiAlpha(input[numEnd]) || hasOverrideAt(numEnd)) return -1
+
+            var alphaEnd = numEnd
+            while (alphaEnd < input.length && isAsciiAlpha(input[alphaEnd]) && !hasOverrideAt(alphaEnd)) {
+                alphaEnd++
+            }
+            val tail = input.substring(numEnd, alphaEnd)
+            val tailLower = tail.lowercase()
+
+            if (tail.any { it.isUpperCase() }) {
+                var p = numEnd
+                var seenUp = false
+                while (p < alphaEnd) {
+                    if (input[p].isUpperCase()) {
+                        seenUp = true
+                    } else if (seenUp) {
+                        val rem = input.substring(p, alphaEnd).lowercase()
+                        if (PARTICLES.any { rem.startsWith(it) } || rem.startsWith("de") || rem.startsWith("kara")) {
+                            break
+                        }
+                    }
+                    p++
+                }
+                if (p > numEnd && seenUp) return p
+            }
+            if (tailLower in NUMERIC_UNIT_SUFFIXES) {
+                return alphaEnd
+            }
+            val unitPrefix = NUMERIC_UNIT_SUFFIXES.filter { it.length >= 2 && tailLower.startsWith(it) }
+                .sortedByDescending { it.length }
+                .firstOrNull { u ->
+                    val rem = tailLower.substring(u.length)
+                    PARTICLES.any { rem.startsWith(it) } || rem.startsWith("de") || rem.startsWith("kara")
+                }
+            if (unitPrefix != null) {
+                return numEnd + unitPrefix.length
+            }
+            if (alphaEnd < input.length && input[alphaEnd].isDigit() && !hasOverrideAt(alphaEnd)) {
+                var idx = alphaEnd
+                while (idx < input.length && !hasOverrideAt(idx) &&
+                    (input[idx].isDigit() || isAsciiAlpha(input[idx]) ||
+                        ((input[idx] == '-' || input[idx] == '_') && idx + 1 < input.length &&
+                            (input[idx + 1].isDigit() || isAsciiAlpha(input[idx + 1]))))
+                ) {
+                    idx++
+                }
+                return idx
+            }
+            return -1
+        }
+
+        return -1
     }
 
     private fun isJapaneseFirstRun(
@@ -728,6 +963,18 @@ class ScoreEngine(
         private val PARTICLES = listOf("kara", "made", "ha", "ga", "wo", "ni", "de", "to", "no", "mo", "wa", "he", "ya")
         private val CASE_PARTICLES = listOf("kara", "made", "ha", "ga", "wo", "ni", "de", "mo")
         private val COMMON_COLLIDING_KANA = setOf("での", "みろ", "ので", "しり", "すいか", "かれん", "まや", "かめん", "かれ", "くれ", "とり", "もり")
+        private val TECH_MODEL_PREFIXES = setOf(
+            "v", "p", "q", "x", "h", "usb", "ps", "mp", "utf", "gpt", "api", "http", "ipv",
+            "sha", "md", "iso", "arm", "win", "ios", "macos", "qwen", "llama", "cuda", "avx",
+            "ddr", "ssd", "hdd", "pcie", "hdmi", "wifi", "cat", "px", "dp", "sp",
+            "m", "a", "b", "c", "s", "r", "e", "f", "g", "i", "k", "l", "n", "t", "u", "w", "z"
+        )
+        private val NUMERIC_UNIT_SUFFIXES = setOf(
+            "st", "nd", "rd", "th", "gb", "mb", "kb", "tb", "pb", "hz", "khz", "mhz", "ghz",
+            "px", "dp", "sp", "cm", "mm", "km", "kg", "mg", "ml", "ms", "us", "ns", "fps",
+            "rpm", "bps", "kbps", "mbps", "gbps", "bit", "ch", "mah", "kwh", "mw", "kw", "db",
+            "pt", "em", "rem", "vw", "vh", "d", "k", "g", "m", "s", "h", "v", "w", "a", "l", "x"
+        )
 
         private fun isStrictJapaneseRomaji(analysis: RomajiAnalysis): Boolean {
             return analysis.isStrictValid && (analysis.pendingTail.isEmpty() || analysis.pendingTail == "n")

@@ -296,6 +296,15 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             visibility = View.GONE
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
             setPadding(dp(6), dp(3), dp(6), dp(3))
+            setOnClickListener {
+                if (session.isEmpty) return@setOnClickListener
+                if (session.snapshot.isEditing) {
+                    renderSnapshot(session.startConversion(getSurroundingTextBefore()))
+                } else {
+                    noteFix("caret", conversionFix = false)
+                    renderSnapshot(session.moveCaret(-1, getSurroundingTextBefore()))
+                }
+            }
         }
 
         candidateScroll = HorizontalScrollView(this).apply {
@@ -1220,9 +1229,10 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             renderSnapshot(session.startConversion(getSurroundingTextBefore()))
             return
         }
-        val lastIsEnglish = snap.clauses.lastOrNull()?.isEnglish == true
+        val singlePureEnglishWord = snap.clauses.size == 1 && snap.clauses[0].isEnglish &&
+            snap.clauses[0].raw.all { it in 'a'..'z' || it in 'A'..'Z' || it == '\'' }
         val alreadyHasSpace = snap.rawInput.contains(' ')
-        if (!snap.isConverting && (lastIsEnglish || alreadyHasSpace)) {
+        if (!snap.isConverting && (singlePureEnglishWord || alreadyHasSpace)) {
             val next = session.appendChar(' ', getSurroundingTextBefore())
             renderSnapshot(next)
             return
@@ -1283,17 +1293,28 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
     }
 
     override fun onMoveCursor(delta: Int) {
-        if (!session.isEmpty && !session.snapshot.isConverting) {
+        if (!session.isEmpty && session.snapshot.isEditing) {
             noteFix("caret", conversionFix = false)
-            // Before conversion the arrows move a caret inside the composition (conversion stays shown).
             renderSnapshot(session.moveCaret(delta, getSurroundingTextBefore()))
             return
         }
         if (!session.isEmpty) {
-            // While converting, ◀▶ shorten / lengthen the focused clause (English words included).
-            // The focus moves with ‹ › on the clause bar or by tapping a clause.
+            // While converting (or live-converting), ◀▶ shorten / lengthen the focused clause (including alphanumeric).
+            // The focus moves with ‹ › on the clause bar or by tapping a clause; Spacebar slide / reading badge moves the caret.
             noteFix("resize")
             renderSnapshot(session.resizeFocusedClause(delta, getSurroundingTextBefore()))
+        } else {
+            clearUndoCommit()
+            val code = if (delta < 0) KeyEvent.KEYCODE_DPAD_LEFT else KeyEvent.KEYCODE_DPAD_RIGHT
+            sendDownUpKeyEvents(code)
+            renderSnapshot(session.snapshot)
+        }
+    }
+
+    override fun onSpaceSlideCursor(delta: Int) {
+        if (!session.isEmpty) {
+            noteFix("caret", conversionFix = false)
+            renderSnapshot(session.moveCaret(delta, getSurroundingTextBefore()))
         } else {
             clearUndoCommit()
             val code = if (delta < 0) KeyEvent.KEYCODE_DPAD_LEFT else KeyEvent.KEYCODE_DPAD_RIGHT
@@ -1532,6 +1553,9 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             fixAutoPreview = null
             fixActions.clear()
         }
+        if (::keyboardView.isInitialized) {
+            keyboardView.arrowResizeMode = snap.isComposing && !snap.isEditing
+        }
         val dark = isDarkTheme()
         val accent = if (dark) Color.parseColor("#5C8AC4") else Color.parseColor("#4A6F9E")
         val focusBgSpan = if (dark) Color.argb(90, 92, 138, 196) else Color.argb(65, 74, 111, 158)
@@ -1730,7 +1754,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
                     val single = Runnable {
                         pillSingleTap = null
                         if (session.isEmpty || idx > session.snapshot.clauses.lastIndex) return@Runnable
-                        if (session.snapshot.focusedClauseIndex == idx) {
+                        if (session.snapshot.focusedClauseIndex == idx && session.snapshot.isConverting) {
                             expandedTab = ExpandedTab.CANDIDATES
                             isExpandedPanelOpen = !isExpandedPanelOpen
                             syncExpandedPanelState(session.snapshot)
@@ -2957,12 +2981,12 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         )
         addButtonRow(
             listOf(
-                "◀ 左" to { onMoveCursor(-1) },
+                "◀ 左" to { onSpaceSlideCursor(-1) },
                 "▼ 下" to {
                     clearUndoCommit()
                     sendDownUpKeyEvents(KeyEvent.KEYCODE_DPAD_DOWN)
                 },
-                "▶ 右" to { onMoveCursor(1) }
+                "▶ 右" to { onSpaceSlideCursor(1) }
             )
         )
         addButtonRow(

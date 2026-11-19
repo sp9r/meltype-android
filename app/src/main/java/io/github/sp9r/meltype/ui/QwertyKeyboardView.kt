@@ -31,6 +31,9 @@ interface KeyboardActionListener {
     fun onSpace()
     fun onEnter()
     fun onMoveCursor(delta: Int)
+    fun onSpaceSlideCursor(delta: Int) {
+        onMoveCursor(delta)
+    }
     fun onMoveCursor2D(dx: Int, dy: Int) {
         if (dx != 0) onMoveCursor(dx)
     }
@@ -95,6 +98,14 @@ class QwertyKeyboardView @JvmOverloads constructor(
             if (field != value) {
                 field = value
                 rebuildLayout()
+                invalidate()
+            }
+        }
+    /** True while composing (not caret-editing): arrow keys show "短"/"長" for clause boundary resizing. */
+    var arrowResizeMode: Boolean = false
+        set(value) {
+            if (field != value) {
+                field = value
                 invalidate()
             }
         }
@@ -666,13 +677,18 @@ class QwertyKeyboardView @JvmOverloads constructor(
             }
 
             if (showSubLabels && k.subLabel.isNotEmpty()) {
+                val drawnSub = when {
+                    arrowResizeMode && k.kind == KeyKind.CURSOR_LEFT -> "短"
+                    arrowResizeMode && k.kind == KeyKind.CURSOR_RIGHT -> "長"
+                    else -> k.subLabel
+                }
                 paintSubText.color = cSubText
                 paintSubText.textSize = sp(9f)
-                if (k.subLabel == SmileyIcon.GLYPH) {
+                if (drawnSub == SmileyIcon.GLYPH) {
                     SmileyIcon.draw(canvas, k.rect.right - dp(8.5f), k.rect.top + dp(8f), dp(4.6f), cSubText)
                 } else {
                     canvas.drawText(
-                        k.subLabel,
+                        drawnSub,
                         k.rect.right - dp(3.5f),
                         k.rect.top + dp(10.5f),
                         paintSubText
@@ -810,7 +826,7 @@ class QwertyKeyboardView @JvmOverloads constructor(
                             val dir = if (totalDx > 0f) 1 else -1
                             spaceSlideAccumX = 0f
                             performHaptic()
-                            listener?.onMoveCursor(dir)
+                            listener?.onSpaceSlideCursor(dir)
                         }
                     } else {
                         spaceSlideAccumX += dx
@@ -819,7 +835,7 @@ class QwertyKeyboardView @JvmOverloads constructor(
                             val dir = if (spaceSlideAccumX > 0f) 1 else -1
                             spaceSlideAccumX -= dir * step
                             performHaptic()
-                            listener?.onMoveCursor(dir)
+                            listener?.onSpaceSlideCursor(dir)
                         }
                     }
                     lastX = x

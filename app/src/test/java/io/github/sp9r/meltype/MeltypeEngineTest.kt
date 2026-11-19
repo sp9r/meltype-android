@@ -839,4 +839,142 @@ class MeltypeEngineTest {
         assertTrue(ext.clauses[en2 - 1].reading, ext.clauses[en2 - 1].reading.endsWith("ご"))
         assertEquals("ogle", ext.clauses.first { it.isEnglish }.raw)
     }
+
+    @Test
+    fun numericAndCounterSegmentationPreservesModelNumbers() {
+        val converter = AndroidMozcConverter(dictionaries)
+
+        fun assertSegs(input: String, expected: List<Pair<SegmentKind, String>>) {
+            val segs = scoreEngine.segment(input)
+            val actual = segs.map { it.kind to it.raw }
+            assertEquals("Segmentation mismatch for '$input': $segs", expected, actual)
+        }
+
+        assertSegs("1.6mann", listOf(SegmentKind.LITERAL to "1.6", SegmentKind.JAPANESE to "mann"))
+        assertSegs("20mann", listOf(SegmentKind.LITERAL to "20", SegmentKind.JAPANESE to "mann"))
+        assertSegs("1nenn", listOf(SegmentKind.LITERAL to "1", SegmentKind.JAPANESE to "nenn"))
+        assertSegs("tuki6mann", listOf(SegmentKind.JAPANESE to "tuki", SegmentKind.LITERAL to "6", SegmentKind.JAPANESE to "mann"))
+        assertSegs("12gatuga", listOf(SegmentKind.LITERAL to "12", SegmentKind.JAPANESE to "gatuga"))
+        assertSegs("40", listOf(SegmentKind.LITERAL to "40"))
+        assertSegs("3.6", listOf(SegmentKind.LITERAL to "3.6"))
+        assertSegs("1/3wo", listOf(SegmentKind.LITERAL to "1/3", SegmentKind.JAPANESE to "wo"))
+
+        val fracSess = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "1/3") fracSess.appendChar(ch)
+        assertEquals("1/3", fracSess.snapshot.previewText)
+
+        val eqSess = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "128*16=") eqSess.appendChar(ch)
+        assertEquals("2048", eqSess.snapshot.previewText)
+
+        val bareSess = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "128*16") bareSess.appendChar(ch)
+        assertEquals("128*16", bareSess.snapshot.previewText)
+        assertTrue(
+            "Expected 2048 in candidates for 128*16: ${bareSess.snapshot.candidates.map { it.text }}",
+            bareSess.snapshot.candidates.any { it.text == "2048" }
+        )
+
+        assertSegs("RTX4090wokau", listOf(SegmentKind.ENGLISH to "RTX4090", SegmentKind.JAPANESE to "wokau"))
+        assertSegs("iPhone16", listOf(SegmentKind.ENGLISH to "iPhone16"))
+        assertSegs("16GB", listOf(SegmentKind.ENGLISH to "16GB"))
+        assertSegs("4K", listOf(SegmentKind.ENGLISH to "4K"))
+        assertSegs("M4", listOf(SegmentKind.ENGLISH to "M4"))
+    }
+
+    @Test
+    fun localJapaneseGuardBlocksEnglishSplitsNextToTypos() {
+        val converter = AndroidMozcConverter(dictionaries)
+
+        val onajiSegs = scoreEngine.segment("onqjikuraino")
+        assertTrue(
+            "onqjikuraino must not carve English 'rain': $onajiSegs",
+            onajiSegs.none { it.kind == SegmentKind.ENGLISH && it.raw == "rain" }
+        )
+        val onajiSess = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "onqjikuraino") onajiSess.appendChar(ch)
+        assertFalse(onajiSess.snapshot.previewText.contains("rain"))
+        assertTrue(
+            "Expected おなじくらいの reading/preview, got ${onajiSess.snapshot.clauses.map { it.reading }} / ${onajiSess.snapshot.previewText}",
+            onajiSess.snapshot.clauses.joinToString("") { it.reading } == "おなじくらいの" ||
+                onajiSess.snapshot.previewText.contains("同じくらいの")
+        )
+
+        val sentSegs = scoreEngine.segment("heyanonakanisentakumonowohoserutokoroxzq")
+        assertTrue(
+            "Long Japanese sentence ending in typo must not split 'sent' or 'hose': $sentSegs",
+            sentSegs.none { it.kind == SegmentKind.ENGLISH && (it.raw == "sent" || it.raw == "hose") }
+        )
+
+        // Real embedded English words remain intact
+        assertTrue(scoreEngine.segment("kyouhagoogledekensaku").any { it.kind == SegmentKind.ENGLISH && it.raw == "google" })
+        assertTrue(scoreEngine.segment("ashitanomeetingwotsuika").any { it.kind == SegmentKind.ENGLISH && it.raw == "meeting" })
+        assertTrue(scoreEngine.segment("youtubewomiru").any { it.kind == SegmentKind.ENGLISH && it.raw == "youtube" })
+        assertTrue(scoreEngine.segment("claudenikiitemiru").any { it.kind == SegmentKind.ENGLISH && it.raw == "claude" })
+    }
+
+    @Test
+    fun alphanumericAndLiteralClausesWidenShrinkAndShowBoundaryBar() {
+        val converter = AndroidMozcConverter(dictionaries)
+
+        // 1. Decimal literal "3.6" shrinks to "3." + "6" and widens back to "3.6"
+        val decSess = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "3.6") decSess.appendChar(ch)
+        val decShrunk = decSess.resizeFocusedClause(-1)
+        assertEquals(listOf("3.", "6"), decShrunk.clauses.map { it.raw })
+        assertTrue(decShrunk.clauses.all { it.isEnglish })
+        assertTrue(decShrunk.canExtendClause)
+        assertTrue(decShrunk.isConverting)
+        val decWidened = decSess.resizeFocusedClause(+1)
+        assertEquals(listOf("3.6"), decWidened.clauses.map { it.raw })
+
+        // 2. "1.6mann" focused on "1.6": boundary bar chips, widen +1 -> "1.6m" + "あん", snap -> "1.6ma", shrink back -> "1.6" + "まん"
+        val mannSess = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "1.6mann") mannSess.appendChar(ch)
+        val focused16 = mannSess.focusClause(0)
+        assertTrue(focused16.canExtendClause)
+        assertEquals("1.6mann", focused16.focusedAdjustableKana)
+        assertEquals(3, focused16.focusedAdjustableLen)
+
+        val widened1 = mannSess.resizeFocusedClause(+1)
+        assertEquals("1.6m", widened1.clauses[0].raw)
+        assertEquals("あん", widened1.clauses.drop(1).joinToString("") { it.reading })
+
+        val snapped5 = mannSess.setFocusedClauseLength(5)
+        assertEquals("1.6ma", snapped5.clauses[0].raw)
+        assertEquals("ん", snapped5.clauses.drop(1).joinToString("") { it.reading })
+
+        mannSess.resizeFocusedClause(-1)
+        val restored16 = mannSess.resizeFocusedClause(-1)
+        assertEquals("1.6", restored16.clauses[0].raw)
+        assertEquals("まん", restored16.clauses.drop(1).joinToString("") { it.reading })
+
+        // 3. "google123" widens from "google" into LITERAL digits -> "google1"
+        val gSess = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "google123") gSess.appendChar(ch)
+        gSess.focusClause(0)
+        assertTrue(gSess.snapshot.canExtendClause)
+        val gWide = gSess.resizeFocusedClause(+1)
+        assertEquals("google1", gWide.clauses[0].raw)
+        assertEquals("23", gWide.clauses[1].raw)
+
+        // 4. "tuki6" Japanese clause widens into adjacent LITERAL "6"
+        val tSess = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "tuki6") tSess.appendChar(ch)
+        tSess.focusClause(0)
+        assertTrue(tSess.snapshot.canExtendClause)
+        val tWide = tSess.resizeFocusedClause(+1)
+        assertEquals("つき6", tWide.clauses[0].reading)
+
+        // 5. Language toggle and split updates enter conversion mode
+        val togSess = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "kyouha") togSess.appendChar(ch)
+        assertFalse(togSess.snapshot.isConverting)
+        assertTrue(togSess.toggleFocusedSegmentLanguage().isConverting)
+
+        val splitSess = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "kyouha") splitSess.appendChar(ch)
+        assertFalse(splitSess.snapshot.isConverting)
+        assertTrue(splitSess.setFocusedClauseLength(2).isConverting)
+    }
 }
