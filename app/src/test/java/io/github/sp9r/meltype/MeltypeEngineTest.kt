@@ -745,6 +745,23 @@ class MeltypeEngineTest {
     }
 
     @Test
+    fun upDownArrowsMoveCaretToCompositionEdgesWithoutCommit() {
+        val converter = AndroidMozcConverter(dictionaries)
+        val s = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "kyouhaame") s.appendChar(ch)
+        val top = s.moveCaretToEdge(start = true)
+        assertTrue(top.isComposing)
+        assertTrue(top.isEditing)
+        assertEquals(0, top.editKanaCaret)
+        assertEquals("kyouhaame", top.rawInput)
+        s.appendChar('a')
+        assertEquals("あきょうはあめ", s.snapshot.editKana)
+        val bottom = s.moveCaretToEdge(start = false)
+        assertFalse(bottom.isEditing)
+        assertEquals("akyouhaame", bottom.rawInput)
+    }
+
+    @Test
     fun caretEditsInsideCompositionBeforeConversion() {
         val converter = AndroidMozcConverter(dictionaries)
         val s = CompositionSession(dictionaries, scoreEngine, converter)

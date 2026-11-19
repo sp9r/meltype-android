@@ -13,6 +13,7 @@ import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.StateListDrawable
 import android.inputmethodservice.InputMethodService
 import android.os.Build
+import android.os.SystemClock
 import android.text.SpannableString
 import android.text.Spanned
 import android.text.TextUtils
@@ -147,7 +148,12 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
     override fun onCreate() {
         super.onCreate()
         settings = MeltypeSettings(this)
+        settings.migrateV170()
         evalLogger = GlideEvalLogger(filesDir)
+        try {
+            (getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager)?.addPrimaryClipChangedListener(clipListener)
+        } catch (_: Throwable) {
+        }
         dictionaries = AppEngineHolder.getDictionaries(this)
         emojiCatalog = AppEngineHolder.getEmojiCatalog(this)
         scoreEngine = ScoreEngine(dictionaries, typoCorrectionEnabled = { settings.typoCorrectionEnabled })
@@ -246,7 +252,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             minWidth = dp(52)
             setPadding(dp(8), dp(3), dp(8), dp(3))
             setOnClickListener {
-                renderSnapshot(session.resizeFocusedClause(-1, getSurroundingTextBefore()))
+                noteFix("resize"); renderSnapshot(session.resizeFocusedClause(-1, getSurroundingTextBefore()))
             }
         }
         boundaryScroll = HorizontalScrollView(this).apply {
@@ -265,7 +271,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             minWidth = dp(52)
             setPadding(dp(8), dp(3), dp(8), dp(3))
             setOnClickListener {
-                renderSnapshot(session.resizeFocusedClause(+1, getSurroundingTextBefore()))
+                noteFix("resize"); renderSnapshot(session.resizeFocusedClause(+1, getSurroundingTextBefore()))
             }
         }
         boundaryBar.addView(shrinkClauseBtn)
@@ -427,11 +433,21 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         return rootContainer
     }
 
+    private var pillTapIdx = -1
+    private var pillSingleTap: Runnable? = null
+    private val pillHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private var pillTapTime = 0L
+
     private var isPasswordField: Boolean = false
+    private var isIncognitoField: Boolean = false
+
+    private fun isIncognito(info: EditorInfo?): Boolean =
+        info != null && (info.imeOptions and EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING) != 0
 
     override fun onStartInput(attribute: EditorInfo?, restarting: Boolean) {
         super.onStartInput(attribute, restarting)
         isPasswordField = isPasswordInputType(attribute)
+        isIncognitoField = isIncognito(attribute)
         if (!restarting && ::session.isInitialized) {
             session.clearAll()
             clearUndoCommit()
@@ -441,6 +457,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
     override fun onStartInputView(info: EditorInfo?, restarting: Boolean) {
         super.onStartInputView(info, restarting)
         isPasswordField = isPasswordInputType(info)
+        isIncognitoField = isIncognito(info)
         isExpandedPanelOpen = false
         isEmojiSearchActive = false
         emojiSearchQuery.setLength(0)
@@ -464,12 +481,66 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             val clip = cm.primaryClip ?: return
             if (clip.itemCount > 0) {
                 val txt = clip.getItemAt(0)?.coerceToText(this)?.toString()?.trim()
-                if (!txt.isNullOrEmpty() && txt.length <= 500) {
+                val sensitive = isSensitiveClip(clip.description)
+                if (!txt.isNullOrEmpty() && txt.length <= 500 && !sensitive) {
                     settings.addClipboardItem(txt)
                 }
+                offerPaste(txt, clip.description, sensitive)
             }
         } catch (_: Throwable) {
         }
+    }
+
+    // Paste suggestion: text copied in another app shows up at the head of the idle candidate bar.
+    private var pasteOfferText: String? = null
+    private var pasteOfferSince = 0L
+    private var lastHandledClip: String? = null
+
+    private val clipListener = ClipboardManager.OnPrimaryClipChangedListener {
+        captureClipboardText()
+        if (::candidateRow.isInitialized && session.isEmpty) renderSnapshot(session.snapshot)
+    }
+
+    private fun isSensitiveClip(desc: android.content.ClipDescription?): Boolean {
+        val extras = desc?.extras ?: return false
+        return extras.getBoolean("android.content.extra.IS_SENSITIVE", false)
+    }
+
+    private fun offerPaste(txt: String?, desc: android.content.ClipDescription?, sensitive: Boolean) {
+        if (txt.isNullOrEmpty() || sensitive || txt == lastHandledClip) return
+        val now = SystemClock.elapsedRealtime()
+        val ts = if (Build.VERSION.SDK_INT >= 26 && desc != null) desc.timestamp else 0L
+        // The copy time is wall-clock on recent Android; accept either time base.
+        val age = when {
+            ts <= 0L -> 0L
+            ts > now + PASTE_OFFER_MS -> System.currentTimeMillis() - ts
+            else -> now - ts
+        }
+        // Only a fresh copy is offered; an old clip left on the clipboard is not.
+        if (age > PASTE_OFFER_MS) return
+        val copiedAt = now - age.coerceAtLeast(0L)
+        if (txt != pasteOfferText) {
+            pasteOfferText = txt
+            pasteOfferSince = copiedAt
+        }
+    }
+
+    private fun currentPasteOffer(): String? {
+        val t = pasteOfferText ?: return null
+        if (isPasswordField || SystemClock.elapsedRealtime() - pasteOfferSince > PASTE_OFFER_MS) {
+            pasteOfferText = null
+            return null
+        }
+        return t
+    }
+
+    private fun pasteOffered(text: String) {
+        lastHandledClip = text
+        pasteOfferText = null
+        clearUndoCommit()
+        currentInputConnection?.commitText(text, 1)
+        if (shouldLogEval()) evalLogger.logEvent("paste", text.length.toString(), "")
+        renderSnapshot(session.snapshot)
     }
 
     private fun isPasswordInputType(info: EditorInfo?): Boolean {
@@ -497,7 +568,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             if (committed.isNotEmpty()) {
                 currentInputConnection?.commitText(committed, 1)
                 if (shouldLogEval()) {
-                    evalLogger.logCommit(settings.activePromptId, raw, committed, "finish_view")
+                    logCommitDetail(raw, committed, "finish_view")
                 }
             }
         }
@@ -505,6 +576,10 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
     }
 
     override fun onDestroy() {
+        try {
+            (getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager)?.removePrimaryClipChangedListener(clipListener)
+        } catch (_: Throwable) {
+        }
         bgExecutor.shutdownNow()
         glidePreviewExecutor.shutdownNow()
         super.onDestroy()
@@ -622,7 +697,32 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
     }
 
     private fun shouldLogEval(): Boolean =
-        ::settings.isInitialized && ::evalLogger.isInitialized && !isPasswordField && settings.glideEvalLoggingEnabled
+        ::settings.isInitialized && ::evalLogger.isInitialized && !isPasswordField && !isIncognitoField &&
+            (settings.glideEvalLoggingEnabled || settings.usageLoggingEnabled)
+
+    // Usage log: what Meltype proposed before the first manual fix, and the fixes made before commit.
+    private var fixAutoPreview: String? = null
+    private val fixActions = ArrayList<String>()
+    private var lastClausesForLog = ""
+
+    /** Records a manual fix. [conversionFix] marks fixes of the conversion (not of the typed letters). */
+    private fun noteFix(action: String, conversionFix: Boolean = true) {
+        if (!shouldLogEval() || session.isEmpty) return
+        if (conversionFix && fixAutoPreview == null) fixAutoPreview = session.snapshot.previewText
+        if (fixActions.size < 40) fixActions.add(action)
+    }
+
+    private fun logCommitDetail(raw: String, committed: String, via: String) {
+        evalLogger.logCommit(
+            settings.activePromptId, raw, committed, via,
+            autoText = fixAutoPreview ?: committed,
+            actions = fixActions.toList(),
+            clauses = lastClausesForLog,
+            englishMode = englishMode
+        )
+        fixAutoPreview = null
+        fixActions.clear()
+    }
 
     private fun performUndoCommit() {
         val ic = currentInputConnection ?: return
@@ -702,7 +802,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
                 currentInputConnection?.commitText(out, 1)
                 recordUndoCommit(raw, out)
                 if (shouldLogEval()) {
-                    evalLogger.logCommit(settings.activePromptId, raw, committed, "direct_char")
+                    logCommitDetail(raw, committed, "direct_char")
                     evalLogger.logTap(settings.activePromptId, ch, true, "")
                 }
                 renderSnapshot(session.snapshot)
@@ -833,7 +933,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
                 currentInputConnection?.commitText(out, 1)
                 recordUndoCommit(raw, out)
                 if (shouldLogEval()) {
-                    evalLogger.logCommit(settings.activePromptId, raw, committed, "punct")
+                    logCommitDetail(raw, committed, "punct")
                 }
                 renderSnapshot(session.snapshot)
             } else {
@@ -867,7 +967,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             clearUndoCommit()
         }
         if (shouldLogEval()) {
-            evalLogger.logCommit(settings.activePromptId, rawBefore, committed, logKind)
+            logCommitDetail(rawBefore, committed, logKind)
         }
         renderSnapshot(session.snapshot)
     }
@@ -1034,6 +1134,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
                 targetClauseIndex = snap.focusedClauseIndex
             )
             // Keep focus on the same clause while cycling candidates via Spacebar
+            noteFix("cycle:${currentClause.reading}→${nextCand.text}")
             renderSnapshot(session.selectCandidate(nextCand, getSurroundingTextBefore(), advanceFocus = false))
         } else {
             val next = session.appendChar(' ', getSurroundingTextBefore())
@@ -1062,7 +1163,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             currentInputConnection?.commitText(committed, 1)
             recordUndoCommit(raw, committed)
             if (shouldLogEval()) {
-                evalLogger.logCommit(settings.activePromptId, raw, committed, "enter")
+                logCommitDetail(raw, committed, "enter")
             }
             renderSnapshot(session.snapshot)
         } else {
@@ -1075,7 +1176,8 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
 
     override fun onMoveCursor(delta: Int) {
         if (!session.isEmpty && !session.snapshot.isConverting) {
-            // Before conversion the arrows move a caret inside the composition (shown as kana).
+            noteFix("caret", conversionFix = false)
+            // Before conversion the arrows move a caret inside the composition (conversion stays shown).
             renderSnapshot(session.moveCaret(delta, getSurroundingTextBefore()))
             return
         }
@@ -1108,15 +1210,9 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         }
         if (dy != 0) {
             if (!session.isEmpty) {
-                val raw = session.snapshot.rawInput
-                val committed = session.commitAndLearn(getSurroundingTextBefore())
-                if (committed.isNotEmpty()) {
-                    currentInputConnection?.commitText(committed, 1)
-                    if (shouldLogEval()) {
-                        evalLogger.logCommit(settings.activePromptId, raw, committed, "cursor_dpad")
-                    }
-                }
-                renderSnapshot(session.snapshot)
+                // Up/down inside a composition: caret to its start/end; nothing is committed.
+                renderSnapshot(session.moveCaretToEdge(start = dy < 0, surroundingContext = getSurroundingTextBefore()))
+                return
             }
             clearUndoCommit()
             sendDownUpKeyEvents(if (dy < 0) KeyEvent.KEYCODE_DPAD_UP else KeyEvent.KEYCODE_DPAD_DOWN)
@@ -1124,6 +1220,10 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
     }
 
     override fun onToggleLanguage() {
+        if (shouldLogEval()) {
+            evalLogger.logEvent("mode", if (englishMode) "en->ja" else "ja->en", session.snapshot.previewText)
+        }
+        noteFix("mode", conversionFix = false)
         englishMode = !englishMode
         session.englishMode = englishMode
         if (::keyboardView.isInitialized) keyboardView.englishMode = englishMode
@@ -1132,6 +1232,8 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
 
     override fun onToggleSegmentLanguage() {
         if (!session.isEmpty) {
+            val c = session.snapshot.clauses.getOrNull(session.snapshot.focusedClauseIndex)
+            noteFix("lang:${c?.reading.orEmpty()}${if (c?.isEnglish == true) "(en->ja)" else "(ja->en)"}")
             renderSnapshot(session.toggleFocusedSegmentLanguage(getSurroundingTextBefore()))
         }
     }
@@ -1244,6 +1346,10 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
     private fun selectCandidateAndLog(snap: CompositionSnapshot, item: CandidateItem, closeExpanded: Boolean) {
         val rawBefore = snap.rawInput
         val focusedClause = snap.clauses.getOrNull(snap.focusedClauseIndex)
+        noteFix(
+            "pick[${item.kind.name.lowercase()}]:${focusedClause?.reading.orEmpty()}→${item.text}",
+            conversionFix = item.kind != CandidateKind.CORRECTION
+        )
         if (session.prepareCandidateCommit(item, getSurroundingTextBefore())) {
             // Picking a conversion candidate confirms it (and the clauses before it).
             if (shouldLogEval()) {
@@ -1319,6 +1425,15 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
     }
 
     private fun renderSnapshot(snap: CompositionSnapshot) {
+        if (snap.isComposing) {
+            lastClausesForLog = snap.clauses.joinToString("|") {
+                (if (it.isEnglish) "E:" else "") + it.reading + (if (it.text != it.reading) "→" + it.text else "")
+            }
+        } else if (fixActions.isNotEmpty() && session.isEmpty) {
+            // Composition dropped without a commit (cleared); start fresh.
+            fixAutoPreview = null
+            fixActions.clear()
+        }
         val dark = isDarkTheme()
         val accent = if (dark) Color.parseColor("#5C8AC4") else Color.parseColor("#4A6F9E")
         val focusBgSpan = if (dark) Color.argb(90, 92, 138, 196) else Color.argb(65, 74, 111, 158)
@@ -1448,6 +1563,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
                 ).apply { marginEnd = dp(2) }
                 setOnClickListener {
                     if (targetLen != splitLen) {
+                        noteFix("resize")
                         val nextSnap = session.setFocusedClauseLength(targetLen, getSurroundingTextBefore())
                         renderSnapshot(nextSnap)
                     }
@@ -1495,13 +1611,37 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
                     dp(30)
                 ).apply { marginEnd = dp(4) }
                 setOnClickListener {
-                    if (focused) {
-                        expandedTab = ExpandedTab.CANDIDATES
-                        isExpandedPanelOpen = !isExpandedPanelOpen
-                        syncExpandedPanelState(session.snapshot)
-                    } else {
-                        renderSnapshot(session.focusClause(idx))
+                    val now = SystemClock.uptimeMillis()
+                    val pending = pillSingleTap
+                    if (pending != null && pillTapIdx == idx && now - pillTapTime < PILL_DOUBLE_TAP_MS) {
+                        // Double tap on a clause: confirm up to it.
+                        pillHandler.removeCallbacks(pending)
+                        pillSingleTap = null
+                        pillTapIdx = -1
+                        noteFix("pill_double:$idx", conversionFix = false)
+                        isExpandedPanelOpen = false
+                        session.focusClause(idx)
+                        commitFocusedPrefixAndRender("pill_double")
+                        return@setOnClickListener
                     }
+                    pending?.let { pillHandler.removeCallbacks(it) }
+                    pillTapIdx = idx
+                    pillTapTime = now
+                    // The single-tap action waits for the double-tap window: acting at once would
+                    // re-lay the bar and move the second tap onto another control.
+                    val single = Runnable {
+                        pillSingleTap = null
+                        if (session.isEmpty || idx > session.snapshot.clauses.lastIndex) return@Runnable
+                        if (session.snapshot.focusedClauseIndex == idx) {
+                            expandedTab = ExpandedTab.CANDIDATES
+                            isExpandedPanelOpen = !isExpandedPanelOpen
+                            syncExpandedPanelState(session.snapshot)
+                        } else {
+                            renderSnapshot(session.focusClause(idx))
+                        }
+                    }
+                    pillSingleTap = single
+                    pillHandler.postDelayed(single, PILL_DOUBLE_TAP_MS)
                 }
             }
             clausePillRow.addView(pill)
@@ -1517,6 +1657,36 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         val subCol = if (dark) Color.parseColor("#9BA1A8") else Color.parseColor("#737A84")
 
         if (!snap.isComposing && snap.candidates.isEmpty()) {
+            currentPasteOffer()?.let { clip ->
+                val oneLine = clip.replace(Regex("\\s+"), " ")
+                val chip = TextView(this).apply {
+                    text = "\uD83D\uDCCB " + (if (oneLine.length > 16) oneLine.take(15) + "…" else oneLine)
+                    gravity = Gravity.CENTER
+                    maxLines = 1
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+                    setTextColor(textCol)
+                    setPadding(dp(10), dp(4), dp(10), dp(4))
+                    background = GradientDrawable().apply {
+                        setColor(chipAltBg)
+                        cornerRadius = dp(5).toFloat()
+                        setStroke(dp(1), accent)
+                    }
+                    layoutParams = LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                        dp(33)
+                    ).apply { marginEnd = dp(5) }
+                    contentDescription = "コピーした文字を貼り付け"
+                    setOnClickListener { pasteOffered(clip) }
+                    setOnLongClickListener {
+                        // Long-press dismisses the suggestion.
+                        lastHandledClip = clip
+                        pasteOfferText = null
+                        renderSnapshot(session.snapshot)
+                        true
+                    }
+                }
+                candidateRow.addView(chip)
+            }
             // Undo button right after committing a conversion or swipe-deleting
             if ((lastUndoRawInput != null && lastUndoCommittedText != null) || lastUndoDeletedText != null) {
                 val undoBtn = TextView(this).apply {
@@ -1898,7 +2068,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
                 setPadding(0, 0, 0, dp(8))
             }
             val bShrink = makePanelButton("◀ 短", cardBg, textCol, border) {
-                renderSnapshot(session.resizeFocusedClause(-1, getSurroundingTextBefore()))
+                noteFix("resize"); renderSnapshot(session.resizeFocusedClause(-1, getSurroundingTextBefore()))
             }.apply {
                 isEnabled = snap.canShrinkClause
                 alpha = if (snap.canShrinkClause) 1.0f else 0.32f
@@ -1914,7 +2084,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             }
             bScroll.addView(bKanaRow)
             val bExtend = makePanelButton("長 ▶", cardBg, textCol, border) {
-                renderSnapshot(session.resizeFocusedClause(+1, getSurroundingTextBefore()))
+                noteFix("resize"); renderSnapshot(session.resizeFocusedClause(+1, getSurroundingTextBefore()))
             }.apply {
                 isEnabled = snap.canExtendClause
                 alpha = if (snap.canExtendClause) 1.0f else 0.32f
@@ -1942,6 +2112,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             for ((tag, value) in snap.scriptVariants) {
                 val chip = makePanelButton("$tag: $value", cardBg, textCol, accent) {
                     val wasLast = snap.focusedClauseIndex >= snap.clauses.lastIndex
+                    noteFix("variant:$value")
                     session.applyFocusedClauseSurface(
                         value,
                         getSurroundingTextBefore(),
@@ -2815,6 +2986,8 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 
     companion object {
+        private const val PASTE_OFFER_MS = 5L * 60 * 1000
+        private const val PILL_DOUBLE_TAP_MS = 280L
         private val DEFAULT_RECENT_EMOJIS = listOf(
             "😀", "😂", "🤣", "😊", "🙏", "🙇", "👍", "✨", "🔥",
             "❤️", "🎉", "😭", "😅", "🤔", "👀", "✅", "☀️", "🌸",

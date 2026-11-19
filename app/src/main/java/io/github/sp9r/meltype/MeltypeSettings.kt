@@ -103,7 +103,7 @@ class MeltypeSettings(context: Context) {
         set(value) = prefs.edit().putFloat(KEY_FLICK_SENSITIVITY, value.coerceIn(0.7f, 1.4f)).apply()
 
     var autoCommitOnPunctuation: Boolean
-        get() = prefs.getBoolean(KEY_AUTO_COMMIT_PUNCT, true)
+        get() = prefs.getBoolean(KEY_AUTO_COMMIT_PUNCT, false)
         set(value) = prefs.edit().putBoolean(KEY_AUTO_COMMIT_PUNCT, value).apply()
 
     var punctuationStyle: PunctuationStyle
@@ -129,6 +129,25 @@ class MeltypeSettings(context: Context) {
     var typoCorrectionEnabled: Boolean
         get() = prefs.getBoolean(KEY_TYPO_CORRECTION, true)
         set(value) = prefs.edit().putBoolean(KEY_TYPO_CORRECTION, value).apply()
+
+    /** Local usage log (commits, candidate picks, language switches) to find what to improve. */
+    var usageLoggingEnabled: Boolean
+        get() = prefs.getBoolean(KEY_USAGE_LOGGING, true)
+        set(value) = prefs.edit().putBoolean(KEY_USAGE_LOGGING, value).apply()
+
+    /**
+     * One-time change for existing installs (v1.7.0, the owner's requests): the language key becomes
+     * the bottom-row key (emoji on long-press) and 。、 no longer commit the composition.
+     */
+    fun migrateV170() {
+        if (prefs.getBoolean(KEY_MIGRATED_V170, false)) return
+        val edit = prefs.edit()
+        if (prefs.all.isNotEmpty()) {
+            edit.putString(KEY_BOTTOM_KEY, BottomKeyMode.LANGUAGE.key)
+            edit.putBoolean(KEY_AUTO_COMMIT_PUNCT, false)
+        }
+        edit.putBoolean(KEY_MIGRATED_V170, true).apply()
+    }
 
     var glideEvalLoggingEnabled: Boolean
         get() = prefs.getBoolean(KEY_GLIDE_EVAL_LOGGING, false)
@@ -243,6 +262,8 @@ class MeltypeSettings(context: Context) {
         private const val KEY_LEARNING = "learning_enabled"
         private const val KEY_TYPO_CORRECTION = "typo_correction_enabled"
         private const val KEY_GLIDE_EVAL_LOGGING = "glide_eval_logging"
+        private const val KEY_USAGE_LOGGING = "usage_logging"
+        private const val KEY_MIGRATED_V170 = "migrated_v170"
         private const val KEY_ACTIVE_PROMPT_ID = "glide_eval_prompt_id"
         private const val KEY_ACTIVE_PROMPT_EXPECTED = "glide_eval_prompt_expected"
         private const val KEY_ACTIVE_PROMPT_INDEX = "glide_eval_prompt_index"

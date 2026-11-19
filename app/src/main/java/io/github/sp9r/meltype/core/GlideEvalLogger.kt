@@ -198,7 +198,11 @@ class GlideEvalLogger(private val filesDir: File) {
         promptId: String,
         rawInput: String,
         committedText: String,
-        via: String
+        via: String,
+        autoText: String? = null,
+        actions: List<String> = emptyList(),
+        clauses: String = "",
+        englishMode: Boolean = false
     ) {
         val line = buildString(256) {
             append('{')
@@ -208,6 +212,25 @@ class GlideEvalLogger(private val filesDir: File) {
             appendKVStr("rawInput", rawInput); append(',')
             appendKVStr("committed", committedText); append(',')
             appendKVStr("via", via)
+            if (autoText != null) {
+                append(','); appendKVStr("auto", autoText)
+                append(','); appendKVStr("actions", actions.joinToString(" "))
+                append(','); appendKVStr("clauses", clauses)
+                append(','); appendKV("en", englishMode)
+            }
+            append('}')
+        }
+        appendLineAsync(line)
+    }
+
+    /** Generic usage event (language mode switch etc.). */
+    fun logEvent(kind: String, detail: String, preview: String) {
+        val line = buildString(128) {
+            append('{')
+            appendKV("ts", System.currentTimeMillis()); append(',')
+            appendKVStr("type", kind); append(',')
+            appendKVStr("detail", detail); append(',')
+            appendKVStr("preview", preview)
             append('}')
         }
         appendLineAsync(line)
@@ -312,6 +335,12 @@ class GlideEvalLogger(private val filesDir: File) {
             synchronized(lock) {
                 runCatching {
                     filesDir.mkdirs()
+                    if (logFile.length() > MAX_LOG_BYTES) {
+                        // Keep one previous generation so the log never grows without bound.
+                        val old = File(filesDir, "$LOG_FILE_NAME.1")
+                        old.delete()
+                        logFile.renameTo(old)
+                    }
                     logFile.appendText(line + "\n", Charsets.UTF_8)
                 }
             }
@@ -432,5 +461,6 @@ class GlideEvalLogger(private val filesDir: File) {
     companion object {
         const val LOG_FILE_NAME = "glide_eval_log.jsonl"
         private const val MAX_STORED_POINTS = 72
+        private const val MAX_LOG_BYTES = 8L * 1024 * 1024
     }
 }

@@ -463,14 +463,10 @@ class QwertyKeyboardView @JvmOverloads constructor(
                     listOf(
                         1.50f to VisualKeyBuilder("?123", "123", KeyKind.LAYER_SYM, subOutputChar = '\u0001', isFn = true),
                         // Gboard: emoji key (default) or language key; the other one moves to a long-press.
+                        1.00f to VisualKeyBuilder(commaLabel, "！", KeyKind.COMMA, subOutputChar = '！', isFn = false),
                         if (bottomKeyMode == BottomKeyMode.LANGUAGE) {
-                            1.00f to VisualKeyBuilder(commaLabel, SmileyIcon.GLYPH, KeyKind.COMMA, subOutputChar = '\u0002', isFn = false)
-                        } else {
-                            1.00f to VisualKeyBuilder(commaLabel, "！", KeyKind.COMMA, subOutputChar = '！', isFn = false)
-                        },
-                        if (bottomKeyMode == BottomKeyMode.LANGUAGE) {
-                            // Tap: Japanese/English input mode. Long-press: flip only the focused clause.
-                            1.00f to VisualKeyBuilder("日/英", "⇄", KeyKind.LANG_TOGGLE, subOutputChar = '\u0004', isFn = true)
+                            // Tap: Japanese/English input mode. Long-press only: emoji.
+                            1.00f to VisualKeyBuilder("日/英", SmileyIcon.GLYPH, KeyKind.LANG_TOGGLE, subOutputChar = '\u0002', isFn = true)
                         } else {
                             1.00f to VisualKeyBuilder(SmileyIcon.GLYPH, "日/英", KeyKind.EMOJI, subOutputChar = '\u0003', isFn = true)
                         },

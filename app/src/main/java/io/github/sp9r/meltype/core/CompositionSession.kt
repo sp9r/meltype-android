@@ -262,6 +262,15 @@ class CompositionSession(
         return recompute(surroundingContext, keepFocus = true)
     }
 
+    /** Up/down arrow inside a composition: caret to its start or end (no commit). */
+    fun moveCaretToEdge(start: Boolean, surroundingContext: String? = null): CompositionSnapshot {
+        if (buffer.isEmpty()) return cachedSnapshot
+        clearLastGlideHint()
+        converting = false
+        caretRaw = if (start) 0 else null
+        return recompute(surroundingContext, keepFocus = true)
+    }
+
     /** Starts conversion review (Gboard's first Space): focus goes to the first clause. */
     fun startConversion(surroundingContext: String? = null): CompositionSnapshot {
         if (buffer.isEmpty()) return cachedSnapshot

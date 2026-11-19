@@ -1182,6 +1182,10 @@ class MainActivity : AppCompatActivity() {
             settings.autoCommitOnPunctuation = it
         }
         switchCard.addView(hairline())
+        addSwitchRow(switchCard, "改善用の入力ログ", "確定・候補の選び直し・日/英の切替を端末内に記録（パスワード欄とシークレット入力は除外、外部送信なし）", settings.usageLoggingEnabled) {
+            settings.usageLoggingEnabled = it
+        }
+        switchCard.addView(hairline())
         addSwitchRow(switchCard, "キータップ時の振動フィードバック", "打鍵とカーソルキー操作で短く振動", settings.hapticFeedback) {
             settings.hapticFeedback = it
         }

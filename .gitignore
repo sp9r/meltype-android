@@ -12,3 +12,6 @@ private/
 # Large upstream binaries downloaded & verified via tools/fetch_mozc_assets.py
 app/src/main/jniLibs/
 app/src/main/assets/mozc.data
+
+# Usage logs pulled from the phone (contain typed text)
+*.jsonl
