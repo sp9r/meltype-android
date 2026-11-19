@@ -1116,7 +1116,7 @@ class MainActivity : AppCompatActivity() {
             modeCard,
             "、の右のキー（他方は長押し）",
             listOf(
-                "☺ 絵文字（Gboard標準）" to (settings.bottomKeyMode == BottomKeyMode.EMOJI),
+                "絵文字（Gboard標準）" to (settings.bottomKeyMode == BottomKeyMode.EMOJI),
                 "日/英 言語切替" to (settings.bottomKeyMode == BottomKeyMode.LANGUAGE)
             )
         ) { idx ->

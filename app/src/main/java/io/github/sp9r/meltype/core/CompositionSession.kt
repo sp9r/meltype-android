@@ -93,6 +93,12 @@ class CompositionSession(
 
     val isEmpty: Boolean get() = buffer.isEmpty()
 
+    /**
+     * English input mode (Gboard's language key). Typed letters stay English instead of being read as
+     * romaji, and z sequences are off. Text composed before the switch keeps its own language.
+     */
+    var englishMode: Boolean = false
+
     fun appendChar(
         ch: Char,
         surroundingContext: String? = null,
@@ -101,7 +107,17 @@ class CompositionSession(
         clearLastGlideHint()
         buffer.append(ch)
         bufferSpatialHints.add(spatialHints)
+        if (englishMode && (ch.isLetterOrDigit() || ch == '\'')) markTrailingWordEnglish()
         return recompute(surroundingContext)
+    }
+
+    /** Pins the word that ends at the buffer tail as English, merging with an English word it extends. */
+    private fun markTrailingWordEnglish() {
+        val end = buffer.length - 1
+        var start = end
+        while (start > 0 && (buffer[start - 1].isLetterOrDigit() || buffer[start - 1] == '\'')) start--
+        overrides.keys.filter { it.first <= end && it.last >= start }.toList().forEach { overrides.remove(it) }
+        overrides[start..end] = SegmentKind.ENGLISH
     }
 
     /**
@@ -111,6 +127,7 @@ class CompositionSession(
      */
     fun tryZSymbol(key: Char, surroundingContext: String? = null): CompositionSnapshot? {
         val sym = Z_SYMBOLS[key] ?: return null
+        if (englishMode) return null
         if (buffer.isEmpty() || buffer.last() != 'z') return null
         val lastIdx = buffer.length - 1
         if (overrides.keys.any { lastIdx in it }) return null

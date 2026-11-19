@@ -248,7 +248,11 @@ class KeyboardBlueprintView @JvmOverloads constructor(
         paintText.color = textCol
         val fm = paintText.fontMetrics
         val ty = rect.centerY() - (fm.ascent + fm.descent) * 0.5f
-        canvas.drawText(label, rect.centerX(), ty, paintText)
+        if (label == SmileyIcon.GLYPH) {
+            SmileyIcon.draw(canvas, rect.centerX(), rect.centerY(), paintText.textSize * 0.45f, textCol)
+        } else {
+            canvas.drawText(label, rect.centerX(), ty, paintText)
+        }
         if (sub.isNotEmpty() && rect.height() > 12f * resources.displayMetrics.density) {
             paintSub.color = mutedCol
             canvas.drawText(sub, rect.right - 2f * resources.displayMetrics.density, rect.top + 6.5f * resources.displayMetrics.density, paintSub)

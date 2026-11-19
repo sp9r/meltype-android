@@ -35,6 +35,8 @@ interface KeyboardActionListener {
         if (dx != 0) onMoveCursor(dx)
     }
     fun onToggleLanguage()
+    /** Long-press on 日/英: switch only the focused clause between Japanese and English. */
+    fun onToggleSegmentLanguage() {}
     fun onToggleEmojiPanel()
     fun onOpenSettings()
     fun onGlidePreview(points: List<TouchPoint>, letterBounds: RectF)
@@ -87,6 +89,17 @@ class QwertyKeyboardView @JvmOverloads constructor(
                 invalidate()
             }
         }
+    /** English input mode: the space bar reads "English" and 、。 become , . like Gboard's English layout. */
+    var englishMode: Boolean = false
+        set(value) {
+            if (field != value) {
+                field = value
+                rebuildLayout()
+                invalidate()
+            }
+        }
+    private val commaLabel: String get() = if (englishMode) "," else punctuationStyle.comma
+    private val periodLabel: String get() = if (englishMode) "." else punctuationStyle.period
     var bottomKeyMode: BottomKeyMode = BottomKeyMode.EMOJI
         set(value) {
             if (field != value) {
@@ -451,17 +464,18 @@ class QwertyKeyboardView @JvmOverloads constructor(
                         1.50f to VisualKeyBuilder("?123", "123", KeyKind.LAYER_SYM, subOutputChar = '\u0001', isFn = true),
                         // Gboard: emoji key (default) or language key; the other one moves to a long-press.
                         if (bottomKeyMode == BottomKeyMode.LANGUAGE) {
-                            1.00f to VisualKeyBuilder(punctuationStyle.comma, "☺", KeyKind.COMMA, subOutputChar = '\u0002', isFn = false)
+                            1.00f to VisualKeyBuilder(commaLabel, SmileyIcon.GLYPH, KeyKind.COMMA, subOutputChar = '\u0002', isFn = false)
                         } else {
-                            1.00f to VisualKeyBuilder(punctuationStyle.comma, "！", KeyKind.COMMA, subOutputChar = '！', isFn = false)
+                            1.00f to VisualKeyBuilder(commaLabel, "！", KeyKind.COMMA, subOutputChar = '！', isFn = false)
                         },
                         if (bottomKeyMode == BottomKeyMode.LANGUAGE) {
-                            1.00f to VisualKeyBuilder("日/英", "", KeyKind.LANG_TOGGLE, isFn = true)
+                            // Tap: Japanese/English input mode. Long-press: flip only the focused clause.
+                            1.00f to VisualKeyBuilder("日/英", "⇄", KeyKind.LANG_TOGGLE, subOutputChar = '\u0004', isFn = true)
                         } else {
-                            1.00f to VisualKeyBuilder("☺", "日/英", KeyKind.EMOJI, subOutputChar = '\u0003', isFn = true)
+                            1.00f to VisualKeyBuilder(SmileyIcon.GLYPH, "日/英", KeyKind.EMOJI, subOutputChar = '\u0003', isFn = true)
                         },
-                        2.00f to VisualKeyBuilder("空白", "", KeyKind.SPACE, isFn = false),
-                        1.00f to VisualKeyBuilder(punctuationStyle.period, "？", KeyKind.PERIOD, subOutputChar = '？', isFn = false),
+                        2.00f to VisualKeyBuilder(if (englishMode) "English" else "空白", "", KeyKind.SPACE, isFn = false),
+                        1.00f to VisualKeyBuilder(periodLabel, "？", KeyKind.PERIOD, subOutputChar = '？', isFn = false),
                         1.00f to VisualKeyBuilder("◀", "↕", KeyKind.CURSOR_LEFT, isFn = true),
                         1.00f to VisualKeyBuilder("▶", "↕", KeyKind.CURSOR_RIGHT, isFn = true),
                         1.50f to VisualKeyBuilder("⏎", "", KeyKind.ENTER, isFn = true)
@@ -647,19 +661,27 @@ class QwertyKeyboardView @JvmOverloads constructor(
                 k.label.length == 2 -> sp(13.5f)
                 else -> sp(18.5f)
             }
-            val fm = paintText.fontMetrics
-            val textY = k.rect.centerY() - (fm.ascent + fm.descent) * 0.5f
-            canvas.drawText(k.label, k.rect.centerX(), textY, paintText)
+            if (k.label == SmileyIcon.GLYPH) {
+                SmileyIcon.draw(canvas, k.rect.centerX(), k.rect.centerY(), sp(9f), paintText.color)
+            } else {
+                val fm = paintText.fontMetrics
+                val textY = k.rect.centerY() - (fm.ascent + fm.descent) * 0.5f
+                canvas.drawText(k.label, k.rect.centerX(), textY, paintText)
+            }
 
             if (showSubLabels && k.subLabel.isNotEmpty()) {
                 paintSubText.color = cSubText
                 paintSubText.textSize = sp(9f)
-                canvas.drawText(
-                    k.subLabel,
-                    k.rect.right - dp(3.5f),
-                    k.rect.top + dp(10.5f),
-                    paintSubText
-                )
+                if (k.subLabel == SmileyIcon.GLYPH) {
+                    SmileyIcon.draw(canvas, k.rect.right - dp(8.5f), k.rect.top + dp(8f), dp(4.6f), cSubText)
+                } else {
+                    canvas.drawText(
+                        k.subLabel,
+                        k.rect.right - dp(3.5f),
+                        k.rect.top + dp(10.5f),
+                        paintSubText
+                    )
+                }
             }
         }
 
@@ -710,8 +732,12 @@ class QwertyKeyboardView @JvmOverloads constructor(
 
             paintText.color = cText
             paintText.textSize = if (previewChar.length >= 2) sp(14f) else sp(22f)
-            val fm = paintText.fontMetrics
-            canvas.drawText(previewChar, popRect.centerX(), popRect.centerY() - (fm.ascent + fm.descent) * 0.5f, paintText)
+            if (previewChar == SmileyIcon.GLYPH) {
+                SmileyIcon.draw(canvas, popRect.centerX(), popRect.centerY(), sp(11f), cText)
+            } else {
+                val fm = paintText.fontMetrics
+                canvas.drawText(previewChar, popRect.centerX(), popRect.centerY() - (fm.ascent + fm.descent) * 0.5f, paintText)
+            }
         }
     }
 
@@ -1035,6 +1061,9 @@ class QwertyKeyboardView @JvmOverloads constructor(
                     }
                     dk.subOutputChar == '\u0003' -> {
                         listener?.onToggleLanguage()
+                    }
+                    dk.subOutputChar == '\u0004' -> {
+                        listener?.onToggleSegmentLanguage()
                     }
                     else -> {
                         listener?.onCharacter(dk.subOutputChar, directCommit = (layer == Layer.NUMPAD))

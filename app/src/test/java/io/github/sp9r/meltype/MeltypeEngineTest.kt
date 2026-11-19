@@ -653,4 +653,39 @@ class MeltypeEngineTest {
         // Keys outside the z table are not touched.
         assertNull(arrow.tryZSymbol('a'))
     }
+
+    @Test
+    fun englishModeKeepsTypedWordsEnglish() {
+        val converter = AndroidMozcConverter(dictionaries)
+        // Romaji-readable English words (make = まけ, home = ほめ) stay English in English mode.
+        for (word in listOf("make", "home", "name", "hello")) {
+            val s = CompositionSession(dictionaries, scoreEngine, converter)
+            s.englishMode = true
+            for (ch in word) s.appendChar(ch)
+            val snap = s.snapshot
+            assertEquals(word, snap.previewText)
+            assertTrue("$word should be English", snap.clauses.all { it.isEnglish })
+        }
+        // A glided word followed by typed letters merges into one English word.
+        val merged = CompositionSession(dictionaries, scoreEngine, converter)
+        merged.englishMode = true
+        merged.appendGlideResult("game", true, listOf("game" to true))
+        merged.appendChar('s')
+        assertEquals("games", merged.snapshot.previewText)
+        // z sequences are off in English mode.
+        val z = CompositionSession(dictionaries, scoreEngine, converter)
+        z.englishMode = true
+        z.appendChar('z')
+        assertNull(z.tryZSymbol('.'))
+    }
+
+    @Test
+    fun englishOnlyGlideFindsWordsJapaneseBiasHid() {
+        // Words that lose to Japanese readings under the Japanese bias are found once only English is kept.
+        for (word in listOf("game", "name", "breakfast", "really", "sorry", "hello", "today")) {
+            val path = KeyLayoutGeometry.syntheticPathForWord(word, jitter = 0.02f)
+            val english = glideDecoder.decode(path, maxResults = 20, preferJapanese = false).filter { it.isEnglish }
+            assertTrue("$word not in English top 3: ${english.take(3).map { it.word }}", english.take(3).any { it.word == word })
+        }
+    }
 }

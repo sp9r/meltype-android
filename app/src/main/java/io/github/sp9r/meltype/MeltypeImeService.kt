@@ -53,6 +53,7 @@ import io.github.sp9r.meltype.glide.KeyLayoutGeometry
 import io.github.sp9r.meltype.glide.TouchPoint
 import io.github.sp9r.meltype.ui.KeyboardActionListener
 import io.github.sp9r.meltype.ui.QwertyKeyboardView
+import io.github.sp9r.meltype.ui.SmileyDrawable
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -112,6 +113,8 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
 
     private lateinit var dividerView: View
     private lateinit var keyboardView: QwertyKeyboardView
+    /** Japanese/English input mode, switched by the 日/英 key like Gboard's language key. */
+    private var englishMode: Boolean = false
     private lateinit var emojiCatalog: EmojiCatalog
     private lateinit var expandedPanel: LinearLayout
     private lateinit var expandedHeader: LinearLayout
@@ -231,7 +234,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             }
         }
         langSwitchBtn = makeRailButton("日/英").apply {
-            setOnClickListener { onToggleLanguage() }
+            setOnClickListener { onToggleSegmentLanguage() }
         }
 
         clauseTopRow.addView(clauseScroll)
@@ -310,7 +313,10 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         }
         candidateScroll.addView(candidateRow)
 
-        emojiBarBtn = makeRailButton("☺").apply {
+        emojiBarBtn = makeRailButton("").apply {
+            setCompoundDrawables(SmileyDrawable(dp(17)).also { it.setBounds(0, 0, dp(17), dp(17)) }, null, null, null)
+            minWidth = dp(34)
+            contentDescription = "絵文字"
             setOnClickListener { onToggleEmojiPanel() }
         }
 
@@ -531,6 +537,8 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         keyboardView.letterFlickEnabled = settings.letterFlickEnabled
         keyboardView.showNumberRow = settings.showNumberRow
         keyboardView.bottomKeyMode = settings.bottomKeyMode
+        keyboardView.englishMode = englishMode
+        session.englishMode = englishMode
         keyboardView.autoReturnFromSymbols = settings.autoReturnFromSymbols
         keyboardView.flickSensitivity = settings.flickSensitivity
         keyboardView.themeMode = settings.themeMode
@@ -562,6 +570,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         styleRailButton(partialCommitBtn, dark, subtle = false)
         styleRailButton(langSwitchBtn, dark, subtle = false)
         styleRailButton(emojiBarBtn, dark, subtle = false)
+        (emojiBarBtn.compoundDrawables[0] as? SmileyDrawable)?.color = emojiBarBtn.currentTextColor
         styleRailButton(expandPanelBtn, dark, subtle = false)
         styleRailButton(oneHandBtn, dark, subtle = false)
         styleRailButton(settingsBtn, dark, subtle = false)
@@ -801,13 +810,14 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         val snap = session.snapshot
         val lastIsEnglish = snap.clauses.lastOrNull()?.isEnglish == true
         val punct = when {
+            englishMode -> if (isPeriod) "." else ","
             lastIsEnglish && settings.punctuationStyle != PunctuationStyle.HALF ->
                 if (isPeriod) "." else ","
             else ->
                 if (isPeriod) settings.punctuationStyle.period else settings.punctuationStyle.comma
         }
         if (snap.isComposing) {
-            if (settings.autoCommitOnPunctuation && !lastIsEnglish) {
+            if (englishMode || (settings.autoCommitOnPunctuation && !lastIsEnglish)) {
                 val raw = snap.rawInput
                 val committed = session.commitAndLearn(getSurroundingTextBefore())
                 val out = committed + punct
@@ -961,6 +971,15 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             renderSnapshot(session.snapshot)
             return
         }
+        if (englishMode) {
+            // English mode behaves like Gboard's English layout: space commits the word with a space.
+            val raw = snap.rawInput
+            val out = session.commitAndLearn(getSurroundingTextBefore()) + " "
+            currentInputConnection?.commitText(out, 1)
+            recordUndoCommit(raw, out)
+            renderSnapshot(session.snapshot)
+            return
+        }
         val lastIsEnglish = snap.clauses.lastOrNull()?.isEnglish == true
         val alreadyHasSpace = snap.rawInput.contains(' ')
         if (lastIsEnglish || alreadyHasSpace) {
@@ -1057,6 +1076,13 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
     }
 
     override fun onToggleLanguage() {
+        englishMode = !englishMode
+        session.englishMode = englishMode
+        if (::keyboardView.isInitialized) keyboardView.englishMode = englishMode
+        showTransientTrace(if (englishMode) "English" else "日本語")
+    }
+
+    override fun onToggleSegmentLanguage() {
         if (!session.isEmpty) {
             renderSnapshot(session.toggleFocusedSegmentLanguage(getSurroundingTextBefore()))
         }
@@ -1095,7 +1121,9 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         glidePreviewExecutor.execute {
             if (glidePreviewSeq.get() != seq) return@execute
             val norm = KeyLayoutGeometry.normalizeFromView(copiedPoints, boundsCopy)
-            val cands = decoder.decode(norm, maxResults = 3, preferJapanese = !inEnglishSentence, fastPreview = true)
+            val cands = englishOnly(
+                decoder.decode(norm, maxResults = if (englishMode) 8 else 3, preferJapanese = !englishMode && !inEnglishSentence, fastPreview = true)
+            ).take(3)
             if (cands.isEmpty() || glidePreviewSeq.get() != seq) return@execute
             val preview = cands.joinToString(" | ") { c ->
                 if (!c.isEnglish && !c.kanaHint.isNullOrEmpty()) c.kanaHint else c.word
@@ -1118,18 +1146,20 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         val snap = session.snapshot
         val inEnglishSentence = snap.isComposing && snap.rawInput.contains(' ') &&
             snap.clauses.lastOrNull()?.isEnglish == true
-        val preferJp = !inEnglishSentence
+        val preferJp = !englishMode && !inEnglishSentence
         val loggingEval = shouldLogEval()
         val debugRes = if (loggingEval) {
-            decoder.decodeDebug(norm, maxResults = 10, preferJapanese = preferJp)
+            decoder.decodeDebug(norm, maxResults = if (englishMode) 20 else 10, preferJapanese = preferJp)
         } else {
             null
         }
-        val cands = if (debugRes != null) {
-            debugRes.candidates.take(8).map { GlideCandidate(it.word, it.isEnglish, it.scoreCost, it.kanaHint) }
-        } else {
-            decoder.decode(norm, maxResults = 8, preferJapanese = preferJp, fastPreview = false)
-        }
+        val cands = englishOnly(
+            if (debugRes != null) {
+                debugRes.candidates.map { GlideCandidate(it.word, it.isEnglish, it.scoreCost, it.kanaHint) }
+            } else {
+                decoder.decode(norm, maxResults = if (englishMode) 20 else 8, preferJapanese = preferJp, fastPreview = false)
+            }
+        ).take(8)
         val composingBefore = snap.rawInput
         val top = cands.firstOrNull()
         val updated = if (top != null) {
@@ -1195,6 +1225,10 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             }
         }
     }
+
+    /** In English mode keep only English glide candidates (falling back to all if none decoded). */
+    private fun englishOnly(cands: List<GlideCandidate>): List<GlideCandidate> =
+        if (englishMode) cands.filter { it.isEnglish }.ifEmpty { cands } else cands
 
     private fun showTransientTrace(text: String) {
         if (!::traceBadge.isInitialized) return
