@@ -688,4 +688,70 @@ class MeltypeEngineTest {
             assertTrue("$word not in English top 3: ${english.take(3).map { it.word }}", english.take(3).any { it.word == word })
         }
     }
+
+    @Test
+    fun conversionCommitsClauseByClauseAndBackspaceRevertsToKana() {
+        val converter = AndroidMozcConverter(dictionaries)
+        val s = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "kyouhagoogledekensaku") s.appendChar(ch)
+        val clauses = s.snapshot.clauses
+        assertTrue("needs several clauses: ${clauses.map { it.text }}", clauses.size > 1)
+        assertFalse(s.snapshot.isConverting)
+        val started = s.startConversion()
+        assertTrue(started.isConverting)
+        assertEquals(0, started.focusedClauseIndex)
+        val first = clauses.first().text
+        val committed = s.commitFocusedPrefix()
+        assertEquals(first, committed)
+        assertTrue(s.snapshot.isConverting)
+        assertEquals(0, s.snapshot.focusedClauseIndex)
+        // Backspace in conversion returns the rest to unconverted kana instead of deleting.
+        val rawBefore = s.snapshot.rawInput
+        val reverted = s.backspace()
+        assertEquals(rawBefore, reverted.rawInput)
+        assertFalse(reverted.isConverting)
+        assertTrue(reverted.isEditing)
+        assertEquals("googleでけんさく", reverted.previewText)
+        // The next Backspace deletes one kana.
+        val shorter = s.backspace()
+        assertEquals(reverted.previewText.dropLast(1), shorter.previewText)
+    }
+
+    @Test
+    fun caretEditsInsideCompositionBeforeConversion() {
+        val converter = AndroidMozcConverter(dictionaries)
+        val s = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "kyouhaame") s.appendChar(ch)
+        // Two kana left: きょうは|あめ
+        val moved = s.moveCaret(-2)
+        assertTrue(moved.isEditing)
+        assertEquals("きょうはあめ", moved.previewText)
+        assertEquals(4, moved.caretOffset)
+        // Delete は and type が at the caret.
+        val deleted = s.backspace()
+        assertEquals("きょうあめ", deleted.previewText)
+        assertEquals(3, deleted.caretOffset)
+        s.appendChar('g')
+        val inserted = s.appendChar('a')
+        assertEquals("kyougaame", inserted.rawInput)
+        assertEquals("きょうがあめ", inserted.previewText)
+        assertEquals(4, inserted.caretOffset)
+        // Moving back to the end returns to live conversion.
+        val end = s.moveCaret(+5)
+        assertFalse(end.isEditing)
+        assertEquals("kyougaame", end.rawInput)
+        // Space-style conversion from the kana view.
+        s.moveCaret(-1)
+        val conv = s.startConversion()
+        assertTrue(conv.isConverting)
+        assertFalse(conv.isEditing)
+        // Typing English letters mid-word in English mode stays English.
+        val en = CompositionSession(dictionaries, scoreEngine, converter)
+        en.englishMode = true
+        for (ch in "helo") en.appendChar(ch)
+        en.moveCaret(-1)
+        en.appendChar('l')
+        assertEquals("hello", en.snapshot.rawInput)
+        assertTrue(en.snapshot.clauses.all { it.isEnglish })
+    }
 }

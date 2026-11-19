@@ -48,7 +48,13 @@ data class CompositionSnapshot(
     val canExtendClause: Boolean = false,
     val hasGlideUndo: Boolean = false,
     val focusedAdjustableKana: String = "",
-    val focusedAdjustableLen: Int = 0
+    val focusedAdjustableLen: Int = 0,
+    /** Conversion state (after Space / clause focus): Enter commits clause by clause from the first. */
+    val isConverting: Boolean = false,
+    /** Kana editing view: the composition is shown unconverted, with a caret that can move inside it. */
+    val isEditing: Boolean = false,
+    /** Caret offset in [previewText] while [isEditing]; -1 otherwise. */
+    val caretOffset: Int = -1
 )
 
 /**
@@ -93,6 +99,17 @@ class CompositionSession(
 
     val isEmpty: Boolean get() = buffer.isEmpty()
 
+    /** Raw buffer index of the editing caret; null means the caret is at the end (normal typing). */
+    private var caretRaw: Int? = null
+    /** Backspace during conversion returned the composition to its unconverted kana form. */
+    private var kanaRevert = false
+    private var converting = false
+
+    /** True when the caret sits inside the composition, so new input is inserted there. */
+    val isCaretInside: Boolean get() = caretRaw != null
+
+    private data class EditUnit(val rawStart: Int, val rawEnd: Int, val text: String)
+
     /**
      * English input mode (Gboard's language key). Typed letters stay English instead of being read as
      * romaji, and z sequences are off. Text composed before the switch keeps its own language.
@@ -105,19 +122,158 @@ class CompositionSession(
         spatialHints: Map<Char, Float> = emptyMap()
     ): CompositionSnapshot {
         clearLastGlideHint()
+        converting = false
+        val englishChar = englishMode && (ch.isLetterOrDigit() || ch == '\'')
+        val at = caretRaw
+        if (at != null) {
+            insertRaw(at, ch.toString(), listOf(spatialHints))
+            if (englishChar) markWordEnglishAround(at)
+            return recompute(surroundingContext)
+        }
+        kanaRevert = false
         buffer.append(ch)
         bufferSpatialHints.add(spatialHints)
-        if (englishMode && (ch.isLetterOrDigit() || ch == '\'')) markTrailingWordEnglish()
+        if (englishChar) markWordEnglishAround(buffer.length - 1)
         return recompute(surroundingContext)
     }
 
-    /** Pins the word that ends at the buffer tail as English, merging with an English word it extends. */
-    private fun markTrailingWordEnglish() {
-        val end = buffer.length - 1
-        var start = end
-        while (start > 0 && (buffer[start - 1].isLetterOrDigit() || buffer[start - 1] == '\'')) start--
+    /** Pins the word containing [pos] as English, merging with the English word it extends. */
+    private fun markWordEnglishAround(pos: Int) {
+        fun isWord(c: Char) = c.isLetterOrDigit() || c == '\''
+        var start = pos
+        while (start > 0 && isWord(buffer[start - 1])) start--
+        var end = pos
+        while (end + 1 < buffer.length && isWord(buffer[end + 1])) end++
         overrides.keys.filter { it.first <= end && it.last >= start }.toList().forEach { overrides.remove(it) }
         overrides[start..end] = SegmentKind.ENGLISH
+    }
+
+    /** Inserts [text] at raw index [at], shifting overrides and hints, and leaves the caret after it. */
+    private fun insertRaw(at: Int, text: String, hints: List<Map<Char, Float>> = emptyList()) {
+        val shifted = LinkedHashMap<IntRange, SegmentKind>()
+        for ((r, k) in overrides) {
+            val nr = when {
+                r.last < at -> r
+                r.first >= at -> (r.first + text.length)..(r.last + text.length)
+                else -> r.first..(r.last + text.length)
+            }
+            shifted[nr] = k
+        }
+        overrides.clear()
+        overrides.putAll(shifted)
+        val starts = noTypoFixStarts.map { if (it >= at) it + text.length else it }
+        noTypoFixStarts.clear()
+        noTypoFixStarts.addAll(starts)
+        buffer.insert(at, text)
+        while (bufferSpatialHints.size < at) bufferSpatialHints.add(emptyMap())
+        for (k in text.indices) bufferSpatialHints.add(at + k, hints.getOrNull(k) ?: emptyMap())
+        while (bufferSpatialHints.size > buffer.length) bufferSpatialHints.removeAt(bufferSpatialHints.lastIndex)
+        selectedClauseTextByKey.clear()
+        customClauseSplits.clear()
+        val next = at + text.length
+        caretRaw = if (next >= buffer.length) null else next
+    }
+
+    /** Deletes raw [from, to), shifting overrides and hints. Does not move the caret. */
+    private fun deleteRaw(from: Int, to: Int) {
+        if (to <= from) return
+        val n = to - from
+        val shifted = LinkedHashMap<IntRange, SegmentKind>()
+        for ((r, k) in overrides) {
+            val nf = if (r.first < from) r.first else if (r.first >= to) r.first - n else from
+            val nl = if (r.last < from) r.last else if (r.last >= to) r.last - n else from - 1
+            if (nl >= nf) shifted[nf..nl] = k
+        }
+        overrides.clear()
+        overrides.putAll(shifted)
+        val starts = noTypoFixStarts.filter { it < from || it >= to }.map { if (it >= to) it - n else it }
+        noTypoFixStarts.clear()
+        noTypoFixStarts.addAll(starts)
+        buffer.delete(from, to)
+        for (k in (to - 1) downTo from) {
+            if (k < bufferSpatialHints.size) bufferSpatialHints.removeAt(k)
+        }
+        selectedClauseTextByKey.clear()
+        customClauseSplits.clear()
+    }
+
+    /**
+     * The composition split into the units the editing caret steps over: one kana (or kana group such
+     * as きょ) per romaji chunk in Japanese segments, one character elsewhere.
+     */
+    private fun editUnits(): List<EditUnit> {
+        val raw = buffer.toString()
+        val out = ArrayList<EditUnit>()
+        var pos = 0
+        fun chars(until: Int) {
+            while (pos < until && pos < raw.length) {
+                out.add(EditUnit(pos, pos + 1, raw[pos].toString()))
+                pos++
+            }
+        }
+        for (seg in scoreEngine.segment(raw, overrides)) {
+            if (seg.startIndex < pos) continue
+            chars(seg.startIndex)
+            if (seg.kind == SegmentKind.JAPANESE) {
+                val analysis = RomajiDetector.analyze(raw.substring(seg.startIndex, seg.endIndex), strictForDetection = false)
+                for (c in analysis.chunks) {
+                    val s = seg.startIndex + c.romajiStart
+                    val e = seg.startIndex + c.romajiEnd
+                    if (s < pos || e > seg.endIndex) continue
+                    chars(s)
+                    out.add(EditUnit(s, e, c.kana))
+                    pos = e
+                }
+            }
+            chars(seg.endIndex)
+        }
+        chars(raw.length)
+        return out
+    }
+
+    private fun leaveEditing() {
+        caretRaw = null
+        kanaRevert = false
+    }
+
+    /**
+     * Moves the editing caret by [delta] kana units inside the composition. The composition switches
+     * to the unconverted kana view while the caret is inside it.
+     */
+    fun moveCaret(delta: Int, surroundingContext: String? = null): CompositionSnapshot {
+        if (buffer.isEmpty() || delta == 0) return cachedSnapshot
+        clearLastGlideHint()
+        converting = false
+        val units = editUnits()
+        var p = caretRaw ?: buffer.length
+        repeat(kotlin.math.abs(delta)) {
+            p = if (delta < 0) {
+                units.lastOrNull { it.rawStart < p }?.rawStart ?: p
+            } else {
+                units.firstOrNull { it.rawEnd > p }?.rawEnd ?: p
+            }
+        }
+        caretRaw = if (p >= buffer.length) null else p
+        return recompute(surroundingContext, keepFocus = true)
+    }
+
+    /** Starts conversion review (Gboard's first Space): focus goes to the first clause. */
+    fun startConversion(surroundingContext: String? = null): CompositionSnapshot {
+        if (buffer.isEmpty()) return cachedSnapshot
+        leaveEditing()
+        converting = true
+        focusedClauseIdx = 0
+        return recompute(surroundingContext, keepFocus = true)
+    }
+
+    /** Backspace during conversion: drops the chosen conversions and shows the composition as kana. */
+    private fun revertToKana() {
+        converting = false
+        caretRaw = null
+        kanaRevert = true
+        selectedClauseTextByKey.clear()
+        customClauseSplits.clear()
+        clearLastGlideHint()
     }
 
     /**
@@ -127,7 +283,7 @@ class CompositionSession(
      */
     fun tryZSymbol(key: Char, surroundingContext: String? = null): CompositionSnapshot? {
         val sym = Z_SYMBOLS[key] ?: return null
-        if (englishMode) return null
+        if (englishMode || caretRaw != null) return null
         if (buffer.isEmpty() || buffer.last() != 'z') return null
         val lastIdx = buffer.length - 1
         if (overrides.keys.any { lastIdx in it }) return null
@@ -144,6 +300,13 @@ class CompositionSession(
 
     fun appendText(text: String, surroundingContext: String? = null): CompositionSnapshot {
         clearLastGlideHint()
+        converting = false
+        val at = caretRaw
+        if (at != null) {
+            insertRaw(at, text)
+            return recompute(surroundingContext)
+        }
+        kanaRevert = false
         buffer.append(text)
         repeat(text.length) { bufferSpatialHints.add(emptyMap()) }
         return recompute(surroundingContext)
@@ -159,6 +322,20 @@ class CompositionSession(
         alternatives: List<Pair<String, Boolean>>,
         surroundingContext: String? = null
     ): CompositionSnapshot {
+        converting = false
+        val at = caretRaw
+        if (at != null) {
+            clearLastGlideHint()
+            insertRaw(at, primaryWord)
+            if (primaryWord.isNotEmpty()) {
+                val range = at until (at + primaryWord.length)
+                overrides.keys.filter { it.first <= range.last && it.last >= range.first }.toList()
+                    .forEach { overrides.remove(it) }
+                overrides[range] = if (isPrimaryEnglish) SegmentKind.ENGLISH else SegmentKind.JAPANESE
+            }
+            return recompute(surroundingContext)
+        }
+        kanaRevert = false
         var addedSpace = false
         if (buffer.isNotEmpty() && !buffer.last().isWhitespace()) {
             val lastSeg = cachedSnapshot.clauses.lastOrNull()
@@ -212,6 +389,21 @@ class CompositionSession(
      */
     fun backspace(surroundingContext: String? = null): CompositionSnapshot {
         if (buffer.isEmpty()) return cachedSnapshot
+        if (converting) {
+            revertToKana()
+            return recompute(surroundingContext)
+        }
+        val caret = caretRaw
+        if (caret != null || kanaRevert) {
+            // Kana view: delete the kana (or character) before the caret.
+            clearLastGlideHint()
+            val p = caret ?: buffer.length
+            val unit = editUnits().lastOrNull { it.rawStart < p } ?: return cachedSnapshot
+            deleteRaw(unit.rawStart, p)
+            if (buffer.isEmpty()) return clearAll()
+            caretRaw = if (caret == null || unit.rawStart >= buffer.length) null else unit.rawStart
+            return recompute(surroundingContext, keepFocus = true)
+        }
         val glideSpan = lastGlideRange
         if (glideSpan != null && glideSpan.last == buffer.length - 1 && glideSpan.first >= 0) {
             val delStart = if (lastGlideLeadingSpace && glideSpan.first > 0 && buffer[glideSpan.first - 1] == ' ') {
@@ -249,6 +441,9 @@ class CompositionSession(
         noTypoFixStarts.clear()
         clearLastGlideHint()
         focusedClauseIdx = 0
+        caretRaw = null
+        kanaRevert = false
+        converting = false
         return recompute(null)
     }
 
@@ -261,6 +456,9 @@ class CompositionSession(
         noTypoFixStarts.clear()
         clearLastGlideHint()
         focusedClauseIdx = 0
+        caretRaw = null
+        kanaRevert = false
+        converting = false
         if (rawInput.isNotEmpty()) {
             buffer.append(rawInput)
             repeat(rawInput.length) { bufferSpatialHints.add(emptyMap()) }
@@ -271,6 +469,7 @@ class CompositionSession(
     fun toggleFocusedSegmentLanguage(surroundingContext: String? = null): CompositionSnapshot {
         val clauses = cachedSnapshot.clauses
         if (clauses.isEmpty()) return cachedSnapshot
+        leaveEditing()
         val idx = focusedClauseIdx.coerceIn(0, clauses.lastIndex)
         val targetSegIdx = clauses[idx].segmentIndex
         val segs = scoreEngine.segment(buffer.toString(), overrides)
@@ -292,6 +491,7 @@ class CompositionSession(
      */
     fun resizeFocusedClause(deltaKana: Int, surroundingContext: String? = null): CompositionSnapshot {
         if (deltaKana == 0) return cachedSnapshot
+        leaveEditing()
         return updateFocusedClauseSplit(
             targetLenProvider = { currentLen, _ -> currentLen + deltaKana },
             surroundingContext = surroundingContext
@@ -391,6 +591,7 @@ class CompositionSession(
         surroundingContext: String? = null,
         advanceFocus: Boolean = false
     ): CompositionSnapshot {
+        leaveEditing()
         if (item.kind == CandidateKind.GLIDE_ALT) {
             val isEn = item.subtitle.startsWith("英")
             return replaceLastGlideAlternative(item.text, isEn, surroundingContext)
@@ -452,6 +653,8 @@ class CompositionSession(
     fun moveFocus(delta: Int): CompositionSnapshot {
         val count = cachedSnapshot.clauses.size
         if (count <= 0) return cachedSnapshot
+        leaveEditing()
+        converting = true
         focusedClauseIdx = (focusedClauseIdx + delta).coerceIn(0, count - 1)
         return recompute(null, keepFocus = true)
     }
@@ -459,6 +662,8 @@ class CompositionSession(
     fun focusClause(index: Int): CompositionSnapshot {
         val count = cachedSnapshot.clauses.size
         if (index in 0 until count) {
+            leaveEditing()
+            converting = true
             focusedClauseIdx = index
         }
         return recompute(null, keepFocus = true)
@@ -470,6 +675,12 @@ class CompositionSession(
     fun commitAndLearn(surroundingContext: String? = null): String {
         val snap = cachedSnapshot
         val committed = snap.previewText
+        if (snap.isEditing) {
+            // The kana view is committed as shown; it is not a conversion result to learn from.
+            committedHistory.clear()
+            clearAll()
+            return committed
+        }
         val mozcClauses = snap.clauses
             .filter { !it.isEnglish && RomajiDetector.isHiraganaOnly(it.reading) }
             .map { ConversionClause(it.reading, it.text) }
@@ -544,6 +755,7 @@ class CompositionSession(
         val snap = cachedSnapshot
         val clauses = snap.clauses
         if (clauses.isEmpty()) return ""
+        if (snap.isEditing) return commitAndLearn(surroundingContext)
         val cutIdx = snap.focusedClauseIndex.coerceIn(0, clauses.lastIndex)
         if (cutIdx == clauses.lastIndex) {
             return commitAndLearn(surroundingContext)
@@ -630,6 +842,9 @@ class CompositionSession(
     private fun recompute(surroundingContext: String?, keepFocus: Boolean = false): CompositionSnapshot {
         val raw = buffer.toString()
         if (raw.isEmpty()) {
+            caretRaw = null
+            kanaRevert = false
+            converting = false
             cachedSnapshot = CompositionSnapshot("", "", "", emptyList(), 0, emptyList(), false)
             return cachedSnapshot
         }
@@ -1072,7 +1287,15 @@ class CompositionSession(
             }
         }
 
-        val preview = displayClauses.joinToString("") { it.text }
+        val editing = caretRaw != null || kanaRevert
+        var preview = displayClauses.joinToString("") { it.text }
+        var caretOffset = -1
+        if (editing) {
+            val units = editUnits()
+            preview = units.joinToString("") { it.text }
+            val p = caretRaw ?: raw.length
+            caretOffset = units.filter { it.rawStart < p }.sumOf { it.text.length }
+        }
         val trace = segments.joinToString("|") { it.raw }
         cachedSnapshot = CompositionSnapshot(
             rawInput = raw,
@@ -1087,7 +1310,10 @@ class CompositionSession(
             canExtendClause = canExtend,
             hasGlideUndo = hasGlideUndo,
             focusedAdjustableKana = adjustableBuf.toString(),
-            focusedAdjustableLen = focusedAdjLen
+            focusedAdjustableLen = focusedAdjLen,
+            isConverting = converting,
+            isEditing = editing,
+            caretOffset = caretOffset
         )
         return cachedSnapshot
     }

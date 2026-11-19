@@ -24,6 +24,8 @@ import android.view.KeyEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.inputmethod.EditorInfo
+import android.view.inputmethod.InputConnection
+import android.view.inputmethod.ExtractedTextRequest
 import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
@@ -217,20 +219,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         partialCommitBtn = makeRailButton("確定✓").apply {
             setOnClickListener {
                 glidePreviewSeq.incrementAndGet()
-                val rawBefore = session.snapshot.rawInput
-                val committed = session.commitFocusedPrefix(getSurroundingTextBefore())
-                if (committed.isNotEmpty()) {
-                    currentInputConnection?.commitText(committed, 1)
-                    if (session.isEmpty) {
-                        recordUndoCommit(rawBefore, committed)
-                    } else {
-                        clearUndoCommit()
-                    }
-                    if (shouldLogEval()) {
-                        evalLogger.logCommit(settings.activePromptId, rawBefore, committed, "partial")
-                    }
-                    renderSnapshot(session.snapshot)
-                }
+                commitFocusedPrefixAndRender("partial")
             }
         }
         langSwitchBtn = makeRailButton("日/英").apply {
@@ -700,6 +689,11 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
                 return
             }
         }
+        if (directCommit && session.isCaretInside) {
+            clearUndoCommit()
+            renderSnapshot(session.appendText(ch.toString(), getSurroundingTextBefore()))
+            return
+        }
         if (directCommit) {
             if (!session.isEmpty) {
                 val raw = session.snapshot.rawInput
@@ -753,6 +747,11 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             renderSnapshot(snap)
             return
         }
+        if (session.isCaretInside) {
+            clearUndoCommit()
+            renderSnapshot(session.appendText(sym, getSurroundingTextBefore()))
+            return
+        }
         if (!session.isEmpty) {
             val raw = session.snapshot.rawInput
             val committed = session.commitAndLearn(getSurroundingTextBefore())
@@ -771,6 +770,11 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         if (isPasswordField) return
         clearUndoCommit()
         val ic = currentInputConnection ?: return
+        if (session.isCaretInside) {
+            session.appendText(open + close, getSurroundingTextBefore())
+            renderSnapshot(session.moveCaret(-close.length, getSurroundingTextBefore()))
+            return
+        }
         if (!session.isEmpty) {
             val committed = session.commitAndLearn(getSurroundingTextBefore())
             ic.commitText(committed + open + close, 1)
@@ -817,6 +821,11 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
                 if (isPeriod) settings.punctuationStyle.period else settings.punctuationStyle.comma
         }
         if (snap.isComposing) {
+            if (session.isCaretInside) {
+                clearUndoCommit()
+                renderSnapshot(session.appendText(punct, getSurroundingTextBefore()))
+                return
+            }
             if (englishMode || (settings.autoCommitOnPunctuation && !lastIsEnglish)) {
                 val raw = snap.rawInput
                 val committed = session.commitAndLearn(getSurroundingTextBefore())
@@ -843,6 +852,24 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             }
             renderSnapshot(session.snapshot)
         }
+    }
+
+    /** Commits the clauses up to the focused one and keeps the rest in composition. */
+    private fun commitFocusedPrefixAndRender(logKind: String) {
+        val rawBefore = session.snapshot.rawInput
+        val committed = session.commitFocusedPrefix(getSurroundingTextBefore())
+        if (committed.isEmpty()) return
+        // Leave the composing region first so the committed part is not replaced by the remainder.
+        currentInputConnection?.commitText(committed, 1)
+        if (session.isEmpty) {
+            recordUndoCommit(rawBefore, committed)
+        } else {
+            clearUndoCommit()
+        }
+        if (shouldLogEval()) {
+            evalLogger.logCommit(settings.activePromptId, rawBefore, committed, logKind)
+        }
+        renderSnapshot(session.snapshot)
     }
 
     override fun onBackspace() {
@@ -980,11 +1007,21 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             renderSnapshot(session.snapshot)
             return
         }
+        if (snap.isEditing) {
+            // Kana view (caret editing or reverted by Backspace): Space converts again from the first clause.
+            renderSnapshot(session.startConversion(getSurroundingTextBefore()))
+            return
+        }
         val lastIsEnglish = snap.clauses.lastOrNull()?.isEnglish == true
         val alreadyHasSpace = snap.rawInput.contains(' ')
-        if (lastIsEnglish || alreadyHasSpace) {
+        if (!snap.isConverting && (lastIsEnglish || alreadyHasSpace)) {
             val next = session.appendChar(' ', getSurroundingTextBefore())
             renderSnapshot(next)
+            return
+        }
+        if (!snap.isConverting && snap.clauses.size > 1) {
+            // First Space starts conversion at the first clause (Gboard style); later Spaces cycle candidates.
+            renderSnapshot(session.startConversion(getSurroundingTextBefore()))
             return
         }
         val currentClause = snap.clauses.getOrNull(snap.focusedClauseIndex)
@@ -1013,6 +1050,12 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             return
         }
         if (isExpandedPanelOpen) isExpandedPanelOpen = false
+        val snapNow = session.snapshot
+        if (snapNow.isConverting && snapNow.focusedClauseIndex < snapNow.clauses.lastIndex) {
+            // Conversion state: Enter commits clause by clause from the first one.
+            commitFocusedPrefixAndRender("enter_partial")
+            return
+        }
         if (!session.isEmpty) {
             val raw = session.snapshot.rawInput
             val committed = session.commitAndLearn(getSurroundingTextBefore())
@@ -1031,6 +1074,11 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
     }
 
     override fun onMoveCursor(delta: Int) {
+        if (!session.isEmpty && !session.snapshot.isConverting) {
+            // Before conversion the arrows move a caret inside the composition (shown as kana).
+            renderSnapshot(session.moveCaret(delta, getSurroundingTextBefore()))
+            return
+        }
         if (!session.isEmpty) {
             val snap = session.snapshot
             if (snap.clauses.size > 1) {
@@ -1236,16 +1284,39 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         traceBadge.text = text
     }
 
+    /** Puts the editor cursor [caret] characters into the composing text of length [len]. */
+    private fun placeComposingCaret(ic: InputConnection, len: Int, caret: Int) {
+        if (caret < 0 || caret >= len) return
+        val end = try {
+            if (Build.VERSION.SDK_INT >= 31) {
+                ic.getSurroundingText(0, 0, 0)?.let { it.offset + it.selectionEnd }
+            } else {
+                null
+            } ?: ic.getExtractedText(ExtractedTextRequest(), 0)?.let { it.startOffset + it.selectionEnd }
+        } catch (_: Exception) {
+            null
+        } ?: return
+        val pos = end - (len - caret)
+        if (pos >= 0) ic.setSelection(pos, pos)
+    }
+
     private fun renderSnapshot(snap: CompositionSnapshot) {
         val dark = isDarkTheme()
         val accent = if (dark) Color.parseColor("#5C8AC4") else Color.parseColor("#4A6F9E")
         val focusBgSpan = if (dark) Color.argb(90, 92, 138, 196) else Color.argb(65, 74, 111, 158)
 
         val ic = currentInputConnection
+        if (snap.isComposing && snap.isEditing) {
+            val spanned = SpannableString(snap.previewText)
+            spanned.setSpan(UnderlineSpan(), 0, spanned.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            ic?.setComposingText(spanned, 1)
+            if (ic != null) placeComposingCaret(ic, snap.previewText.length, snap.caretOffset)
+        }
         if (snap.isComposing) {
             val spanned = SpannableString(snap.previewText)
             var offset = 0
             for ((idx, clause) in snap.clauses.withIndex()) {
+                if (snap.isEditing) break
                 val end = (offset + clause.text.length).coerceAtMost(spanned.length)
                 if (end > offset) {
                     spanned.setSpan(UnderlineSpan(), offset, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
@@ -1255,9 +1326,14 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
                 }
                 offset = end
             }
-            ic?.setComposingText(spanned, 1)
+            if (!snap.isEditing) ic?.setComposingText(spanned, 1)
 
-            val clauseTrace = snap.clauses.joinToString("│") { it.reading }.ifEmpty { snap.romajiTrace }
+            val clauseTrace = if (snap.isEditing) {
+                val c = snap.caretOffset.coerceIn(0, snap.previewText.length)
+                snap.previewText.substring(0, c) + "｜" + snap.previewText.substring(c)
+            } else {
+                snap.clauses.joinToString("│") { it.reading }.ifEmpty { snap.romajiTrace }
+            }
             traceBadge.visibility = View.VISIBLE
             traceBadge.text = clauseTrace
 
