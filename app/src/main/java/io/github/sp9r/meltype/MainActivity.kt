@@ -1171,14 +1171,16 @@ class MainActivity : AppCompatActivity() {
             blueprintView.showNumberRow = it
         }
         switchCard.addView(hairline())
-        addSwitchRow(switchCard, "キー右上の数字・記号ヒントを表示", "0.26秒長押し・上下フリックで数字・記号を入力", settings.showSubLabels) {
+        addSwitchRow(switchCard, "キー右上の数字・記号ヒントを表示", "長押し・上下フリックで数字・記号を入力", settings.showSubLabels) {
             settings.showSubLabels = it
             blueprintView.showSubLabels = it
         }
         switchCard.addView(hairline())
-        addSwitchRow(switchCard, "文字キーの上下フリック記号入力", "ON推奨：上下に短くフリックして右上の数字・記号を入力（横へ滑らせるとグライド）", settings.letterFlickEnabled) {
+        addSwitchRow(switchCard, "文字キーの上下フリック記号入力", "ON推奨：上下に大きくフリックして右上の数字・記号を入力（小さい傾きは無視、横はグライド）", settings.letterFlickEnabled) {
             settings.letterFlickEnabled = it
         }
+        switchCard.addView(hairline())
+        addSymbolSensitivityControl(switchCard)
         switchCard.addView(hairline())
         addSwitchRow(switchCard, "記号入力後に文字キーへ自動復帰", "?123から1文字入力した直後にQWERTYへ戻る", settings.autoReturnFromSymbols) {
             settings.autoReturnFromSymbols = it
@@ -1694,6 +1696,7 @@ class MainActivity : AppCompatActivity() {
         var shiftTyped: List<Char> = emptyList()
         var arrowJitterDirs: List<Pair<Int, Int>> = emptyList()
         var flickSyms: List<Char> = emptyList()
+        var rollChars: List<Char> = emptyList()
         val uiLatch = java.util.concurrent.CountDownLatch(1)
         runOnUiThread {
             try {
@@ -1793,17 +1796,18 @@ class MainActivity : AppCompatActivity() {
                 }
                 arrowJitterDirs = movedDirs.subList(jitterCountBefore, movedDirs.size).toList()
 
-                // Letter key vertical flick (up & down) emits secondary symbol even with glide enabled
+                // Letter key vertical flick (up & down) requires deliberate ±dp(36) swipe; slight thumb rolls keep base letter
                 probeKb.glideEnabled = true
                 probeKb.letterFlickEnabled = true
+                probeKb.flickSensitivity = 1.0f
                 val symBefore = typedChars.size
                 val qCenter = probeKb.firstKeyCenterForTest("q")
                 val sCenter = probeKb.firstKeyCenterForTest("s")
                 if (qCenter != null) {
                     val t0 = android.os.SystemClock.uptimeMillis()
                     val e1 = android.view.MotionEvent.obtain(t0, t0, android.view.MotionEvent.ACTION_DOWN, qCenter.first, qCenter.second, 0)
-                    val e2 = android.view.MotionEvent.obtain(t0, t0 + 30L, android.view.MotionEvent.ACTION_MOVE, qCenter.first, qCenter.second - dp(26).toFloat(), 0)
-                    val e3 = android.view.MotionEvent.obtain(t0, t0 + 60L, android.view.MotionEvent.ACTION_UP, qCenter.first, qCenter.second - dp(26).toFloat(), 0)
+                    val e2 = android.view.MotionEvent.obtain(t0, t0 + 30L, android.view.MotionEvent.ACTION_MOVE, qCenter.first, qCenter.second - dp(36).toFloat(), 0)
+                    val e3 = android.view.MotionEvent.obtain(t0, t0 + 60L, android.view.MotionEvent.ACTION_UP, qCenter.first, qCenter.second - dp(36).toFloat(), 0)
                     probeKb.onTouchEvent(e1)
                     probeKb.onTouchEvent(e2)
                     probeKb.onTouchEvent(e3)
@@ -1814,8 +1818,8 @@ class MainActivity : AppCompatActivity() {
                 if (sCenter != null) {
                     val t0 = android.os.SystemClock.uptimeMillis()
                     val e1 = android.view.MotionEvent.obtain(t0, t0, android.view.MotionEvent.ACTION_DOWN, sCenter.first, sCenter.second, 0)
-                    val e2 = android.view.MotionEvent.obtain(t0, t0 + 30L, android.view.MotionEvent.ACTION_MOVE, sCenter.first, sCenter.second + dp(26).toFloat(), 0)
-                    val e3 = android.view.MotionEvent.obtain(t0, t0 + 60L, android.view.MotionEvent.ACTION_UP, sCenter.first, sCenter.second + dp(26).toFloat(), 0)
+                    val e2 = android.view.MotionEvent.obtain(t0, t0 + 30L, android.view.MotionEvent.ACTION_MOVE, sCenter.first, sCenter.second + dp(36).toFloat(), 0)
+                    val e3 = android.view.MotionEvent.obtain(t0, t0 + 60L, android.view.MotionEvent.ACTION_UP, sCenter.first, sCenter.second + dp(36).toFloat(), 0)
                     probeKb.onTouchEvent(e1)
                     probeKb.onTouchEvent(e2)
                     probeKb.onTouchEvent(e3)
@@ -1824,6 +1828,35 @@ class MainActivity : AppCompatActivity() {
                     e3.recycle()
                 }
                 flickSyms = typedChars.subList(symBefore, typedChars.size).toList()
+
+                val rollBefore = typedChars.size
+                val aCenter = probeKb.firstKeyCenterForTest("a")
+                val oCenter = probeKb.firstKeyCenterForTest("o")
+                if (aCenter != null) {
+                    val t0 = android.os.SystemClock.uptimeMillis()
+                    val e1 = android.view.MotionEvent.obtain(t0, t0, android.view.MotionEvent.ACTION_DOWN, aCenter.first, aCenter.second, 0)
+                    val e2 = android.view.MotionEvent.obtain(t0, t0 + 25L, android.view.MotionEvent.ACTION_MOVE, aCenter.first, aCenter.second - dp(16).toFloat(), 0)
+                    val e3 = android.view.MotionEvent.obtain(t0, t0 + 55L, android.view.MotionEvent.ACTION_UP, aCenter.first, aCenter.second - dp(16).toFloat(), 0)
+                    probeKb.onTouchEvent(e1)
+                    probeKb.onTouchEvent(e2)
+                    probeKb.onTouchEvent(e3)
+                    e1.recycle()
+                    e2.recycle()
+                    e3.recycle()
+                }
+                if (oCenter != null) {
+                    val t0 = android.os.SystemClock.uptimeMillis()
+                    val e1 = android.view.MotionEvent.obtain(t0, t0, android.view.MotionEvent.ACTION_DOWN, oCenter.first, oCenter.second, 0)
+                    val e2 = android.view.MotionEvent.obtain(t0, t0 + 30L, android.view.MotionEvent.ACTION_MOVE, oCenter.first - dp(8).toFloat(), oCenter.second + dp(16).toFloat(), 0)
+                    val e3 = android.view.MotionEvent.obtain(t0, t0 + 65L, android.view.MotionEvent.ACTION_UP, oCenter.first - dp(8).toFloat(), oCenter.second + dp(16).toFloat(), 0)
+                    probeKb.onTouchEvent(e1)
+                    probeKb.onTouchEvent(e2)
+                    probeKb.onTouchEvent(e3)
+                    e1.recycle()
+                    e2.recycle()
+                    e3.recycle()
+                }
+                rollChars = typedChars.subList(rollBefore, typedChars.size).toList()
             } finally {
                 uiLatch.countDown()
             }
@@ -1853,6 +1886,11 @@ class MainActivity : AppCompatActivity() {
             "LetterVerticalFlickUpDown",
             flickSyms == listOf('+', '#'),
             "flickSyms=$flickSyms"
+        )
+        check(
+            "LetterRollNotSymbol",
+            rollChars == listOf('a', 'o'),
+            "rollChars=$rollChars"
         )
 
         val boundarySess = CompositionSession(dicts, engine, converter)
@@ -2055,6 +2093,66 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun addFreeHeightControl(parent: LinearLayout) {
+        addSteppedPercentSlider(
+            parent = parent,
+            title = "高さスケール",
+            minPct = 65,
+            maxPct = 155,
+            currentValue = { settings.keyboardHeightScale },
+            applyValue = { next ->
+                settings.keyboardHeightScale = next
+                blueprintView.heightScale = settings.keyboardHeightScale
+            },
+            formatLabel = { value ->
+                val pct = (value * 100f).roundToInt().coerceIn(65, 155)
+                val baseDp = if (settings.showNumberRow) 264f else 224f
+                val approxDp = (baseDp * value).roundToInt()
+                "${pct}% · ${approxDp}dp"
+            },
+            stepLabels = listOf("-5%", "-1%", "100%", "+1%", "+5%"),
+            stepValues = listOf(-0.05f, -0.01f, null, +0.01f, +0.05f),
+            resetValue = 1.0f
+        )
+    }
+
+    private fun addSymbolSensitivityControl(parent: LinearLayout) {
+        addSteppedPercentSlider(
+            parent = parent,
+            title = "QWERTY記号感度（フリック・長押し）",
+            minPct = 50,
+            maxPct = 150,
+            currentValue = { settings.flickSensitivity },
+            applyValue = { next ->
+                settings.flickSensitivity = next
+            },
+            formatLabel = { value ->
+                val pct = (value * 100f).roundToInt().coerceIn(50, 150)
+                val holdMs = (390f / value.coerceIn(0.50f, 1.50f)).roundToInt().coerceIn(260, 680)
+                val tag = when {
+                    pct < 95 -> "誤爆防止"
+                    pct > 105 -> "高感度"
+                    else -> "標準"
+                }
+                "${pct}% · ${tag} (長押し${holdMs}ms)"
+            },
+            stepLabels = listOf("-10%", "-5%", "100%", "+5%", "+10%"),
+            stepValues = listOf(-0.10f, -0.05f, null, +0.05f, +0.10f),
+            resetValue = 1.0f
+        )
+    }
+
+    private fun addSteppedPercentSlider(
+        parent: LinearLayout,
+        title: String,
+        minPct: Int,
+        maxPct: Int,
+        currentValue: () -> Float,
+        applyValue: (Float) -> Unit,
+        formatLabel: (Float) -> String,
+        stepLabels: List<String>,
+        stepValues: List<Float?>,
+        resetValue: Float
+    ) {
         val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(12), dp(6), dp(12), dp(12))
@@ -2065,7 +2163,7 @@ class MainActivity : AppCompatActivity() {
             setPadding(0, 0, 0, dp(4))
         }
         topRow.addView(TextView(this).apply {
-            text = "高さスケール"
+            text = title
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f)
             setTypeface(null, Typeface.BOLD)
             setTextColor(cText)
@@ -2081,7 +2179,7 @@ class MainActivity : AppCompatActivity() {
         container.addView(topRow)
 
         val seekBar = SeekBar(this).apply {
-            max = 90
+            max = maxPct - minPct
             progressTintList = ColorStateList.valueOf(cAccent)
             thumbTintList = ColorStateList.valueOf(cAccent)
             layoutParams = LinearLayout.LayoutParams(
@@ -2092,14 +2190,11 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        fun updateUiFromScale(scale: Float, updateSeek: Boolean) {
-            val pct = (scale * 100f).roundToInt().coerceIn(65, 155)
-            val baseDp = if (settings.showNumberRow) 264f else 224f
-            val approxDp = (baseDp * scale).roundToInt()
-            valueLabel.text = "${pct}% · ${approxDp}dp"
-            blueprintView.heightScale = scale
+        fun updateUi(value: Float, updateSeek: Boolean) {
+            valueLabel.text = formatLabel(value)
             if (updateSeek) {
-                val targetProg = (pct - 65).coerceIn(0, 90)
+                val pct = (value * 100f).roundToInt().coerceIn(minPct, maxPct)
+                val targetProg = (pct - minPct).coerceIn(0, maxPct - minPct)
                 if (seekBar.progress != targetProg) {
                     seekBar.progress = targetProg
                 }
@@ -2110,9 +2205,9 @@ class MainActivity : AppCompatActivity() {
         seekBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
                 if (updatingProgrammatically) return
-                val nextScale = (65 + progress) / 100f
-                settings.keyboardHeightScale = nextScale
-                updateUiFromScale(settings.keyboardHeightScale, updateSeek = false)
+                val nextValue = (minPct + progress) / 100f
+                applyValue(nextValue)
+                updateUi(currentValue(), updateSeek = false)
             }
             override fun onStartTrackingTouch(sb: SeekBar?) {}
             override fun onStopTrackingTouch(sb: SeekBar?) {}
@@ -2123,14 +2218,8 @@ class MainActivity : AppCompatActivity() {
             orientation = LinearLayout.HORIZONTAL
             setPadding(0, dp(2), 0, 0)
         }
-        val stepSpecs = listOf(
-            "-5%" to { settings.keyboardHeightScale - 0.05f },
-            "-1%" to { settings.keyboardHeightScale - 0.01f },
-            "100%" to { 1.0f },
-            "+1%" to { settings.keyboardHeightScale + 0.01f },
-            "+5%" to { settings.keyboardHeightScale + 0.05f }
-        )
-        stepSpecs.forEachIndexed { idx, (label, calc) ->
+        stepLabels.forEachIndexed { idx, label ->
+            val delta = stepValues[idx]
             val btn = TextView(this).apply {
                 text = label
                 gravity = Gravity.CENTER
@@ -2139,12 +2228,13 @@ class MainActivity : AppCompatActivity() {
                 setTextColor(cText)
                 background = boxBg(cSurfaceSubtle, cBorder, 4)
                 layoutParams = LinearLayout.LayoutParams(0, dp(32), 1f).apply {
-                    if (idx < stepSpecs.lastIndex) marginEnd = dp(5)
+                    if (idx < stepLabels.lastIndex) marginEnd = dp(5)
                 }
                 setOnClickListener {
-                    settings.keyboardHeightScale = calc().coerceIn(0.65f, 1.55f)
+                    val target = if (delta == null) resetValue else (currentValue() + delta)
+                    applyValue(target.coerceIn(minPct / 100f, maxPct / 100f))
                     updatingProgrammatically = true
-                    updateUiFromScale(settings.keyboardHeightScale, updateSeek = true)
+                    updateUi(currentValue(), updateSeek = true)
                     updatingProgrammatically = false
                 }
             }
@@ -2153,7 +2243,8 @@ class MainActivity : AppCompatActivity() {
         container.addView(btnRow)
 
         updatingProgrammatically = true
-        updateUiFromScale(settings.keyboardHeightScale, updateSeek = true)
+        applyValue(currentValue())
+        updateUi(currentValue(), updateSeek = true)
         updatingProgrammatically = false
         parent.addView(container)
     }

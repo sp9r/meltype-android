@@ -2163,43 +2163,64 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         }
         expandedContent.addView(statusText)
 
-        // Quick height adjustment strip inside keyboard
-        val heightRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(2), 0, dp(8))
+        fun addQuickStepRow(label: String, steps: List<Pair<String, () -> Unit>>) {
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(0, dp(2), 0, dp(8))
+            }
+            row.addView(TextView(this).apply {
+                text = label
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                setTextColor(mutedCol)
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            })
+            for ((lbl, fn) in steps) {
+                val b = makePanelButton(lbl, cardBg, textCol, border) { fn() }
+                b.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(32)).apply {
+                    marginStart = dp(4)
+                }
+                row.addView(b)
+            }
+            expandedContent.addView(row)
         }
-        val pct = (settings.keyboardHeightScale * 100f).roundToInt()
-        val heightLabel = TextView(this).apply {
-            text = "高さ ${pct}%"
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-            setTextColor(mutedCol)
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-        }
-        heightRow.addView(heightLabel)
 
+        // Quick height and symbol-sensitivity adjustment strips inside keyboard
+        val pct = (settings.keyboardHeightScale * 100f).roundToInt()
         fun adjustHeight(delta: Float?, exact: Float? = null) {
             val next = (exact ?: (settings.keyboardHeightScale + (delta ?: 0f))).coerceIn(0.65f, 1.55f)
             settings.keyboardHeightScale = next
             applySettingsToViews()
             populateExpandedPanel(session.snapshot)
         }
-
-        val hSteps = listOf(
-            "-5%" to { adjustHeight(-0.05f) },
-            "-2%" to { adjustHeight(-0.02f) },
-            "100%" to { adjustHeight(null, 1.0f) },
-            "+2%" to { adjustHeight(+0.02f) },
-            "+5%" to { adjustHeight(+0.05f) }
+        addQuickStepRow(
+            "高さ ${pct}%",
+            listOf(
+                "-5%" to { adjustHeight(-0.05f) },
+                "-2%" to { adjustHeight(-0.02f) },
+                "100%" to { adjustHeight(null, 1.0f) },
+                "+2%" to { adjustHeight(+0.02f) },
+                "+5%" to { adjustHeight(+0.05f) }
+            )
         )
-        for ((lbl, fn) in hSteps) {
-            val b = makePanelButton(lbl, cardBg, textCol, border) { fn() }
-            b.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(32)).apply {
-                marginStart = dp(4)
-            }
-            heightRow.addView(b)
+
+        val sensPct = (settings.flickSensitivity * 100f).roundToInt()
+        fun adjustSymSensitivity(delta: Float?, exact: Float? = null) {
+            val next = (exact ?: (settings.flickSensitivity + (delta ?: 0f))).coerceIn(0.50f, 1.50f)
+            settings.flickSensitivity = next
+            applySettingsToViews()
+            populateExpandedPanel(session.snapshot)
         }
-        expandedContent.addView(heightRow)
+        addQuickStepRow(
+            "記号感度 ${sensPct}%",
+            listOf(
+                "-10%" to { adjustSymSensitivity(-0.10f) },
+                "-5%" to { adjustSymSensitivity(-0.05f) },
+                "100%" to { adjustSymSensitivity(null, 1.0f) },
+                "+5%" to { adjustSymSensitivity(+0.05f) },
+                "+10%" to { adjustSymSensitivity(+0.10f) }
+            )
+        )
 
         if (!snap.isComposing) {
             val numRowToggle = makePanelButton(

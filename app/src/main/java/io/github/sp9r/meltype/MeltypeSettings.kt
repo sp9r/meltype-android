@@ -103,8 +103,8 @@ class MeltypeSettings(context: Context) {
         set(value) = prefs.edit().putBoolean(KEY_AUTO_RETURN_SYMBOLS, value).apply()
 
     var flickSensitivity: Float
-        get() = prefs.getFloat(KEY_FLICK_SENSITIVITY, 1.0f).coerceIn(0.7f, 1.4f)
-        set(value) = prefs.edit().putFloat(KEY_FLICK_SENSITIVITY, value.coerceIn(0.7f, 1.4f)).apply()
+        get() = prefs.getFloat(KEY_FLICK_SENSITIVITY, 1.0f).coerceIn(0.50f, 1.50f)
+        set(value) = prefs.edit().putFloat(KEY_FLICK_SENSITIVITY, value.coerceIn(0.50f, 1.50f)).apply()
 
     var autoCommitOnPunctuation: Boolean
         get() = prefs.getBoolean(KEY_AUTO_COMMIT_PUNCT, false)
