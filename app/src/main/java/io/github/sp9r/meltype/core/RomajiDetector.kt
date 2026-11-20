@@ -108,6 +108,12 @@ object RomajiDetector {
     )
 
     private val STRICT_DISALLOWED_SINGLE_LETTERS = setOf('l', 'q', 'v', 'x')
+    val SMALL_KANA_PREFIXES = setOf(
+        "ltu", "ltsu", "xtu", "xtsu",
+        "lya", "lyu", "lyo", "xya", "xyu", "xyo",
+        "lwa", "xwa", "lka", "lke", "xka", "xke", "xn"
+    )
+    val SMALL_SOKUON_KEYS = setOf("ltu", "ltsu", "xtu", "xtsu")
     private val VOWELS = setOf('a', 'i', 'u', 'e', 'o')
     private val LONG_VOWEL_DIGRAPHS = setOf(
         "おう", "こう", "そう", "とう", "のう", "ほう", "もう", "よう", "ろう", "ごう", "ぞう", "どう", "ぼう", "ぽう",
@@ -155,11 +161,6 @@ object RomajiDetector {
         while (i < raw.length) {
             val ch = raw[i]
 
-            if (strictForDetection && ch in STRICT_DISALLOWED_SINGLE_LETTERS) {
-                strictValid = false
-                invalidReason = "ローマ字に通常使わない文字 ($ch)"
-            }
-
             // Explicit n' / nn / xn
             if (i + 1 < raw.length && raw.startsWith("n'", i)) {
                 chunks.add(RomajiChunk(i, i + 2, raw.substring(i, i + 2), "ん"))
@@ -176,7 +177,9 @@ object RomajiDetector {
                 val sub = raw.substring(i, i + len)
                 val kana = FULL_TABLE[sub]
                 if (kana != null) {
-                    if (strictForDetection && sub.firstOrNull() in STRICT_DISALLOWED_SINGLE_LETTERS && sub != "-") {
+                    if (strictForDetection && sub.firstOrNull() in STRICT_DISALLOWED_SINGLE_LETTERS &&
+                        sub != "-" && sub !in SMALL_KANA_PREFIXES
+                    ) {
                         strictValid = false
                         invalidReason = "英語・記号寄り綴り ($sub)"
                     }
@@ -193,6 +196,7 @@ object RomajiDetector {
                 // So a single 'n' won't match FULL_TABLE directly!
                 if (sub in STRICT_YOUON_PREFIXES) strongYouon++
                 if (sub == "tsu") tsuCount++
+                if (sub in SMALL_SOKUON_KEYS) sokuonCount++
                 chunks.add(RomajiChunk(i, i + matchedLen, sub, matchedKana))
                 kanaOut.append(matchedKana)
                 if (kanaOut.length >= 2) {
@@ -203,6 +207,11 @@ object RomajiDetector {
                 }
                 i += matchedLen
                 continue
+            }
+
+            if (strictForDetection && ch in STRICT_DISALLOWED_SINGLE_LETTERS) {
+                strictValid = false
+                if (invalidReason == null) invalidReason = "ローマ字に通常使わない文字 ($ch)"
             }
 
             // Special rule for 'n': followed by a consonant (not vowel, not 'y', not 'n', not '\'')
@@ -227,10 +236,11 @@ object RomajiDetector {
                 }
             }
 
-            // Bilabial 'm' before b/p/m acts as moraic nasal 'ん' (e.g. shimbun, sampo, tempura, ammari)
+            // Bilabial 'm' before b/p acts as moraic nasal 'ん' (e.g. shimbun, sampo, tempura).
+            // Double 'mm' (e.g. sammu-) falls through to sokuon 'っ' so "sammu-" -> "さっむー".
             if (ch == 'm' && i + 1 < raw.length) {
                 val mNext = raw[i + 1]
-                if (mNext == 'b' || mNext == 'p' || mNext == 'm') {
+                if (mNext == 'b' || mNext == 'p') {
                     chunks.add(RomajiChunk(i, i + 1, "m", "ん"))
                     kanaOut.append("ん")
                     i += 1

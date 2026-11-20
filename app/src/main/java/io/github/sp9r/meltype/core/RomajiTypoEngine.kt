@@ -1,8 +1,10 @@
 package io.github.sp9r.meltype.core
 
 import io.github.sp9r.meltype.glide.GlideDecoder
+import io.github.sp9r.meltype.glide.KeyLayoutGeometry
 import java.util.Arrays
 import kotlin.math.abs
+import kotlin.math.hypot
 import kotlin.math.min
 
 data class RomajiFix(
@@ -218,18 +220,44 @@ class RomajiTypoEngine(private val dictionaries: MeltypeDictionaries) {
         letters: String,
         final: Boolean,
         spatialWeights: List<Map<Char, Float>> = emptyList()
-    ): RomajiFix? {
+    ): RomajiFix? = rankUnreadableFixes(letters, final, spatialWeights, limit = 1).firstOrNull()
+
+    fun suggestUnreadableFixes(
+        letters: String,
+        final: Boolean,
+        spatialWeights: List<Map<Char, Float>> = emptyList(),
+        limit: Int = 3
+    ): List<RomajiFix> = rankUnreadableFixes(letters, final, spatialWeights, limit)
+
+    private fun neighborSubstitutePrior(from: Char, to: Char, spatialBonus: Float): Double {
+        val c1 = KeyLayoutGeometry.centerOf(from)
+        val c2 = KeyLayoutGeometry.centerOf(to)
+        val basePrior = if (c1 != null && c2 != null) {
+            val d = hypot((c1.x - c2.x).toDouble(), (c1.y - c2.y).toDouble())
+            0.24 + (d / 0.45).coerceIn(0.35, 1.0) * 0.12
+        } else {
+            0.30
+        }
+        return basePrior - spatialBonus * 0.20
+    }
+
+    private fun rankUnreadableFixes(
+        letters: String,
+        final: Boolean,
+        spatialWeights: List<Map<Char, Float>>,
+        limit: Int
+    ): List<RomajiFix> {
         val lower = letters.lowercase()
-        if (lower.length < 3 || !lower.all { it in 'a'..'z' }) return null
+        if (lower.length < 3 || !lower.all { it in 'a'..'z' }) return emptyList()
         if (dictionaries.englishAllWords.contains(lower) || dictionaries.properNounCanonical.containsKey(lower)) {
-            return null
+            return emptyList()
         }
 
         val first = firstUnreadableOffset(lower, final)
-        if (first < 0) return null
+        if (first < 0) return emptyList()
 
         // Wait until >= 2 characters follow an unreadable consonant while still typing live.
-        if (!final && lower.length - first - 1 < 2) return null
+        if (!final && lower.length - first - 1 < 2) return emptyList()
 
         // Trailing extra neighbor consonant (e.g. "yoroshikuy" where 'y' is next to 'u')
         val firstAnalysis = RomajiDetector.analyze(lower, strictForDetection = false)
@@ -241,7 +269,7 @@ class RomajiTypoEngine(private val dictionaries: MeltypeDictionaries) {
                 val trimmed = lower.dropLast(1)
                 val kana = RomajiDetector.analyze(trimmed).finalizedHiragana()
                 if (kana.length >= 2 && segmentKana(kana, kana.length - 1).second) {
-                    return RomajiFix(letters, trimmed, kana, cost = 1.0, isSingleWholeWord = kana in words)
+                    return listOf(RomajiFix(letters, trimmed, kana, cost = 1.0, isSingleWholeWord = kana in words))
                 }
             }
         }
@@ -267,7 +295,11 @@ class RomajiTypoEngine(private val dictionaries: MeltypeDictionaries) {
                     val spatialForIdx = spatialWeights.getOrNull(k)
                     for (n in near) {
                         val sb = (spatialForIdx?.get(n) ?: 0f).coerceIn(0f, 1f)
-                        consider(lower.substring(0, k) + n + lower.substring(k + 1), k, 0.30 - sb * 0.20)
+                        consider(
+                            lower.substring(0, k) + n + lower.substring(k + 1),
+                            k,
+                            neighborSubstitutePrior(c, n, sb)
+                        )
                     }
                 }
                 // 2. Accidental extra neighbor or doubled key press
@@ -292,7 +324,7 @@ class RomajiTypoEngine(private val dictionaries: MeltypeDictionaries) {
                 consider(lower.substring(0, k) + n + lower.substring(k), k, prior)
             }
         }
-        if (candidates.isEmpty()) return null
+        if (candidates.isEmpty()) return emptyList()
 
         val ranked = ArrayList<RomajiFix>(candidates.size)
         for ((candLetters, info) in candidates) {
@@ -319,18 +351,31 @@ class RomajiTypoEngine(private val dictionaries: MeltypeDictionaries) {
             val wholeBonus = if (kana in words) -0.4 else 0.0
             ranked.add(RomajiFix(letters, candLetters, kana, cost = segCost + prior + wholeBonus, isSingleWholeWord = kana in words))
         }
-        if (ranked.isEmpty()) return null
+        if (ranked.isEmpty()) return emptyList()
         ranked.sortBy { it.cost }
-
-        // Avoid flipping when two distinct kana outcomes tie too closely
-        if (ranked.size > 1 && ranked[1].kana != ranked[0].kana && ranked[1].cost - ranked[0].cost < 0.15) {
-            return null
-        }
 
         val rawKana = RomajiDetector.analyze(lower, strictForDetection = false).displayKanaOrTail
         val rawCost = rawSegmentPenalty(rawKana)
-        if (ranked[0].cost >= rawCost) return null
-        return ranked[0]
+        val improving = ranked.filter { it.cost < rawCost }
+        if (improving.isEmpty()) return emptyList()
+        // When two repairs tie closely and the raw gain is modest, stay conservative;
+        // when the raw slice has heavy unreadable ASCII penalty, prefer top repair + alternates.
+        if (improving.size > 1 &&
+            improving[1].kana != improving[0].kana &&
+            improving[1].cost - improving[0].cost < 0.15 &&
+            rawCost - improving[0].cost < 2.0
+        ) {
+            return emptyList()
+        }
+        val out = ArrayList<RomajiFix>(limit)
+        val seenKana = HashSet<String>()
+        for (item in improving) {
+            if (seenKana.add(item.kana)) {
+                out.add(item)
+                if (out.size >= limit) break
+            }
+        }
+        return out
     }
 
     private fun endsWithWordPlusParticle(kana: String): Boolean {
@@ -410,13 +455,6 @@ class RomajiTypoEngine(private val dictionaries: MeltypeDictionaries) {
         if (!lower.endsWith("n")) {
             tryCand("${lower}n", 0.40)
         }
-        // Missed consonant before vowel inside short stems? (e.g. "watahi" -> "watashi" by inserting 's' after vowel)
-        for (i in 1 until lower.length) {
-            val subS = if (lower[i] in VOWELS || lower[i] == 'h') lower.substring(0, i) + 's' + lower.substring(i) else null
-            if (subS != null) tryCand(subS, 0.55)
-            val subT = if (lower[i] in VOWELS || lower[i] == 's') lower.substring(0, i) + 't' + lower.substring(i) else null
-            if (subT != null) tryCand(subT, 0.55)
-        }
 
         results.sortBy { it.cost }
         return results.take(5)
@@ -486,13 +524,14 @@ class RomajiTypoEngine(private val dictionaries: MeltypeDictionaries) {
     companion object {
         private val VOWELS = setOf('a', 'i', 'u', 'e', 'o')
 
+        // Gboard Japanese QWERTY layout (a..l left-aligned, z..m half-key offset below d..l)
         private val NEIGHBORS = mapOf(
             'q' to "wa", 'w' to "qeas", 'e' to "wrsd", 'r' to "etdf", 't' to "ryfg",
             'y' to "tugh", 'u' to "yihj", 'i' to "uojk", 'o' to "ipkl", 'p' to "ol",
-            'a' to "qwsz", 's' to "weadzx", 'd' to "erfsxc", 'f' to "rtdgcv", 'g' to "tyfhvb",
-            'h' to "yugjbn", 'j' to "uihknm", 'k' to "iojlm", 'l' to "opk",
-            'z' to "asx", 'x' to "zsdc", 'c' to "xdfv", 'v' to "cfgb", 'b' to "vghn",
-            'n' to "bhjm", 'm' to "njk"
+            'a' to "qwsz", 's' to "weadzx", 'd' to "erfsxzc", 'f' to "rtdgcvx", 'g' to "tyfhvbc",
+            'h' to "yugjbnv", 'j' to "uihknmb", 'k' to "iojlmn", 'l' to "opkm",
+            'z' to "asdx", 'x' to "sdfzc", 'c' to "dfgxv", 'v' to "fghcb", 'b' to "ghjvn",
+            'n' to "hjkbm", 'm' to "jkln"
         )
 
         private val V5_ROWS = mapOf(
@@ -518,7 +557,13 @@ class RomajiTypoEngine(private val dictionaries: MeltypeDictionaries) {
             "ござい", "ございます", "だけ", "しか", "ほど", "くらい", "ぐらい", "など", "なら",
             "たら", "だら", "たり", "だり", "ずつ", "そう", "らしい", "みたい", "ほう", "とき", "ところ", "ため", "はず", "わけ",
             "ました", "ません", "ましょう", "ませんでした", "でした", "でしょう", "ている", "ていた", "てい", "てる", "てた", "ちゃった",
-            "なかった", "たかった", "ないで", "なくて", "られた", "れた", "でしょうか", "ですか", "ますか", "ですね", "ますね", "ですよ", "ますよ"
+            "なかった", "たかった", "ないで", "なくて", "られた", "れた", "でしょうか", "ですか", "ますか", "ですね", "ますね", "ですよ", "ますよ",
+            "なきゃ", "なくちゃ", "なければ", "ないと", "ちゃう", "ちゃっ", "ちゃった", "じゃう", "じゃっ", "じゃった",
+            "てない", "とく", "といた", "といて", "らない", "らなく", "らなかっ",
+            "かない", "がない", "さない", "たない", "なない", "ばない", "まない", "わない", "れない", "られない",
+            "っぽい", "っぱ", "やっぱ", "めっちゃ", "ちゃんと", "ほんと", "ほんとに", "まじ", "まじで",
+            "なんか", "なんて", "なんで", "やろ", "やん", "よね", "じゃん", "かな", "かなあ", "かも", "っけ",
+            "だし", "だけど", "だった", "だったら", "なのに", "なので"
         )
     }
 }

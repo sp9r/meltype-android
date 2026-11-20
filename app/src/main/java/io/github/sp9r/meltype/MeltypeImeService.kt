@@ -149,6 +149,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         super.onCreate()
         settings = MeltypeSettings(this)
         settings.migrateV170()
+        settings.migrateV174()
         evalLogger = GlideEvalLogger(filesDir)
         try {
             (getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager)?.addPrimaryClipChangedListener(clipListener)
@@ -1385,13 +1386,15 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         val snap = session.snapshot
         val inEnglishSentence = snap.isComposing && snap.rawInput.contains(' ') &&
             snap.clauses.lastOrNull()?.isEnglish == true
+        val useEnglishGlide = englishMode || settings.glideEnglishOnly
+        val preferJp = !useEnglishGlide && !inEnglishSentence
         val copiedPoints = points.toList()
         val boundsCopy = RectF(letterBounds)
         glidePreviewExecutor.execute {
             if (glidePreviewSeq.get() != seq) return@execute
             val norm = KeyLayoutGeometry.normalizeFromView(copiedPoints, boundsCopy)
             val cands = englishOnly(
-                decoder.decode(norm, maxResults = if (englishMode) 8 else 3, preferJapanese = !englishMode && !inEnglishSentence, fastPreview = true)
+                decoder.decode(norm, maxResults = if (useEnglishGlide) 8 else 3, preferJapanese = preferJp, fastPreview = true)
             ).take(3)
             if (cands.isEmpty() || glidePreviewSeq.get() != seq) return@execute
             val preview = cands.joinToString(" | ") { c ->
@@ -1415,10 +1418,11 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         val snap = session.snapshot
         val inEnglishSentence = snap.isComposing && snap.rawInput.contains(' ') &&
             snap.clauses.lastOrNull()?.isEnglish == true
-        val preferJp = !englishMode && !inEnglishSentence
+        val useEnglishGlide = englishMode || settings.glideEnglishOnly
+        val preferJp = !useEnglishGlide && !inEnglishSentence
         val loggingEval = shouldLogEval()
         val debugRes = if (loggingEval) {
-            decoder.decodeDebug(norm, maxResults = if (englishMode) 20 else 10, preferJapanese = preferJp)
+            decoder.decodeDebug(norm, maxResults = if (useEnglishGlide) 20 else 10, preferJapanese = preferJp)
         } else {
             null
         }
@@ -1426,7 +1430,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             if (debugRes != null) {
                 debugRes.candidates.map { GlideCandidate(it.word, it.isEnglish, it.scoreCost, it.kanaHint) }
             } else {
-                decoder.decode(norm, maxResults = if (englishMode) 20 else 8, preferJapanese = preferJp, fastPreview = false)
+                decoder.decode(norm, maxResults = if (useEnglishGlide) 20 else 8, preferJapanese = preferJp, fastPreview = false)
             }
         ).take(8)
         val composingBefore = snap.rawInput
@@ -1517,9 +1521,9 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         }
     }
 
-    /** In English mode keep only English glide candidates (falling back to all if none decoded). */
+    /** In English mode or when English-only glide is enabled, keep only English glide candidates (falling back if none). */
     private fun englishOnly(cands: List<GlideCandidate>): List<GlideCandidate> =
-        if (englishMode) cands.filter { it.isEnglish }.ifEmpty { cands } else cands
+        if (englishMode || settings.glideEnglishOnly) cands.filter { it.isEnglish }.ifEmpty { cands } else cands
 
     private fun showTransientTrace(text: String) {
         if (!::traceBadge.isInitialized) return

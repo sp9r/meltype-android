@@ -246,10 +246,15 @@ class GlideDecoder(private val dictionaries: MeltypeDictionaries) {
         }
 
         // Tier 1: Core everyday Japanese romaji & particles
+        val highFreqGreetings = setOf(
+            "arigatou", "arigatougozaimasu", "ohayou", "ohayougozaimasu",
+            "konnichiwa", "onegaishimasu", "sumimasen"
+        )
         for ((rom, hiraHint) in CORE_JAPANESE_PAIRS) {
-            registerJapaneseHira(hiraHint, freqBonus = 0.56f, explicitRomaji = rom)
+            val bonus = if (rom in highFreqGreetings) 0.80f else 0.56f
+            registerJapaneseHira(hiraHint, freqBonus = bonus, explicitRomaji = rom)
             if (!rom.endsWith("ha") && !rom.endsWith("wo")) {
-                registerJapaneseHira(hiraHint, freqBonus = 0.54f)
+                registerJapaneseHira(hiraHint, freqBonus = bonus - 0.02f)
             }
         }
         for (jp in dictionaries.japaneseCanonicalWords) {
@@ -314,14 +319,14 @@ class GlideDecoder(private val dictionaries: MeltypeDictionaries) {
             registerTemplate(w, w, isEnglish = true, freqBonus = 0.12f)
         }
 
-        // Tier 5 English (39k SCOWL): only allow medium-long words (>= 5 chars) that do NOT look like
-        // valid Japanese romaji, with negative prior so rare English words never hijack Japanese glides.
+        // Tier 5 English (39k SCOWL): register 5..14-char non-romaji English words not already in Tier 1-3
+        // so cold initialization stays fast while English-only glide still covers broad vocabulary.
         for (w in dictionaries.englishAllWords.allWords()) {
-            if (w.length in 5..14 && w !in japaneseTraceSet && !dictionaries.japaneseWords.contains(w)) {
+            if (w.length in 5..14 && w !in japaneseTraceSet && !dictionaries.japaneseWords.contains(w) && !seen.containsKey("$w|$w|E")) {
                 val rom = RomajiDetector.analyze(w, strictForDetection = true)
                 val looksLikeJp = rom.isStrictValid && rom.pendingTail.isEmpty() && rom.chunks.size >= 2
                 if (!looksLikeJp) {
-                    registerTemplate(w, w, isEnglish = true, freqBonus = -0.42f)
+                    registerTemplate(w, w, isEnglish = true, freqBonus = -0.32f)
                 }
             }
         }
@@ -420,8 +425,8 @@ class GlideDecoder(private val dictionaries: MeltypeDictionaries) {
         val endX = normalizedPoints.last().x
         val endY = normalizedPoints.last().y
 
-        val startLimit = if (fastPreview) 5 else 8
-        val endLimit = if (fastPreview) 5 else 8
+        val startLimit = if (fastPreview) 5 else 12
+        val endLimit = if (fastPreview) 5 else 12
         val maxEndpointDist = if (fastPreview) 0.58f else 0.68f
         val startKeys = KeyLayoutGeometry.nearestKeys(startX, startY, limit = startLimit)
         val endKeys = KeyLayoutGeometry.nearestKeys(endX, endY, limit = endLimit)
@@ -463,6 +468,7 @@ class GlideDecoder(private val dictionaries: MeltypeDictionaries) {
             val endpointCost = pairCosts[pIdx]
             val bucket = buckets[pairBuckets[pIdx]]
             for (entry in bucket) {
+                if (!preferJapanese && !entry.isEnglish) continue
                 val lenDiff = abs(pathLen - entry.arcLen)
                 val maxLenBound = maxOf(pathLen, entry.arcLen) * 0.85f + 0.65f
                 if (lenDiff > maxLenBound) continue
@@ -542,16 +548,37 @@ class GlideDecoder(private val dictionaries: MeltypeDictionaries) {
             a to nearMask
         }
 
+        val (pCx, pCy, pScale) = templateCentroidAndScale(path, n)
+        val pInvScale = 1f / pScale
         val candidates = ArrayList<GlideCandidate>(stage1.size + 8)
         for (hit in stage1) {
             val e = hit.entry
             var cornerAdj = 0f
             for ((anchor, nearMask) in interiorAnchors) {
                 if (nearMask != 0) {
-                    if ((e.letterMask and nearMask) == 0) {
-                        cornerAdj += 0.10f * anchor.sharpness
-                    } else {
+                    if ((e.letterMask and nearMask) != 0) {
                         cornerAdj -= 0.03f * anchor.sharpness
+                    } else {
+                        val naX = ((anchor.x - pCx) * pInvScale) * e.tplScale + e.tplCx
+                        val naY = ((anchor.y - pCy) * pInvScale) * e.tplScale + e.tplCy
+                        var alignedHit = false
+                        var remMask = e.letterMask
+                        while (remMask != 0) {
+                            val bit = Integer.numberOfTrailingZeros(remMask)
+                            remMask = remMask and (remMask - 1)
+                            val kc = KeyLayoutGeometry.centerOf(('a'.code + bit).toChar()) ?: continue
+                            val adx = naX - kc.x
+                            val ady = naY - kc.y
+                            if (adx * adx + ady * ady < 0.1296f) {
+                                alignedHit = true
+                                break
+                            }
+                        }
+                        if (alignedHit) {
+                            cornerAdj -= 0.02f * anchor.sharpness
+                        } else {
+                            cornerAdj += 0.10f * anchor.sharpness
+                        }
                     }
                 }
             }
@@ -614,8 +641,8 @@ class GlideDecoder(private val dictionaries: MeltypeDictionaries) {
             decodeCompoundSplits(normalizedPoints, pathLen, endKeys, n, candidates, debugBreakdownsOut)
         }
 
-        // Syllable lattice fallback if trajectory anchors themselves form strict valid romaji
-        if (anchors.size >= 2) {
+        // Syllable lattice fallback if trajectory anchors themselves form strict valid romaji (Japanese glide mode only)
+        if (preferJapanese && anchors.size >= 2) {
             val dedupChars = ArrayList<Char>(anchors.size)
             for (a in anchors) {
                 if (dedupChars.lastOrNull() != a.nearestChar) dedupChars.add(a.nearestChar)

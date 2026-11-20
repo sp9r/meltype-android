@@ -1127,14 +1127,16 @@ class CompositionSession(
                     if (useTypoFix && seg.raw.all { it in 'a'..'z' || it in 'A'..'Z' }) {
                         val hasUnreadable = typoEngine.firstUnreadableOffset(rawLower, final = false) >= 0
                         if (hasUnreadable) {
-                            val fix = typoEngine.fixUnreadable(rawLower, final = false, spatialWeights = segSpatial)
+                            val fixes = typoEngine.suggestUnreadableFixes(rawLower, final = false, spatialWeights = segSpatial)
+                            val fix = fixes.firstOrNull()
                             if (fix != null) {
                                 if (literalLocked) {
-                                    addCorrection(fix.right, fix.kana)
+                                    for (f in fixes) addCorrection(f.right, f.kana)
                                 } else {
                                     effectiveRaw = fix.right
                                     rawTypoFallback = RomajiDetector.analyze(rawLower, strictForDetection = false).finalizedHiragana()
                                     unreadableFixApplied = true
+                                    for (alt in fixes.drop(1)) addCorrection(alt.right, alt.kana)
                                 }
                             }
                         }
@@ -1177,7 +1179,8 @@ class CompositionSession(
                                 marginOk &&
                                 !typoEngine.isKnownWord(convertibleHira) &&
                                 !typoEngine.hasKnownReadingPrefix(convertibleHira) &&
-                                rawNotCohesive
+                                rawNotCohesive &&
+                                (hasRareQCluster || spatiallySupported(rawLower, top.right, segSpatial))
                             // Sentence-level rewrite: the typed reading contains an unknown piece, the fix
                             // makes the whole reading known, and the tap actually landed near the fixed key.
                             val sentenceRewrite = !wordRewrite &&
@@ -1269,7 +1272,9 @@ class CompositionSession(
                             } else {
                                 converter.convertClauses(activeHira, segContext)
                             }
-                            converted ?: listOf(ConversionClause(activeHira, activeHira))
+                            val rawClauses = converted ?: listOf(ConversionClause(activeHira, activeHira))
+                            val phrased = applyPhrasesAtClauseBoundaries(activeHira, rawClauses, segContext)
+                            coalesceColloquialSokuonLongVowels(phrased)
                         }
 
                         var readingCursor = 0
@@ -1538,6 +1543,105 @@ class CompositionSession(
             editKanaCaret = editKanaCaret
         )
         return cachedSnapshot
+    }
+
+    /**
+     * Applies multi-char bundled phrases (e.g. こうかいあか->公開垢, めんへら->メンヘラ)
+     * when a phrase starts at a Mozc clause boundary inside a longer sentence.
+     */
+    private fun applyPhrasesAtClauseBoundaries(
+        reading: String,
+        clauses: List<ConversionClause>,
+        baseContext: String?
+    ): List<ConversionClause> {
+        val phrases = dictionaries.readingToPhrases
+        if (phrases.isEmpty() || reading.length < 4 || clauses.isEmpty()) return clauses
+
+        val out = ArrayList<ConversionClause>(clauses.size + 2)
+        var idx = 0
+        var readingPos = 0
+        val ctx = StringBuilder(baseContext ?: "")
+
+        while (idx < clauses.size && readingPos < reading.length) {
+            var matchedKey: String? = null
+            var matchedVal: String? = null
+            val remaining = reading.substring(readingPos)
+            for ((k, v) in phrases) {
+                if (k.length >= 4 && remaining.startsWith(k)) {
+                    if (matchedKey == null || k.length > matchedKey.length) {
+                        matchedKey = k
+                        matchedVal = v
+                    }
+                }
+            }
+            if (matchedKey != null && matchedVal != null) {
+                // Check if Mozc already produced the exact phrase surface at this position
+                var coverLen = 0
+                var coverIdx = idx
+                val coverText = StringBuilder()
+                while (coverIdx < clauses.size && coverLen < matchedKey.length) {
+                    coverLen += clauses[coverIdx].reading.length
+                    coverText.append(clauses[coverIdx].text)
+                    coverIdx++
+                }
+                if (coverLen == matchedKey.length && coverText.toString() == matchedVal) {
+                    while (idx < coverIdx) {
+                        out.add(clauses[idx])
+                        ctx.append(clauses[idx].text)
+                        readingPos += clauses[idx].reading.length
+                        idx++
+                    }
+                    continue
+                }
+                out.add(ConversionClause(matchedKey, matchedVal))
+                ctx.append(matchedVal)
+                readingPos += matchedKey.length
+                val tailAfter = reading.substring(readingPos)
+                if (tailAfter.isEmpty()) break
+                val tailClauses = converter.convertClauses(tailAfter, ctx.toString().ifEmpty { null })
+                    ?: listOf(ConversionClause(tailAfter, tailAfter))
+                out.addAll(applyPhrasesAtClauseBoundaries(tailAfter, tailClauses, ctx.toString().ifEmpty { null }))
+                return out
+            }
+            val c = clauses[idx]
+            out.add(c)
+            ctx.append(c.text)
+            readingPos += c.reading.length
+            idx++
+        }
+        return out
+    }
+
+    /**
+     * Prevents Mozc from splitting colloquial emphatic forms like "さっむー" / "あっつー"
+     * (pattern: [kana]っ[kana]ー) into unnatural kanji + katakana chunks (e.g. "察" + "ムー").
+     */
+    private fun coalesceColloquialSokuonLongVowels(clauses: List<ConversionClause>): List<ConversionClause> {
+        if (clauses.size < 2) return clauses
+        fun isColloquialEmphatic(r: String): Boolean =
+            r.length == 4 &&
+                r[0] in '\u3041'..'\u3096' &&
+                r[1] == 'っ' &&
+                r[2] in '\u3041'..'\u3096' &&
+                r[3] == 'ー'
+
+        val out = ArrayList<ConversionClause>(clauses.size)
+        var i = 0
+        while (i < clauses.size) {
+            if (i + 1 < clauses.size) {
+                val c1 = clauses[i]
+                val c2 = clauses[i + 1]
+                val combined = c1.reading + c2.reading
+                if (isColloquialEmphatic(combined)) {
+                    out.add(ConversionClause(combined, combined))
+                    i += 2
+                    continue
+                }
+            }
+            out.add(clauses[i])
+            i++
+        }
+        return out
     }
 
     /** Maps the raw caret [p] to an offset in the converted preview (clause boundaries are exact). */

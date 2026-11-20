@@ -62,6 +62,10 @@ class MeltypeSettings(context: Context) {
         get() = prefs.getBoolean(KEY_GLIDE_ENABLED, true)
         set(value) = prefs.edit().putBoolean(KEY_GLIDE_ENABLED, value).apply()
 
+    var glideEnglishOnly: Boolean
+        get() = prefs.getBoolean(KEY_GLIDE_ENGLISH_ONLY, true)
+        set(value) = prefs.edit().putBoolean(KEY_GLIDE_ENGLISH_ONLY, value).apply()
+
     var glideSensitivity: Float
         get() = prefs.getFloat(KEY_GLIDE_SENSITIVITY, 1.0f).coerceIn(0.6f, 1.4f)
         set(value) = prefs.edit().putFloat(KEY_GLIDE_SENSITIVITY, value.coerceIn(0.6f, 1.4f)).apply()
@@ -119,7 +123,7 @@ class MeltypeSettings(context: Context) {
         set(value) = prefs.edit().putBoolean(KEY_SUB_LABELS, value).apply()
 
     var letterFlickEnabled: Boolean
-        get() = prefs.getBoolean(KEY_LETTER_FLICK, false)
+        get() = prefs.getBoolean(KEY_LETTER_FLICK, true)
         set(value) = prefs.edit().putBoolean(KEY_LETTER_FLICK, value).apply()
 
     var learningEnabled: Boolean
@@ -147,6 +151,19 @@ class MeltypeSettings(context: Context) {
             edit.putBoolean(KEY_AUTO_COMMIT_PUNCT, false)
         }
         edit.putBoolean(KEY_MIGRATED_V170, true).apply()
+    }
+
+    /**
+     * One-time change for v1.7.4: glide defaults to English-only decoding and letter-key
+     * vertical flick symbol input is enabled for both existing and new installs.
+     */
+    fun migrateV174() {
+        if (prefs.getBoolean(KEY_MIGRATED_V174, false)) return
+        prefs.edit()
+            .putBoolean(KEY_GLIDE_ENGLISH_ONLY, true)
+            .putBoolean(KEY_LETTER_FLICK, true)
+            .putBoolean(KEY_MIGRATED_V174, true)
+            .apply()
     }
 
     var glideEvalLoggingEnabled: Boolean
@@ -246,6 +263,7 @@ class MeltypeSettings(context: Context) {
     companion object {
         private const val PREFS_NAME = "meltype_prefs"
         private const val KEY_GLIDE_ENABLED = "glide_enabled"
+        private const val KEY_GLIDE_ENGLISH_ONLY = "glide_english_only"
         private const val KEY_GLIDE_SENSITIVITY = "glide_sensitivity"
         private const val KEY_THEME_MODE = "theme_mode"
         private const val KEY_ONE_HANDED = "one_handed_mode"
@@ -264,6 +282,7 @@ class MeltypeSettings(context: Context) {
         private const val KEY_GLIDE_EVAL_LOGGING = "glide_eval_logging"
         private const val KEY_USAGE_LOGGING = "usage_logging"
         private const val KEY_MIGRATED_V170 = "migrated_v170"
+        private const val KEY_MIGRATED_V174 = "migrated_v174"
         private const val KEY_ACTIVE_PROMPT_ID = "glide_eval_prompt_id"
         private const val KEY_ACTIVE_PROMPT_EXPECTED = "glide_eval_prompt_expected"
         private const val KEY_ACTIVE_PROMPT_INDEX = "glide_eval_prompt_index"

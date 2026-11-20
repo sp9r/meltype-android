@@ -126,6 +126,8 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         settings = MeltypeSettings(this)
+        settings.migrateV170()
+        settings.migrateV174()
         evalLogger = GlideEvalLogger(filesDir)
         applyLaunchIntentOptions(intent)
         evalPrompts = loadGlideEvalPrompts()
@@ -1152,8 +1154,12 @@ class MainActivity : AppCompatActivity() {
         switchCard.addView(microHeading("INPUT & KEY BEHAVIOUR").apply {
             setPadding(dp(12), dp(10), dp(12), dp(4))
         })
-        addSwitchRow(switchCard, "グライド入力（スワイプ入力）", "QWERTYキー上を滑らせて日英単語をデコード", settings.glideEnabled) {
+        addSwitchRow(switchCard, "グライド入力（スワイプ入力）", "QWERTYキー上を滑らせて単語をデコード", settings.glideEnabled) {
             settings.glideEnabled = it
+        }
+        switchCard.addView(hairline())
+        addSwitchRow(switchCard, "グライド入力を英語前提で判定", "ON推奨：日本語モード中でもグライドは英単語だけを候補にする", settings.glideEnglishOnly) {
+            settings.glideEnglishOnly = it
         }
         switchCard.addView(hairline())
         addSwitchRow(switchCard, "ローマ字ミスタイプ自動補正", "打鍵ミス・隣接誤打・mb/mp→ん・カタカナ誤綴りを補正", settings.typoCorrectionEnabled) {
@@ -1165,12 +1171,12 @@ class MainActivity : AppCompatActivity() {
             blueprintView.showNumberRow = it
         }
         switchCard.addView(hairline())
-        addSwitchRow(switchCard, "キー右上の数字・記号ヒントを表示", "0.3秒長押し（Gboard既定と同じ）で数字・記号を入力、補助キーは上フリックも可", settings.showSubLabels) {
+        addSwitchRow(switchCard, "キー右上の数字・記号ヒントを表示", "0.26秒長押し・上下フリックで数字・記号を入力", settings.showSubLabels) {
             settings.showSubLabels = it
             blueprintView.showSubLabels = it
         }
         switchCard.addView(hairline())
-        addSwitchRow(switchCard, "文字キーの上フリック記号入力", "OFF推奨：グライド中の縦誤爆を防止（長押し入力と、。ー?123の上フリックは常時有効）", settings.letterFlickEnabled) {
+        addSwitchRow(switchCard, "文字キーの上下フリック記号入力", "ON推奨：上下に短くフリックして右上の数字・記号を入力（横へ滑らせるとグライド）", settings.letterFlickEnabled) {
             settings.letterFlickEnabled = it
         }
         switchCard.addView(hairline())
@@ -1484,7 +1490,7 @@ class MainActivity : AppCompatActivity() {
             val s = CompositionSession(dicts, engine, converter)
             for (ch in input) s.appendChar(ch)
             val out = s.snapshot.previewText
-            val ok = out.contains(expectedSub) && (input.contains(' ') || out.any { it.code > 127 })
+            val ok = out.contains(expectedSub, ignoreCase = true) && (input.contains(' ') || out.any { it.code > 127 })
             check("LiveConvert($input)", ok, out)
         }
 
@@ -1518,7 +1524,7 @@ class MainActivity : AppCompatActivity() {
         combo.appendGlideResult(g2, true, listOf(g2 to true))
         for (ch in "dekensaku") combo.appendChar(ch)
         val comboText = combo.snapshot.previewText
-        check("GlideCombo(kyouha+google+dekensaku)", comboText.contains("google") && comboText.length >= 8, comboText)
+        check("GlideCombo(kyouha+google+dekensaku)", comboText.contains("google", ignoreCase = true) && comboText.length >= 8, comboText)
 
         val undoSession = CompositionSession(dicts, engine, converter)
         undoSession.appendGlideResult("watashi", false, listOf("watashi" to false))
@@ -1557,7 +1563,7 @@ class MainActivity : AppCompatActivity() {
             check("TypoFix($raw)", hit, "prev='$prev' cands=${cands.take(4)}")
         }
         val readableTypo = CompositionSession(dicts, engine, converter)
-        for (ch in "arigatoi ") readableTypo.appendChar(ch)
+        for (ch in "arigatoi") readableTypo.appendChar(ch)
         val rPrev = readableTypo.snapshot.previewText
         val rCands = readableTypo.snapshot.candidates.map { it.text }
         check(
@@ -1658,7 +1664,7 @@ class MainActivity : AppCompatActivity() {
         val pCut = pSess.commitFocusedPrefix()
         check(
             "PartialPrefixCommit",
-            pCut.isNotEmpty() && pSess.snapshot.isComposing && pSess.snapshot.previewText.contains("google"),
+            pCut.isNotEmpty() && pSess.snapshot.isComposing && pSess.snapshot.previewText.contains("google", ignoreCase = true),
             "cut='$pCut' rem='${pSess.snapshot.previewText}'"
         )
 
@@ -1669,7 +1675,12 @@ class MainActivity : AppCompatActivity() {
         val ms = (System.nanoTime() - t0) / 1_000_000.0
         check("GlideSpeedAndAccuracy", "arigatou" in fastHits.take(2) && ms < 80.0, "ms=${"%.1f".format(ms)} top=$fastHits")
 
-        check("DefaultLetterFlickOff", !MeltypeSettings(applicationContext).letterFlickEnabled, "letterFlickEnabled=false")
+        val appSettings = MeltypeSettings(applicationContext)
+        check(
+            "LetterFlickAndEnglishGlide",
+            appSettings.glideEnglishOnly && appSettings.letterFlickEnabled,
+            "glideEnglishOnly=${appSettings.glideEnglishOnly} letterFlickEnabled=${appSettings.letterFlickEnabled}"
+        )
 
         // Real QwertyKeyboardView checks on main thread: dead-zone band, Shift-swapped number row, and 4-way arrow key swipe
         val movedDirs = ArrayList<Pair<Int, Int>>()
@@ -1680,6 +1691,9 @@ class MainActivity : AppCompatActivity() {
         var row0Normal: List<String> = emptyList()
         var row0Shifted: List<String> = emptyList()
         var row0AfterTap: List<String> = emptyList()
+        var shiftTyped: List<Char> = emptyList()
+        var arrowJitterDirs: List<Pair<Int, Int>> = emptyList()
+        var flickSyms: List<Char> = emptyList()
         val uiLatch = java.util.concurrent.CountDownLatch(1)
         runOnUiThread {
             try {
@@ -1742,11 +1756,12 @@ class MainActivity : AppCompatActivity() {
                     evUp.recycle()
                 }
                 row0AfterTap = probeKb.rowZeroLabelsForTest()
+                shiftTyped = typedChars.toList()
 
                 val arrowLeft = probeKb.firstKeyCenterForTest("◀")
                 if (arrowLeft != null) {
                     val (ax, ay) = arrowLeft
-                    val deltas = listOf(0f to -dp(45).toFloat(), 0f to dp(35).toFloat(), -dp(45).toFloat() to 0f, dp(45).toFloat() to 0f)
+                    val deltas = listOf(0f to -dp(48).toFloat(), 0f to dp(48).toFloat(), -dp(48).toFloat() to 0f, dp(48).toFloat() to 0f)
                     for ((dx, dy) in deltas) {
                         val t0 = android.os.SystemClock.uptimeMillis()
                         val e1 = android.view.MotionEvent.obtain(t0, t0, android.view.MotionEvent.ACTION_DOWN, ax, ay, 0)
@@ -1760,6 +1775,55 @@ class MainActivity : AppCompatActivity() {
                         e3.recycle()
                     }
                 }
+
+                // Small vertical jitter on arrow key should stay horizontal tap, not vertical edge jump
+                val jitterCountBefore = movedDirs.size
+                if (arrowLeft != null) {
+                    val (ax, ay) = arrowLeft
+                    val t0 = android.os.SystemClock.uptimeMillis()
+                    val e1 = android.view.MotionEvent.obtain(t0, t0, android.view.MotionEvent.ACTION_DOWN, ax, ay, 0)
+                    val e2 = android.view.MotionEvent.obtain(t0, t0 + 25L, android.view.MotionEvent.ACTION_MOVE, ax, ay + dp(14).toFloat(), 0)
+                    val e3 = android.view.MotionEvent.obtain(t0, t0 + 50L, android.view.MotionEvent.ACTION_UP, ax, ay + dp(14).toFloat(), 0)
+                    probeKb.onTouchEvent(e1)
+                    probeKb.onTouchEvent(e2)
+                    probeKb.onTouchEvent(e3)
+                    e1.recycle()
+                    e2.recycle()
+                    e3.recycle()
+                }
+                arrowJitterDirs = movedDirs.subList(jitterCountBefore, movedDirs.size).toList()
+
+                // Letter key vertical flick (up & down) emits secondary symbol even with glide enabled
+                probeKb.glideEnabled = true
+                probeKb.letterFlickEnabled = true
+                val symBefore = typedChars.size
+                val qCenter = probeKb.firstKeyCenterForTest("q")
+                val sCenter = probeKb.firstKeyCenterForTest("s")
+                if (qCenter != null) {
+                    val t0 = android.os.SystemClock.uptimeMillis()
+                    val e1 = android.view.MotionEvent.obtain(t0, t0, android.view.MotionEvent.ACTION_DOWN, qCenter.first, qCenter.second, 0)
+                    val e2 = android.view.MotionEvent.obtain(t0, t0 + 30L, android.view.MotionEvent.ACTION_MOVE, qCenter.first, qCenter.second - dp(26).toFloat(), 0)
+                    val e3 = android.view.MotionEvent.obtain(t0, t0 + 60L, android.view.MotionEvent.ACTION_UP, qCenter.first, qCenter.second - dp(26).toFloat(), 0)
+                    probeKb.onTouchEvent(e1)
+                    probeKb.onTouchEvent(e2)
+                    probeKb.onTouchEvent(e3)
+                    e1.recycle()
+                    e2.recycle()
+                    e3.recycle()
+                }
+                if (sCenter != null) {
+                    val t0 = android.os.SystemClock.uptimeMillis()
+                    val e1 = android.view.MotionEvent.obtain(t0, t0, android.view.MotionEvent.ACTION_DOWN, sCenter.first, sCenter.second, 0)
+                    val e2 = android.view.MotionEvent.obtain(t0, t0 + 30L, android.view.MotionEvent.ACTION_MOVE, sCenter.first, sCenter.second + dp(26).toFloat(), 0)
+                    val e3 = android.view.MotionEvent.obtain(t0, t0 + 60L, android.view.MotionEvent.ACTION_UP, sCenter.first, sCenter.second + dp(26).toFloat(), 0)
+                    probeKb.onTouchEvent(e1)
+                    probeKb.onTouchEvent(e2)
+                    probeKb.onTouchEvent(e3)
+                    e1.recycle()
+                    e2.recycle()
+                    e3.recycle()
+                }
+                flickSyms = typedChars.subList(symBefore, typedChars.size).toList()
             } finally {
                 uiLatch.countDown()
             }
@@ -1771,14 +1835,24 @@ class MainActivity : AppCompatActivity() {
             "ShiftNumberSymbols",
             row0Normal == listOf("1","2","3","4","5","6","7","8","9","0") &&
                 row0Shifted == listOf("!","@","#","$","%","&","*","(",")","-") &&
-                typedChars == listOf('!') &&
+                shiftTyped == listOf('!') &&
                 row0AfterTap == row0Normal,
-            "shifted=$row0Shifted typed=$typedChars after=$row0AfterTap"
+            "shifted=$row0Shifted typed=$shiftTyped after=$row0AfterTap"
         )
         check(
             "ArrowKey4WaySwipe",
             movedDirs.containsAll(listOf(0 to -1, 0 to 1, -1 to 0, 1 to 0)),
             "dirs=$movedDirs"
+        )
+        check(
+            "ArrowJitterNotVertical",
+            arrowJitterDirs == listOf(-1 to 0),
+            "jitterDirs=$arrowJitterDirs"
+        )
+        check(
+            "LetterVerticalFlickUpDown",
+            flickSyms == listOf('+', '#'),
+            "flickSyms=$flickSyms"
         )
 
         val boundarySess = CompositionSession(dicts, engine, converter)

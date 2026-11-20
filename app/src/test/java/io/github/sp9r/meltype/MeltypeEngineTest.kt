@@ -252,12 +252,12 @@ class MeltypeEngineTest {
             )
         }
 
-        // 3. Accidentally readable neighbor slips with word boundary
+        // 3. Accidentally readable neighbor slips offer correction chips non-destructively (and auto-fix with spatial hint)
         val readableSlips = listOf(
-            "arigatoi " to listOf("ありがとう", "有り難う"),
-            "arigayou " to listOf("ありがとう", "有り難う"),
-            "ohayoi " to listOf("おはよう"),
-            "watashu " to listOf("わたし", "私")
+            "arigatoi" to listOf("ありがとう", "有り難う"),
+            "arigayou" to listOf("ありがとう", "有り難う"),
+            "ohayoi" to listOf("おはよう"),
+            "watashu" to listOf("わたし", "私")
         )
         for ((raw, expects) in readableSlips) {
             val s = CompositionSession(dictionaries, scoreEngine, converter)
@@ -269,6 +269,15 @@ class MeltypeEngineTest {
                 expects.any { prev.contains(it) || cands.any { c -> c.contains(it) } }
             )
         }
+        val spatialArigatoi = CompositionSession(dictionaries, scoreEngine, converter)
+        for ((idx, ch) in "arigatoi".withIndex()) {
+            spatialArigatoi.appendChar(ch, spatialHints = if (idx == 6) mapOf('u' to 0.72f) else emptyMap())
+        }
+        assertTrue(
+            "Expected spatial auto-fix or correction chip for arigatoi near u: prev=${spatialArigatoi.snapshot.previewText} cands=${spatialArigatoi.snapshot.candidates.map { it.text }}",
+            spatialArigatoi.snapshot.previewText.contains("ありがとう") ||
+                spatialArigatoi.snapshot.candidates.any { it.text.contains("ありがとう") }
+        )
 
         // 4. Katakana misspellings resolution (misspellings.txt)
         val misspell = CompositionSession(dictionaries, scoreEngine, converter)
@@ -976,5 +985,104 @@ class MeltypeEngineTest {
         for (ch in "kyouha") splitSess.appendChar(ch)
         assertFalse(splitSess.snapshot.isConverting)
         assertTrue(splitSess.setFocusedClauseLength(2).isConverting)
+    }
+
+    @Test
+    fun englishGlideModeDecodesEnglishOnlyWithoutJapaneseHijack() {
+        val words = listOf("google", "vscode", "claude", "wordle", "twitter", "salt", "dirty")
+        for (w in words) {
+            val path = KeyLayoutGeometry.syntheticPathForWord(w, jitter = 0.02f)
+            val res = glideDecoder.decode(path, maxResults = 8, preferJapanese = false)
+            assertTrue("Expected non-empty English results for '$w'", res.isNotEmpty())
+            assertTrue("Expected all results to be English when preferJapanese=false for '$w', got $res", res.all { it.isEnglish })
+            val top3 = res.take(3).map { it.word }
+            assertTrue("Expected '$w' in top-3 English glide results, got $top3", top3.contains(w))
+        }
+    }
+
+    @Test
+    fun sammuAndSaltumuConvertToSammuLongAndLtuStaysSokuon() {
+        val converter = AndroidMozcConverter(dictionaries)
+
+        val sammu = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "sammu-") sammu.appendChar(ch)
+        assertEquals("さっむー", sammu.snapshot.previewText)
+        assertTrue(sammu.snapshot.clauses.none { it.isEnglish })
+
+        val saltumu = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "saltumu-") saltumu.appendChar(ch)
+        assertEquals("さっむー", saltumu.snapshot.previewText)
+        assertTrue(saltumu.snapshot.clauses.none { it.isEnglish })
+
+        val ltuSess = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "ltu") ltuSess.appendChar(ch)
+        assertEquals("っ", ltuSess.snapshot.previewText)
+        assertTrue(ltuSess.snapshot.clauses.none { it.isEnglish })
+    }
+
+    @Test
+    fun domainAmpersandProperNounsAndQwertySegmentCleanly() {
+        val converter = AndroidMozcConverter(dictionaries)
+
+        fun previewFor(raw: String): String {
+            val s = CompositionSession(dictionaries, scoreEngine, converter)
+            for (ch in raw) s.appendChar(ch)
+            return s.snapshot.previewText
+        }
+
+        val xSegs = scoreEngine.segment("x.com/")
+        assertEquals(listOf(SegmentKind.LITERAL to "x.com/"), xSegs.map { it.kind to it.raw })
+        assertEquals("x.com/", previewFor("x.com/"))
+
+        val hmSegs = scoreEngine.segment("H&M")
+        assertEquals(listOf(SegmentKind.ENGLISH to "H&M"), hmSegs.map { it.kind to it.raw })
+        assertEquals("H&M", previewFor("H&M"))
+
+        val yahooSegs = scoreEngine.segment("yahoo")
+        assertEquals(listOf(SegmentKind.ENGLISH to "yahoo"), yahooSegs.map { it.kind to it.raw })
+        assertEquals("Yahoo", previewFor("yahoo"))
+
+        val wordleSegs = scoreEngine.segment("wordle")
+        assertEquals(listOf(SegmentKind.ENGLISH to "wordle"), wordleSegs.map { it.kind to it.raw })
+        assertEquals("Wordle", previewFor("wordle"))
+
+        val qwertySegs = scoreEngine.segment("qwerty")
+        assertEquals(listOf(SegmentKind.ENGLISH to "qwerty"), qwertySegs.map { it.kind to it.raw })
+        assertEquals("qwerty", previewFor("qwerty"))
+    }
+
+    @Test
+    fun readableJapaneseIsNeverCorruptedAndEmbeddedTyposOfferCorrections() {
+        val converter = AndroidMozcConverter(dictionaries)
+
+        val benkyou = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "benkyousinakyamazui") benkyou.appendChar(ch)
+        assertFalse("benkyousinakyamazui should not rewrite to sinai", benkyou.snapshot.previewText.contains("しない"))
+        assertTrue(
+            "Expected べんきょうしなきゃまずい in readings, got ${benkyou.snapshot.clauses.map { it.reading }}",
+            benkyou.snapshot.clauses.joinToString("") { it.reading } == "べんきょうしなきゃまずい"
+        )
+
+        val ranai = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "ranai") ranai.appendChar(ch)
+        assertEquals("らない", ranai.snapshot.clauses.joinToString("") { it.reading })
+
+        // Neighbor slips inside/adjacent to words offer corrections or repair cleanly without bogus English chunks
+        val imaSlip = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "imaladeinakatta") imaSlip.appendChar(ch)
+        assertTrue(
+            "Expected いままでいなかった in preview or correction chips for imaladeinakatta, got prev=${imaSlip.snapshot.previewText} cands=${imaSlip.snapshot.candidates.map { "${it.subtitle}:${it.text}" }}",
+            imaSlip.snapshot.previewText.contains("いままでいなかった") ||
+                imaSlip.snapshot.clauses.joinToString("") { it.reading }.contains("いままでいなかった") ||
+                imaSlip.snapshot.candidates.any { it.text.contains("いままでいなかった") }
+        )
+
+        val kannkek = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "kannkekdato") kannkek.appendChar(ch)
+        assertTrue(
+            "Expected かんけいだと in preview or candidates for kannkekdato, got prev=${kannkek.snapshot.previewText} cands=${kannkek.snapshot.candidates.map { "${it.subtitle}:${it.text}" }}",
+            kannkek.snapshot.clauses.joinToString("") { it.reading } == "かんけいだと" ||
+                kannkek.snapshot.candidates.any { it.text.contains("かんけい") }
+        )
     }
 }

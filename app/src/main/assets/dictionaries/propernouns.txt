@@ -77,3 +77,5 @@ Suica DCafe ProBot Carlbot Disboard TaCZ NSFW
 Khalifa Ariana Grande Sheeran Marshmello Beabadoobee Chainsmokers Iann Dior Dobby
 # Issue #268
 DeVito
+# 一般開発ツール・サービス・ゲーム
+Wordle VSCode Codex Tailscale Bitwarden Vaultwarden Shizuku Synology Motorola Obsidian Colab Kaggle LeetCode AtCoder Zenn Qiita

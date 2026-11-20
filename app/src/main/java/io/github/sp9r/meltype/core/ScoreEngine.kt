@@ -99,6 +99,15 @@ class ScoreEngine(
                 continue
             }
 
+            // Domain names (x.com/, github.io, example.co.jp) and ampersand brand pairs (H&M, R&D)
+            val specialSpan = detectDomainOrSymbolBrandSpan(input, i, overrides)
+            if (specialSpan != null) {
+                val (spanKind, spanEnd) = specialSpan
+                out.add(ScoredSegment(spanKind, input.substring(i, spanEnd), i, spanEnd))
+                i = spanEnd
+                continue
+            }
+
             // Model numbers / alphanumerics like RTX4090, iPhone16, M4, 16GB, 4K
             if (isAsciiAlpha(ch) || ch.isDigit()) {
                 val modelEnd = detectModelNumberSpan(input, i, overrides)
@@ -253,10 +262,10 @@ class ScoreEngine(
         val n = run.length
         if (n == 0) return emptyList()
 
-        // Single-char shortcut (allow trailing 'k', 's', 'n' as pending Japanese, except pure l/q/v/x -> English)
+        // Single-char shortcut (allow trailing 'k', 's', 'n' as pending Japanese, except l/q/v/x or uppercase -> English)
         if (n == 1) {
             val lower = run.lowercase()
-            if (lower[0] in charArrayOf('l', 'q', 'v', 'x')) {
+            if (lower[0] in charArrayOf('l', 'q', 'v', 'x') || run[0].isUpperCase()) {
                 return listOf(ScoredSegment(SegmentKind.ENGLISH, run, baseOffset, baseOffset + 1))
             }
             val a = RomajiDetector.analyze(RomajiDetector.readCRow(lower), strictForDetection = false)
@@ -330,7 +339,8 @@ class ScoreEngine(
                     scoreEnglishSpan(sub, run.substring(i, j), prevIdx = i, nextPos = j, totalLen = n, fullRun = lowerRun)
                 }
                 if (enScore != null) {
-                    val candidateScore = cur.score + enScore
+                    val enSplitPenalty = if (i > 0 && cur.kind == SegmentKind.ENGLISH) -6.0 else 0.0
+                    val candidateScore = cur.score + enScore + enSplitPenalty
                     val existing = dp[j]
                     if (existing == null || candidateScore > existing.score) {
                         dp[j] = Choice(candidateScore, i, SegmentKind.ENGLISH)
@@ -386,7 +396,8 @@ class ScoreEngine(
             val prevSeg = segments.getOrNull(idx - 1)
             val nextTinyJp = nextSeg != null && nextSeg.kind == SegmentKind.JAPANESE && nextSeg.raw.length <= 2
             val prevTinyJp = prevSeg != null && prevSeg.kind == SegmentKind.JAPANESE && prevSeg.raw.length <= 2
-            if (!dictionaries.englishFocusedWords.contains(lower) || nextTinyJp || prevTinyJp) {
+            val surroundedByJp = prevSeg?.kind == SegmentKind.JAPANESE && nextSeg?.kind == SegmentKind.JAPANESE
+            if (!dictionaries.englishFocusedWords.contains(lower) || nextTinyJp || prevTinyJp || surroundedByJp) {
                 return true
             }
         }
@@ -437,20 +448,22 @@ class ScoreEngine(
             val sliceLower = sliceRaw.lowercase()
             val isFinal = endedByDelimiter || j < segments.size
             val fix = typoEngine.fixUnreadable(sliceLower, final = isFinal)
+            val containsSingleOrEmbeddedWeakEn = (i until j).any { k ->
+                segments[k].kind == SegmentKind.ENGLISH && segments[k].raw.length <= 2
+            }
             val resolvedKana = if (fix != null) {
                 fix.kana
             } else if (sliceLower.length >= 4 &&
                 sliceLower.all { it in 'a'..'z' } &&
-                segments[i].kind == SegmentKind.ENGLISH &&
-                segments[i].raw.length == 1
+                containsSingleOrEmbeddedWeakEn
             ) {
                 val sliceHira = RomajiDetector.analyze(sliceLower, strictForDetection = false).finalizedHiragana()
-                val readableFix = typoEngine.suggestReadableTypos(
+                val readableFixes = typoEngine.suggestReadableTypos(
                     sliceLower,
                     sliceHira,
                     allowFinalTailTrim = isFinal
-                ).firstOrNull { it.isSingleWholeWord }
-                readableFix?.kana
+                )
+                readableFixes.firstOrNull { it.isSingleWholeWord || typoEngine.isKnownReading(it.kana) }?.kana
             } else {
                 null
             }
@@ -498,6 +511,7 @@ class ScoreEngine(
 
         if (!analysis.isStrictValid) return null
         if (analysis.pendingTail.isNotEmpty() && !allowPendingTail) return null
+        if (prevWasEnglish && analysis.hiragana.isEmpty()) return null
 
         val hira = analysis.displayKanaOrTail
         var score = effectiveSub.length * 1.15 - typoPenalty
@@ -603,6 +617,10 @@ class ScoreEngine(
             return 0.5
         }
 
+        // Very short 2-3 char non-focused lowercase words at boundaries inside runs should not chop words
+        if (len <= 2 && !isProper && !hasUppercase && !isFocused && (prevIdx > 0 || nextPos < totalLen)) {
+            return -5.5
+        }
         // Very short 2-3 char romaji-valid English words ("to", "ha", "no", "go", "de", "in", "at", "he", "me", "so", "do", "ma", "ai")
         // should NOT split Japanese strings unless typed with uppercase or surrounded by particle/space boundaries.
         if (len <= 3 && isPureStrictRomaji && !hasUppercase) {
@@ -628,8 +646,7 @@ class ScoreEngine(
                 dictionaries.readingsSet.contains(subKana) ||
                 subKana in COMMON_COLLIDING_KANA
             )
-        val isLowerStrictCollidingProper = isProper && !hasUppercase && isPureStrictRomaji &&
-            (isCommonJpReading || len <= 5)
+        val isLowerStrictCollidingProper = isProper && !hasUppercase && isPureStrictRomaji && isCommonJpReading
 
         if (isProper) {
             if (isLowerStrictCollidingProper && isCommonJpReading) {
@@ -930,6 +947,81 @@ class ScoreEngine(
         return -1
     }
 
+    private fun detectDomainOrSymbolBrandSpan(
+        input: String,
+        start: Int,
+        overrides: Map<IntRange, SegmentKind>
+    ): Pair<SegmentKind, Int>? {
+        fun hasOverrideIn(from: Int, toExclusive: Int): Boolean =
+            overrides.keys.any { it.first < toExclusive && it.last >= from }
+
+        val first = input[start]
+        if (!isAsciiAlpha(first) && !first.isDigit()) return null
+
+        // 1. Short ampersand pairs like "H&M", "h&m", "R&D", "Q&A"
+        if (isAsciiAlpha(first) && (start == 0 || !isAsciiAlpha(input[start - 1]))) {
+            var leftEnd = start + 1
+            while (leftEnd < input.length && isAsciiAlpha(input[leftEnd]) && leftEnd - start < 2) leftEnd++
+            if (leftEnd - start in 1..2 && leftEnd < input.length && input[leftEnd] == '&') {
+                val rightStart = leftEnd + 1
+                var rightEnd = rightStart
+                while (rightEnd < input.length && isAsciiAlpha(input[rightEnd]) && rightEnd - rightStart < 2) rightEnd++
+                if (rightEnd - rightStart in 1..2 &&
+                    (rightEnd == input.length || !isAsciiAlpha(input[rightEnd])) &&
+                    !hasOverrideIn(start, rightEnd)
+                ) {
+                    return SegmentKind.ENGLISH to rightEnd
+                }
+            }
+        }
+
+        // 2. Domain names / URL paths without http:// prefix (e.g. "x.com/", "github.io", "example.co.jp")
+        if (start > 0 && (isAsciiAlpha(input[start - 1]) || input[start - 1].isDigit() || input[start - 1] == '.')) {
+            return null
+        }
+        var labelEnd = start
+        while (labelEnd < input.length && (isAsciiAlpha(input[labelEnd]) || input[labelEnd].isDigit() || input[labelEnd] == '-')) {
+            labelEnd++
+        }
+        if (labelEnd == start || labelEnd >= input.length || input[labelEnd] != '.') return null
+        if (input.substring(start, labelEnd).all { it.isDigit() }) {
+            // Pure numbers like "192.168..." or "1.6" are handled by numeric literal branch, unless followed by a TLD
+            val dotCheck = labelEnd + 1
+            if (dotCheck >= input.length || input[dotCheck].isDigit()) return null
+        }
+        var cur = labelEnd
+        var lastTldEnd = -1
+        while (cur < input.length && input[cur] == '.') {
+            val segStart = cur + 1
+            var segEnd = segStart
+            while (segEnd < input.length && (isAsciiAlpha(input[segEnd]) || input[segEnd].isDigit() || input[segEnd] == '-')) {
+                segEnd++
+            }
+            if (segEnd == segStart) break
+            val segText = input.substring(segStart, segEnd).lowercase()
+            if (segText in KNOWN_TLDS) {
+                lastTldEnd = segEnd
+            }
+            cur = segEnd
+        }
+        if (lastTldEnd > 0) {
+            var finalEnd = lastTldEnd
+            if (finalEnd < input.length && input[finalEnd] == '/') {
+                while (finalEnd < input.length && !input[finalEnd].isWhitespace() &&
+                    input[finalEnd] !in charArrayOf('。', '、', '！', '？')
+                ) {
+                    finalEnd++
+                }
+            } else if (finalEnd < input.length && isAsciiAlpha(input[finalEnd])) {
+                return null
+            }
+            if (!hasOverrideIn(start, finalEnd)) {
+                return SegmentKind.LITERAL to finalEnd
+            }
+        }
+        return null
+    }
+
     private fun isJapaneseFirstRun(
         run: String,
         lowerRun: String,
@@ -937,13 +1029,23 @@ class ScoreEngine(
         touchesLongVowel: Boolean
     ): Boolean {
         if (run.any { it.isUpperCase() }) return false
-        // l/q/x/v and a bare 'c' are rare in everyday romaji but common in English ("hello", "cute").
-        if (lowerRun.any { it == 'l' || it == 'q' || it == 'x' || it == 'v' }) return false
+        // q/v and a bare 'c' are rare in everyday romaji; l/x are only valid when consumed by explicit small-kana prefixes (ltu, xtu, lya, ...)
+        if (lowerRun.any { it == 'q' || it == 'v' }) return false
         for (k in lowerRun.indices) {
             if (lowerRun[k] == 'c' && lowerRun.getOrNull(k + 1) != 'h') return false
         }
+        val hasSmallLx = lowerRun.any { it == 'l' || it == 'x' }
+        val strictCheck = if (hasSmallLx) {
+            RomajiDetector.analyze(lowerRun, strictForDetection = true)
+        } else {
+            null
+        }
+        if (strictCheck != null) {
+            if (!strictCheck.isStrictValid || strictCheck.pendingTail.length > 2) return false
+            if (dictionaries.englishAllWords.contains(lowerRun)) return false
+        }
         if (typoEngine.firstUnreadableOffset(lowerRun, final = endedByDelimiter) >= 0) return false
-        val analysis = RomajiDetector.analyze(lowerRun, strictForDetection = false)
+        val analysis = strictCheck ?: RomajiDetector.analyze(lowerRun, strictForDetection = false)
         // Rare youon spellings (gwo, kwa, twe, ...) usually mean an English word was read as romaji
         // ("meeting" -> め・え・ち・ん・ぐぉ...).
         if (analysis.chunks.any { c -> c.rawRomaji.length >= 3 && c.rawRomaji[1] == 'w' && c.rawRomaji[0] != 'w' }) return false
@@ -951,6 +1053,9 @@ class ScoreEngine(
         if (analysis.pendingTail.length > 2) return false
         val kana = analysis.hiragana
         if (kana.any { it in 'a'..'z' }) return false
+        if (hasSmallLx && analysis.chunks.any { it.rawRomaji in RomajiDetector.SMALL_SOKUON_KEYS } && kana.length >= 2) {
+            return true
+        }
         if (touchesLongVowel && kana.length >= 2) return true
         return kana.length >= 5 || typoEngine.isKnownReading(kana)
     }
@@ -958,7 +1063,13 @@ class ScoreEngine(
     companion object {
         /** Brand words that are also readable romaji; still allowed as English inside a readable run. */
         private val READABLE_EMBEDDED_BRANDS = setOf(
-            "youtube", "wifi", "amazon", "notion", "gemini", "java", "ubuntu", "office"
+            "youtube", "wifi", "amazon", "notion", "gemini", "java", "ubuntu", "office",
+            "yahoo", "google", "claude", "twitter", "github", "wordle", "vscode", "codex"
+        )
+        private val KNOWN_TLDS = setOf(
+            "com", "jp", "net", "org", "io", "dev", "app", "ai", "me", "co", "uk", "au",
+            "edu", "gov", "info", "biz", "xyz", "tv", "cc", "us", "ca", "de", "fr",
+            "html", "pdf", "json"
         )
         private val PARTICLES = listOf("kara", "made", "ha", "ga", "wo", "ni", "de", "to", "no", "mo", "wa", "he", "ya")
         private val CASE_PARTICLES = listOf("kara", "made", "ha", "ga", "wo", "ni", "de", "mo")

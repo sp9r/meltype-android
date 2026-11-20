@@ -123,7 +123,7 @@ class AndroidMozcConverter(
         if (hiragana.isEmpty()) return emptyList()
         if (hiragana.length > 100 || hiragana.any { it.isISOControl() }) return null
 
-        // If user dictionary has an exact full match, prioritize it cleanly
+        // If user dictionary or bundled phrase table has an exact full match, prioritize it cleanly
         val userDict = userDictProvider()
         val exactUser = userDict[hiragana]
         if (exactUser != null) {
@@ -131,6 +131,10 @@ class AndroidMozcConverter(
                 cachedCandidates[hiragana] = listOf(exactUser, hiragana, RomajiDetector.toKatakana(hiragana)).distinct()
             }
             return listOf(ConversionClause(hiragana, exactUser))
+        }
+        val exactPhrase = dictionaries?.readingToPhrases?.get(hiragana)
+        if (exactPhrase != null) {
+            return listOf(ConversionClause(hiragana, exactPhrase))
         }
 
         if (transport == null && !MozcRuntime.initialized) {
