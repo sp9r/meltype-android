@@ -77,6 +77,16 @@ object UtilityConverter {
         return out.toList()
     }
 
+    fun punctuationCandidates(input: String): List<String> = when (input) {
+        "、" -> listOf("、", "，", ",", "・", "〜", "…")
+        "。" -> listOf("。", "．", ".", "！", "？", "…")
+        "，" -> listOf("，", "、", ",")
+        "．" -> listOf("．", "。", ".")
+        "," -> listOf(",", "、", "，")
+        "." -> listOf(".", "。", "．", "…")
+        else -> emptyList()
+    }
+
     fun numericCandidates(input: String): List<String> {
         val trimmed = input.trim()
         if (trimmed.isEmpty() || trimmed.length > 15 || !trimmed.all { it in '0'..'9' }) return emptyList()

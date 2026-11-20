@@ -1697,6 +1697,8 @@ class MainActivity : AppCompatActivity() {
         var arrowJitterDirs: List<Pair<Int, Int>> = emptyList()
         var flickSyms: List<Char> = emptyList()
         var rollChars: List<Char> = emptyList()
+        var topBarTraceW = 0
+        var topBarCandW = 0
         val uiLatch = java.util.concurrent.CountDownLatch(1)
         runOnUiThread {
             try {
@@ -1857,6 +1859,44 @@ class MainActivity : AppCompatActivity() {
                     e3.recycle()
                 }
                 rollChars = typedChars.subList(rollBefore, typedChars.size).toList()
+
+                val topBarProbe = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    setPadding(dp(6), dp(3), dp(6), dp(3))
+                }
+                val probeTrace = TextView(this).apply {
+                    isSingleLine = true
+                    ellipsize = android.text.TextUtils.TruncateAt.START
+                    maxWidth = minOf(dp(84), (1080 * 0.22f).toInt().coerceAtLeast(dp(64)))
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+                    setPadding(dp(6), dp(3), dp(6), dp(3))
+                    text = "へんかんまえをたくさんいれるとへんかんこうほがほぼみえなくなる"
+                }
+                val probeCandScroll = HorizontalScrollView(this).apply {
+                    layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f)
+                }
+                val probeCandRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                probeCandRow.addView(TextView(this).apply { text = "変換候補" })
+                probeCandScroll.addView(probeCandRow)
+                val probeEmojiBtn = TextView(this).apply {
+                    layoutParams = LinearLayout.LayoutParams(dp(34), dp(32))
+                }
+                val probeExpandBtn = TextView(this).apply {
+                    text = "▼"
+                    layoutParams = LinearLayout.LayoutParams(dp(32), dp(32))
+                }
+                topBarProbe.addView(probeTrace)
+                topBarProbe.addView(probeCandScroll)
+                topBarProbe.addView(probeEmojiBtn)
+                topBarProbe.addView(probeExpandBtn)
+                topBarProbe.measure(
+                    View.MeasureSpec.makeMeasureSpec(1080, View.MeasureSpec.EXACTLY),
+                    View.MeasureSpec.makeMeasureSpec(dp(42), View.MeasureSpec.EXACTLY)
+                )
+                topBarProbe.layout(0, 0, 1080, dp(42))
+                topBarTraceW = probeTrace.width
+                topBarCandW = probeCandScroll.width
             } finally {
                 uiLatch.countDown()
             }
@@ -1901,6 +1941,49 @@ class MainActivity : AppCompatActivity() {
             "DirectClauseCut",
             snapSnap.clauses.firstOrNull()?.reading == "きょうは" && snapSnap.focusedAdjustableLen == 4,
             "first=${snapSnap.clauses.firstOrNull()?.reading} adj=${snapSnap.focusedAdjustableKana}:${snapSnap.focusedAdjustableLen}"
+        )
+
+        val bsSess = CompositionSession(dicts, engine, converter)
+        for (c in "kyouha") bsSess.appendChar(c)
+        val bs1 = bsSess.backspace().rawInput
+        val bs2 = bsSess.backspace().rawInput
+        val bs3 = bsSess.backspace().rawInput
+        val kattaSess = CompositionSession(dicts, engine, converter)
+        for (c in "katta") kattaSess.appendChar(c)
+        val kattaBack = kattaSess.backspace().rawInput
+        val kannSess = CompositionSession(dicts, engine, converter)
+        for (c in "kann") kannSess.appendChar(c)
+        val kannBack = kannSess.backspace().rawInput
+        val pendSess = CompositionSession(dicts, engine, converter)
+        for (c in "kyouhash") pendSess.appendChar(c)
+        val pendBack = pendSess.backspace().rawInput
+        val enTailSess = CompositionSession(dicts, engine, converter)
+        for (c in "kyouhagoogle") enTailSess.appendChar(c)
+        val enTailBack = enTailSess.backspace().rawInput
+        check(
+            "JapaneseCharBackspace",
+            bs1 == "kyou" && bs2 == "kyo" && bs3 == "ki" &&
+                kattaBack == "kaltu" && kannBack == "ka" &&
+                pendBack == "kyouhas" && enTailBack == "kyouhagoogl",
+            "kyouha=[$bs1,$bs2,$bs3] katta=$kattaBack kann=$kannBack pend=$pendBack en=$enTailBack"
+        )
+
+        val idlePunctSess = CompositionSession(dicts, engine, converter)
+        val idlePunctSnap = idlePunctSess.appendText("、")
+        val ffSess = CompositionSession(dicts, engine, converter)
+        for (c in "FF") ffSess.appendChar(c)
+        check(
+            "IdlePunctAndAcronym",
+            idlePunctSnap.isComposing &&
+                idlePunctSnap.candidates.map { it.text }.containsAll(listOf(",", "・")) &&
+                ffSess.snapshot.previewText == "FF",
+            "punctComposing=${idlePunctSnap.isComposing} ff=${ffSess.snapshot.previewText}"
+        )
+
+        check(
+            "TopBarLongTraceCandidateWidth",
+            topBarTraceW in 1..dp(90) && topBarCandW >= 600,
+            "traceW=$topBarTraceW maxAllowed=${dp(90)} candW=$topBarCandW"
         )
 
         val header = if (allPassed) "PASS\n" else "FAIL\n"

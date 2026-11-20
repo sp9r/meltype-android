@@ -1085,4 +1085,139 @@ class MeltypeEngineTest {
                 kannkek.snapshot.candidates.any { it.text.contains("かんけい") }
         )
     }
+
+    @Test
+    fun japaneseBackspaceDeletesOneKanaAndPreservesPendingRomajiAndEnglish() {
+        val converter = AndroidMozcConverter(dictionaries)
+
+        // 1. Standard Japanese kana chunks delete one hiragana per backspace
+        val s1 = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "kyouha") s1.appendChar(ch)
+        assertEquals("kyou", s1.backspace().rawInput)
+        assertEquals("kyo", s1.backspace().rawInput)
+        val afterKyo = s1.backspace()
+        assertEquals("ki", afterKyo.rawInput)
+        assertEquals("き", afterKyo.clauses.joinToString("") { it.reading })
+        assertEquals("", s1.backspace().rawInput)
+
+        val watashi = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "watashi") watashi.appendChar(ch)
+        assertEquals("wata", watashi.backspace().rawInput)
+
+        // 2. Moraic nasal nn/n deletes in 1 press
+        val kann = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "kann") kann.appendChar(ch)
+        assertEquals("ka", kann.backspace().rawInput)
+
+        val kan = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "kan") kan.appendChar(ch)
+        assertEquals("ka", kan.backspace().rawInput)
+
+        // 3. Sokuon double consonant stays "っ" instead of reverting to raw consonant
+        val katta = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "katta") katta.appendChar(ch)
+        val kattaBack = katta.backspace()
+        assertEquals("kaltu", kattaBack.rawInput)
+        assertEquals("かっ", kattaBack.clauses.joinToString("") { it.reading })
+        assertFalse(kattaBack.previewText.contains("t"))
+        katta.appendChar('t')
+        val kattaRestored = katta.appendChar('a')
+        assertEquals("かった", kattaRestored.clauses.joinToString("") { it.reading })
+        assertEquals("ka", katta.apply {
+            backspace()
+            backspace()
+        }.snapshot.rawInput)
+
+        // 4. Context-dependent nasals (m before b/p, single n before j) preserve "ん"
+        val shimbun = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "shimbun") shimbun.appendChar(ch)
+        assertEquals("shimbu", shimbun.backspace().rawInput)
+        val shimbunBack2 = shimbun.backspace()
+        assertEquals("shinn", shimbunBack2.rawInput)
+        assertEquals("しん", shimbunBack2.clauses.joinToString("") { it.reading })
+        assertEquals("shi", shimbunBack2.let { shimbun.backspace().rawInput })
+
+        val kanji = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "kanji") kanji.appendChar(ch)
+        val kanjiBack = kanji.backspace()
+        assertEquals("kann", kanjiBack.rawInput)
+        assertEquals("かん", kanjiBack.clauses.joinToString("") { it.reading })
+        val kanjiA = kanji.appendChar('a')
+        assertEquals("かんあ", kanjiA.clauses.joinToString("") { it.reading })
+
+        // 5. Multi-kana sokuon chunk (ccha -> っちゃ -> っち -> っ -> "")
+        val ccha = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "ccha") ccha.appendChar(ch)
+        val ccha1 = ccha.backspace()
+        assertEquals("tchi", ccha1.rawInput)
+        assertEquals("っち", ccha1.clauses.joinToString("") { it.reading })
+        val ccha2 = ccha.backspace()
+        assertEquals("ltu", ccha2.rawInput)
+        assertEquals("っ", ccha2.clauses.joinToString("") { it.reading })
+        assertEquals("", ccha.backspace().rawInput)
+
+        // 6. Pending romaji consonant tail deletes 1 romaji letter, then switches to kana
+        val pending = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "kyouhash") pending.appendChar(ch)
+        assertEquals("kyouhas", pending.backspace().rawInput)
+        assertEquals("kyouha", pending.backspace().rawInput)
+        assertEquals("kyou", pending.backspace().rawInput)
+
+        // 7. English tail and English mode delete 1 ASCII letter
+        val mixedEn = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "kyouhagoogle") mixedEn.appendChar(ch)
+        assertEquals("kyouhagoogl", mixedEn.backspace().rawInput)
+
+        val enMode = CompositionSession(dictionaries, scoreEngine, converter)
+        enMode.englishMode = true
+        for (ch in "make") enMode.appendChar(ch)
+        val enBack = enMode.backspace()
+        assertEquals("mak", enBack.rawInput)
+        assertTrue(enBack.clauses.all { it.isEnglish })
+
+        // 8. Repaired typo chunk keeps kana deletion
+        val typo = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "onegaishimsu") typo.appendChar(ch)
+        assertEquals("onegaishim", typo.backspace().rawInput)
+    }
+
+    @Test
+    fun idlePunctuationComposesWithCandidatesAndAllUpperAcronymsStayEnglish() {
+        val converter = AndroidMozcConverter(dictionaries)
+
+        // 1. Idle punctuation stays composing with alternative candidates and no boundary strip
+        val commaSess = CompositionSession(dictionaries, scoreEngine, converter)
+        val commaSnap = commaSess.appendText("、")
+        assertTrue(commaSnap.isComposing)
+        assertEquals("、", commaSnap.previewText)
+        val commaCands = commaSnap.candidates.map { it.text }
+        assertTrue("Expected punctuation candidates for '、', got $commaCands",
+            commaCands.containsAll(listOf("、", "，", ",", "・")))
+        assertFalse(commaSnap.canExtendClause)
+        assertFalse(commaSnap.canShrinkClause)
+        assertTrue(commaSnap.scriptVariants.isEmpty())
+
+        val contSnap = commaSess.appendText("sorede")
+        assertTrue(contSnap.previewText.startsWith("、"))
+        assertTrue(contSnap.clauses.joinToString("") { it.reading }.contains("それで"))
+
+        val periodSess = CompositionSession(dictionaries, scoreEngine, converter)
+        val periodSnap = periodSess.appendText("。")
+        assertTrue(periodSnap.candidates.map { it.text }.containsAll(listOf("。", "．", ".")))
+
+        // 2. Gliding English after Japanese punctuation must not insert a leading space
+        val glideAfterPunct = CompositionSession(dictionaries, scoreEngine, converter)
+        glideAfterPunct.appendText("、")
+        glideAfterPunct.appendGlideResult("google", true, listOf("google" to true))
+        assertEquals("、google", glideAfterPunct.snapshot.rawInput)
+
+        // 3. 2+ char all-uppercase acronyms stay ENGLISH instead of turning into sokuon ("っf")
+        for (acronym in listOf("FF", "TL", "DM", "SNS")) {
+            val segs = scoreEngine.segment(acronym)
+            assertEquals("Expected ENGLISH for '$acronym': $segs", listOf(SegmentKind.ENGLISH), segs.map { it.kind })
+        }
+        val ffSess = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "FF") ffSess.appendChar(ch)
+        assertEquals("FF", ffSess.snapshot.previewText)
+    }
 }

@@ -280,15 +280,19 @@ class ScoreEngine(
             )
         }
 
-        // Preserve deliberate TitleCase / UPPERCASE runs when they look English or CamelCase brand
+        // Preserve deliberate TitleCase / UPPERCASE runs when they look English or CamelCase brand,
+        // and preserve 2+ char all-uppercase acronyms (e.g. FF, TL, DM) so they aren't parsed as sokuon.
         val lowerRun = run.lowercase()
-        if (run.any { it.isUpperCase() } && (dictionaries.englishAllWords.contains(lowerRun) || dictionaries.properNounCanonical.containsKey(lowerRun))) {
+        val isAllUpperAcronym = n >= 2 && run.all { it.isUpperCase() }
+        if (isAllUpperAcronym ||
+            (run.any { it.isUpperCase() } && (dictionaries.englishAllWords.contains(lowerRun) || dictionaries.properNounCanonical.containsKey(lowerRun)))
+        ) {
             return listOf(
                 ScoredSegment(
-                    SegmentKind.ENGLISH,
-                    run,
-                    baseOffset,
-                    baseOffset + n,
+                    kind = SegmentKind.ENGLISH,
+                    raw = run,
+                    startIndex = baseOffset,
+                    endIndex = baseOffset + n,
                     canonicalEnglish = dictionaries.properNounCanonical[lowerRun]
                 )
             )

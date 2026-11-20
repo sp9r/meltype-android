@@ -295,6 +295,8 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
 
         traceBadge = makeRailButton("").apply {
             visibility = View.GONE
+            isSingleLine = true
+            ellipsize = TextUtils.TruncateAt.START
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
             setPadding(dp(6), dp(3), dp(6), dp(3))
             setOnClickListener {
@@ -1030,21 +1032,24 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             }
         }
         val snap = session.snapshot
-        val lastIsEnglish = snap.clauses.lastOrNull()?.isEnglish == true
+        val lastClause = snap.clauses.lastOrNull()
+        val lastIsAsciiAlnum = lastClause != null && lastClause.isEnglish &&
+            lastClause.raw.lastOrNull()?.let { it in 'a'..'z' || it in 'A'..'Z' || it.isDigit() } == true
         val punct = when {
             englishMode -> if (isPeriod) "." else ","
-            lastIsEnglish && settings.punctuationStyle != PunctuationStyle.HALF ->
+            lastIsAsciiAlnum && settings.punctuationStyle != PunctuationStyle.HALF ->
                 if (isPeriod) "." else ","
             else ->
                 if (isPeriod) settings.punctuationStyle.period else settings.punctuationStyle.comma
         }
-        if (snap.isComposing) {
-            if (session.isCaretInside) {
-                clearUndoCommit()
-                renderSnapshot(session.appendText(punct, getSurroundingTextBefore()))
-                return
-            }
-            if (englishMode || (settings.autoCommitOnPunctuation && !lastIsEnglish)) {
+        if (snap.isComposing && session.isCaretInside) {
+            clearUndoCommit()
+            renderSnapshot(session.appendText(punct, getSurroundingTextBefore()))
+            return
+        }
+        val shouldAutoCommit = englishMode || (settings.autoCommitOnPunctuation && !lastIsAsciiAlnum)
+        if (shouldAutoCommit) {
+            if (snap.isComposing) {
                 val raw = snap.rawInput
                 val committed = session.commitAndLearn(getSurroundingTextBefore())
                 val out = committed + punct
@@ -1056,19 +1061,19 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
                 renderSnapshot(session.snapshot)
             } else {
                 clearUndoCommit()
-                val updated = session.appendText(punct, getSurroundingTextBefore())
+                currentInputConnection?.commitText(punct, 1)
                 if (shouldLogEval()) {
-                    evalLogger.logTap(settings.activePromptId, punct.firstOrNull() ?: ',', false, updated.previewText)
+                    evalLogger.logTap(settings.activePromptId, punct.firstOrNull() ?: ',', true, "")
                 }
-                renderSnapshot(updated)
+                renderSnapshot(session.snapshot)
             }
         } else {
             clearUndoCommit()
-            currentInputConnection?.commitText(punct, 1)
+            val updated = session.appendText(punct, getSurroundingTextBefore())
             if (shouldLogEval()) {
-                evalLogger.logTap(settings.activePromptId, punct.firstOrNull() ?: ',', true, "")
+                evalLogger.logTap(settings.activePromptId, punct.firstOrNull() ?: ',', false, updated.previewText)
             }
-            renderSnapshot(session.snapshot)
+            renderSnapshot(updated)
         }
     }
 
@@ -1525,8 +1530,38 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
     private fun englishOnly(cands: List<GlideCandidate>): List<GlideCandidate> =
         if (englishMode || settings.glideEnglishOnly) cands.filter { it.isEnglish }.ifEmpty { cands } else cands
 
+    private fun updateTraceBadgeMaxWidth(isEditing: Boolean, isTransient: Boolean = false) {
+        val screenW = resources.displayMetrics.widthPixels
+        val maxW = when {
+            isTransient -> minOf(dp(180), (screenW * 0.45f).toInt().coerceAtLeast(dp(120)))
+            isEditing -> minOf(dp(112), (screenW * 0.28f).toInt().coerceAtLeast(dp(84)))
+            else -> minOf(dp(84), (screenW * 0.22f).toInt().coerceAtLeast(dp(64)))
+        }
+        traceBadge.maxWidth = maxW
+    }
+
+    private fun formatTraceBadge(snap: CompositionSnapshot): Pair<String, TextUtils.TruncateAt> {
+        if (snap.isEditing) {
+            val len = snap.editKana.length
+            val c = snap.editKanaCaret.coerceIn(0, len)
+            val left = if (c > 4) "…" + snap.editKana.substring(c - 4, c) else snap.editKana.substring(0, c)
+            val right = if (len - c > 4) snap.editKana.substring(c, c + 4) + "…" else snap.editKana.substring(c)
+            return "$left｜$right" to TextUtils.TruncateAt.MIDDLE
+        }
+        val full = snap.clauses.joinToString("│") { it.reading }.ifEmpty { snap.romajiTrace }
+        if (full.length <= 7) return full to TextUtils.TruncateAt.START
+        if (snap.focusedClauseIndex in 0 until snap.clauses.lastIndex) {
+            val fc = snap.clauses[snap.focusedClauseIndex].reading
+            val pre = if (snap.focusedClauseIndex > 0) "…" else ""
+            return "$pre$fc…" to TextUtils.TruncateAt.END
+        }
+        return full to TextUtils.TruncateAt.START
+    }
+
     private fun showTransientTrace(text: String) {
         if (!::traceBadge.isInitialized) return
+        updateTraceBadgeMaxWidth(isEditing = false, isTransient = true)
+        traceBadge.ellipsize = TextUtils.TruncateAt.END
         traceBadge.visibility = View.VISIBLE
         traceBadge.text = text
     }
@@ -1587,14 +1622,13 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             }
             if (!snap.isEditing) ic?.setComposingText(spanned, 1)
 
-            val clauseTrace = if (snap.isEditing) {
-                val c = snap.editKanaCaret.coerceIn(0, snap.editKana.length)
-                snap.editKana.substring(0, c) + "｜" + snap.editKana.substring(c)
-            } else {
-                snap.clauses.joinToString("│") { it.reading }.ifEmpty { snap.romajiTrace }
-            }
+            val (traceText, trunc) = formatTraceBadge(snap)
+            updateTraceBadgeMaxWidth(isEditing = snap.isEditing)
+            traceBadge.ellipsize = trunc
             traceBadge.visibility = View.VISIBLE
-            traceBadge.text = clauseTrace
+            traceBadge.text = traceText
+            oneHandBtn.visibility = View.GONE
+            settingsBtn.visibility = View.GONE
 
             clauseBar.visibility = View.VISIBLE
             val hasClauses = snap.clauses.isNotEmpty()
@@ -1625,6 +1659,8 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         } else {
             ic?.finishComposingText()
             traceBadge.visibility = View.GONE
+            oneHandBtn.visibility = View.VISIBLE
+            settingsBtn.visibility = View.VISIBLE
             clauseBar.visibility = View.GONE
             boundaryBar.visibility = View.GONE
         }
@@ -1714,6 +1750,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         val bgFocus = if (dark) Color.parseColor("#2A3B52") else Color.parseColor("#E3EDF8")
         val textCol = if (dark) Color.parseColor("#ECEEF0") else Color.parseColor("#202328")
 
+        var focusedPill: View? = null
         for ((idx, clause) in snap.clauses.withIndex()) {
             val focused = idx == snap.focusedClauseIndex
             val showReadingCue = focused && !clause.isEnglish &&
@@ -1771,11 +1808,19 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
                 }
             }
             clausePillRow.addView(pill)
+            if (focused) focusedPill = pill
+        }
+        focusedPill?.let { target ->
+            clauseScroll.post {
+                val targetX = (target.left - (clauseScroll.width - target.width) / 2).coerceAtLeast(0)
+                clauseScroll.smoothScrollTo(targetX, 0)
+            }
         }
     }
 
     private fun renderCandidateRow(snap: CompositionSnapshot, dark: Boolean, accent: Int) {
         candidateRow.removeAllViews()
+        candidateScroll.scrollTo(0, 0)
         val chipBg = if (dark) Color.parseColor("#23272D") else Color.parseColor("#FFFFFF")
         val chipAltBg = if (dark) Color.parseColor("#1D232B") else Color.parseColor("#EDF2F7")
         val border = if (dark) Color.parseColor("#323741") else Color.parseColor("#DFE2E6")

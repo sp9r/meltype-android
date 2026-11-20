@@ -179,27 +179,97 @@ class CompositionSession(
         caretRaw = if (next >= buffer.length) null else next
     }
 
-    /** Deletes raw [from, to), shifting overrides and hints. Does not move the caret. */
-    private fun deleteRaw(from: Int, to: Int) {
-        if (to <= from) return
-        val n = to - from
+    /** Replaces raw [from, to) with [replacement], shifting overrides, typo locks, and spatial hints. */
+    private fun replaceRaw(from: Int, to: Int, replacement: String) {
+        if (to < from || from < 0 || to > buffer.length) return
+        if (to == from && replacement.isEmpty()) return
+        val delta = replacement.length - (to - from)
         val shifted = LinkedHashMap<IntRange, SegmentKind>()
         for ((r, k) in overrides) {
-            val nf = if (r.first < from) r.first else if (r.first >= to) r.first - n else from
-            val nl = if (r.last < from) r.last else if (r.last >= to) r.last - n else from - 1
-            if (nl >= nf) shifted[nf..nl] = k
+            val nr = when {
+                r.last < from -> r
+                r.first >= to -> (r.first + delta)..(r.last + delta)
+                else -> {
+                    val nf = if (r.first < from) r.first else from
+                    val nl = if (r.last >= to) r.last + delta else from + replacement.length - 1
+                    if (nl >= nf) nf..nl else null
+                }
+            }
+            if (nr != null) shifted[nr] = k
         }
         overrides.clear()
         overrides.putAll(shifted)
-        val starts = noTypoFixStarts.filter { it < from || it >= to }.map { if (it >= to) it - n else it }
+        val starts = noTypoFixStarts.mapNotNull {
+            when {
+                it < from -> it
+                it >= to -> it + delta
+                else -> null
+            }
+        }
         noTypoFixStarts.clear()
         noTypoFixStarts.addAll(starts)
-        buffer.delete(from, to)
-        for (k in (to - 1) downTo from) {
-            if (k < bufferSpatialHints.size) bufferSpatialHints.removeAt(k)
+        buffer.replace(from, to, replacement)
+        val delCount = to - from
+        for (k in 0 until delCount) {
+            if (from < bufferSpatialHints.size) bufferSpatialHints.removeAt(from)
         }
+        val insertAt = from.coerceAtMost(bufferSpatialHints.size)
+        for (k in replacement.indices) {
+            bufferSpatialHints.add(insertAt + k, emptyMap())
+        }
+        while (bufferSpatialHints.size < buffer.length) bufferSpatialHints.add(emptyMap())
+        while (bufferSpatialHints.size > buffer.length) bufferSpatialHints.removeAt(bufferSpatialHints.lastIndex)
         selectedClauseTextByKey.clear()
         customClauseSplits.clear()
+    }
+
+    /** Deletes raw [from, to), shifting overrides and hints. Does not move the caret. */
+    private fun deleteRaw(from: Int, to: Int) {
+        replaceRaw(from, to, "")
+    }
+
+    /**
+     * Deletes one display unit before raw index [pos]: one Japanese kana when the preceding
+     * characters form converted Japanese kana, one romaji letter while still typing an
+     * incomplete consonant prefix, or one ASCII/literal character elsewhere.
+     * Returns the new raw cursor position after deletion.
+     */
+    private fun deleteOneUnitBefore(pos: Int): Int {
+        if (pos <= 0) return 0
+        val raw = buffer.toString()
+        val segments = scoreEngine.segment(raw, overrides)
+        val seg = segments.firstOrNull { pos > it.startIndex && pos <= it.endIndex }
+        if (seg == null || seg.kind != SegmentKind.JAPANESE) {
+            replaceRaw(pos - 1, pos, "")
+            return pos - 1
+        }
+        val analysis = RomajiDetector.analyze(raw.substring(seg.startIndex, pos), strictForDetection = false)
+        if (analysis.pendingTail.isNotEmpty() || analysis.chunks.isEmpty()) {
+            replaceRaw(pos - 1, pos, "")
+            return pos - 1
+        }
+        val last = analysis.chunks.last()
+        val chunkStart = seg.startIndex + last.romajiStart
+        val chunkEnd = seg.startIndex + last.romajiEnd
+        if (last.kana.length >= 2) {
+            val remainKana = last.kana.dropLast(1)
+            val replacement = KANA_PREFIX_TO_ROMAJI[remainKana] ?: remainKana
+            replaceRaw(chunkStart, chunkEnd, replacement)
+            return chunkStart + replacement.length
+        }
+        val prev = analysis.chunks.getOrNull(analysis.chunks.size - 2)
+        if (prev != null && prev.kana == "っ" && prev.rawRomaji.length == 1 && prev.rawRomaji[0] in 'a'..'z') {
+            val pStart = seg.startIndex + prev.romajiStart
+            replaceRaw(pStart, chunkEnd, "ltu")
+            return pStart + 3
+        }
+        if (prev != null && prev.kana == "ん" && (prev.rawRomaji == "m" || prev.rawRomaji == "n")) {
+            val pStart = seg.startIndex + prev.romajiStart
+            replaceRaw(pStart, chunkEnd, "nn")
+            return pStart + 2
+        }
+        replaceRaw(chunkStart, chunkEnd, "")
+        return chunkStart
     }
 
     /**
@@ -353,7 +423,8 @@ class CompositionSession(
         var addedSpace = false
         if (buffer.isNotEmpty() && !buffer.last().isWhitespace()) {
             val lastSeg = cachedSnapshot.clauses.lastOrNull()
-            if (lastSeg != null && lastSeg.isEnglish && isPrimaryEnglish) {
+            val lastEndsWithAlnum = lastSeg?.raw?.lastOrNull()?.let { it in 'a'..'z' || it in 'A'..'Z' || it.isDigit() } == true
+            if (lastSeg != null && lastSeg.isEnglish && lastEndsWithAlnum && isPrimaryEnglish) {
                 buffer.append(' ')
                 bufferSpatialHints.add(emptyMap())
                 addedSpace = true
@@ -409,13 +480,12 @@ class CompositionSession(
         }
         val caret = caretRaw
         if (caret != null || kanaRevert) {
-            // Kana view: delete the kana (or character) before the caret.
+            // Kana view: delete one display unit (kana or character) before the caret.
             clearLastGlideHint()
             val p = caret ?: buffer.length
-            val unit = editUnits().lastOrNull { it.rawStart < p } ?: return cachedSnapshot
-            deleteRaw(unit.rawStart, p)
+            val nextPos = deleteOneUnitBefore(p)
             if (buffer.isEmpty()) return clearAll()
-            caretRaw = if (caret == null || unit.rawStart >= buffer.length) null else unit.rawStart
+            caretRaw = if (caret == null || nextPos >= buffer.length) null else nextPos
             return recompute(surroundingContext, keepFocus = true)
         }
         val glideSpan = lastGlideRange
@@ -435,14 +505,8 @@ class CompositionSession(
         }
 
         clearLastGlideHint()
-        val removeAt = buffer.length - 1
-        val toRemove = overrides.keys.filter { removeAt in it }
-        toRemove.forEach { overrides.remove(it) }
-        buffer.deleteCharAt(removeAt)
-        noTypoFixStarts.removeAll { it >= buffer.length }
-        if (removeAt < bufferSpatialHints.size) {
-            bufferSpatialHints.removeAt(removeAt)
-        }
+        deleteOneUnitBefore(buffer.length)
+        if (buffer.isEmpty()) return clearAll()
         return recompute(surroundingContext)
     }
 
@@ -1079,6 +1143,7 @@ class CompositionSession(
                         if (calc != null) cands.add(calc)
                     }
                     cands.addAll(UtilityConverter.numericCandidates(seg.raw))
+                    cands.addAll(UtilityConverter.punctuationCandidates(seg.raw))
                     val tempKey = "$segIdx:0:${seg.raw}:${seg.raw}"
                     val chosen = selectedClauseTextByKey[tempKey] ?: cands.first()
                     displayClauses.add(
@@ -1438,7 +1503,8 @@ class CompositionSession(
         val segAfterFocused = focused?.let { segments.getOrNull(it.segmentIndex + 1) }
             ?.takeIf { focusedSeg != null && it.startIndex == focusedSeg.endIndex }
         val alnumFocused = focused != null && focused.isEnglish &&
-            (focusedSeg?.kind == SegmentKind.ENGLISH || focusedSeg?.kind == SegmentKind.LITERAL)
+            (focusedSeg?.kind == SegmentKind.ENGLISH ||
+                (focusedSeg?.kind == SegmentKind.LITERAL && focusedSeg.raw.any { it.isLetterOrDigit() }))
         val canShrink = if (alnumFocused) {
             focusedSeg!!.endIndex - focusedSeg.startIndex >= 2
         } else {
@@ -1703,6 +1769,7 @@ class CompositionSession(
 
     private fun buildScriptVariants(focused: DisplayClause?, clausesInSeg: Int): List<Pair<String, String>> {
         if (focused == null || focused.reading.isEmpty()) return emptyList()
+        if (focused.isEnglish && focused.raw.none { it.isLetterOrDigit() }) return emptyList()
         val list = ArrayList<Pair<String, String>>(6)
         val seen = HashSet<String>()
         fun add(label: String, text: String) {
@@ -1741,6 +1808,16 @@ class CompositionSession(
     }
 
     companion object {
+        private val KANA_PREFIX_TO_ROMAJI = mapOf(
+            "っち" to "tchi", "っし" to "sshi", "っ" to "ltu",
+            "き" to "ki", "ぎ" to "gi", "し" to "shi", "じ" to "ji",
+            "ち" to "chi", "て" to "te", "で" to "de", "ぢ" to "di",
+            "つ" to "tsu", "と" to "to", "ど" to "do", "に" to "ni",
+            "ひ" to "hi", "び" to "bi", "ぴ" to "pi", "ふ" to "fu",
+            "み" to "mi", "り" to "ri", "う" to "u", "く" to "ku",
+            "ぐ" to "gu", "す" to "su", "ヴ" to "ヴ"
+        )
+
         /** Google IME (Mozc) z-table. */
         val Z_SYMBOLS = mapOf(
             '.' to "…", ',' to "‥", '/' to "・", '-' to "〜", '[' to "『", ']' to "』",
