@@ -3,6 +3,7 @@ package io.github.sp9r.meltype.glide
 import io.github.sp9r.meltype.core.MeltypeDictionaries
 import io.github.sp9r.meltype.core.RomajiDetector
 import kotlin.math.abs
+import kotlin.math.ln
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sqrt
@@ -306,27 +307,48 @@ class GlideDecoder(private val dictionaries: MeltypeDictionaries) {
 
         // Tier 1-3 English
         for (w in CORE_ENGLISH_WORDS) {
-            registerTemplate(w, w, isEnglish = true, freqBonus = 0.34f)
+            registerTemplate(w, w, isEnglish = true, freqBonus = 0.36f)
+        }
+        for ((w, count) in dictionaries.englishGlossFreq) {
+            if (w.length in 2..15 && w !in dictionaries.japaneseOriginEnglishWords) {
+                val glossBonus = when {
+                    count >= 2 -> (0.04f + 0.08f * ln(count.toFloat())).coerceAtMost(0.32f)
+                    w.length >= 3 && dictionaries.englishAllWords.contains(w) -> 0.00f
+                    else -> continue
+                }
+                registerTemplate(w, w, isEnglish = true, freqBonus = glossBonus)
+            }
         }
         for (w in dictionaries.properNounCanonical.keys) {
-            registerTemplate(w, w, isEnglish = true, freqBonus = 0.30f)
+            val properBonus = if (w in CORE_PROPER_BRANDS) 0.26f else 0.06f
+            registerTemplate(w, w, isEnglish = true, freqBonus = properBonus)
         }
-        for (w in dictionaries.commonLatinWordsForGlide) {
-            val isJpOrigin = w in dictionaries.japaneseOriginEnglishWords
-            registerTemplate(w, w, isEnglish = !isJpOrigin, freqBonus = if (isJpOrigin) 0.14f else 0.24f)
+        for (w in dictionaries.englishCommonWords) {
+            registerTemplate(w, w, isEnglish = true, freqBonus = 0.20f)
+        }
+        for (w in dictionaries.japaneseOriginEnglishWords) {
+            registerTemplate(w, w, isEnglish = false, freqBonus = 0.14f)
         }
         for (w in dictionaries.englishReadableWords.allWords()) {
             registerTemplate(w, w, isEnglish = true, freqBonus = 0.12f)
         }
+        for (w in dictionaries.englishTechAndAcronymWords) {
+            val bonus = if (w.length <= 3) 0.04f else 0.10f
+            registerTemplate(w, w, isEnglish = true, freqBonus = bonus)
+        }
+        for (w in dictionaries.glideBrandLoanwords) {
+            val bonus = if (w.length <= 3) -0.08f else 0.02f
+            registerTemplate(w, w, isEnglish = true, freqBonus = bonus)
+        }
 
-        // Tier 5 English (39k SCOWL): register 5..14-char non-romaji English words not already in Tier 1-3
+        // Tier 5 English (39k SCOWL): register 5..14-char non-romaji English words not already in higher tiers
         // so cold initialization stays fast while English-only glide still covers broad vocabulary.
         for (w in dictionaries.englishAllWords.allWords()) {
             if (w.length in 5..14 && w !in japaneseTraceSet && !dictionaries.japaneseWords.contains(w) && !seen.containsKey("$w|$w|E")) {
                 val rom = RomajiDetector.analyze(w, strictForDetection = true)
                 val looksLikeJp = rom.isStrictValid && rom.pendingTail.isEmpty() && rom.chunks.size >= 2
                 if (!looksLikeJp) {
-                    registerTemplate(w, w, isEnglish = true, freqBonus = -0.32f)
+                    registerTemplate(w, w, isEnglish = true, freqBonus = -0.28f)
                 }
             }
         }
@@ -444,14 +466,16 @@ class GlideDecoder(private val dictionaries: MeltypeDictionaries) {
         val pairBuckets = IntArray(maxPairs)
         val pairCosts = FloatArray(maxPairs)
         var pairCount = 0
+        val endpointSlack = if (preferJapanese) 0.13f else 0.09f
+        val endpointWeight = if (preferJapanese) 0.76f else 1.05f
         for ((sChar, sDist) in startKeys) {
             if (sDist > maxEndpointDist && startKeys.first().first != sChar) continue
-            val effSDist = max(0f, sDist - 0.13f)
+            val effSDist = max(0f, sDist - endpointSlack)
             val sIdx = (sChar - 'a') * 26
             for ((eChar, eDist) in endKeys) {
                 if (eDist > maxEndpointDist && endKeys.first().first != eChar) continue
-                val effEDist = max(0f, eDist - 0.13f)
-                val endpointCost = (effSDist + effEDist) * 0.76f
+                val effEDist = max(0f, eDist - endpointSlack)
+                val endpointCost = (effSDist + effEDist) * endpointWeight
                 var ins = pairCount
                 while (ins > 0 && pairCosts[ins - 1] > endpointCost) {
                     pairCosts[ins] = pairCosts[ins - 1]
@@ -537,11 +561,12 @@ class GlideDecoder(private val dictionaries: MeltypeDictionaries) {
             }
             meta.anchorSeq = dedup.toString()
         }
+        val nearThreshold = if (preferJapanese) 0.36f else 0.27f
         val interiorAnchors = anchors.filter { !it.isEndpoint }.map { a ->
             val near2 = KeyLayoutGeometry.nearestKeys(a.x, a.y, limit = 2)
             var nearMask = 0
             for ((kch, d) in near2) {
-                if (d < 0.36f) {
+                if (d < nearThreshold) {
                     nearMask = nearMask or (1 shl (kch - 'a'))
                 }
             }
@@ -1270,7 +1295,35 @@ class GlideDecoder(private val dictionaries: MeltypeDictionaries) {
             "server", "client", "network", "wifi", "bluetooth", "password", "account", "user",
             "settings", "config", "theme", "light", "dark", "layout", "design", "style", "input",
             "output", "text", "word", "words", "japanese", "english", "romaji", "hiragana", "katakana",
-            "kanji", "mozc", "linux", "windows", "macos", "python", "kotlin", "java", "gradle"
+            "kanji", "mozc", "linux", "windows", "macos", "python", "kotlin", "java", "gradle",
+            "perfect", "sweet", "super", "green", "great", "happy", "pretty", "really", "actually",
+            "probably", "definitely", "different", "important", "something", "anything", "everything",
+            "everyone", "nothing", "someone", "anyone", "always", "never", "already", "still", "again",
+            "together", "another", "around", "before", "behind", "between", "during", "since", "until",
+            "while", "through", "without", "should", "must", "been", "being", "having", "doing", "going",
+            "making", "taking", "getting", "looking", "working", "playing", "watching", "listening",
+            "thinking", "trying", "using", "coming", "saying", "giving", "knowing", "seeing", "feeling",
+            "calling", "asking", "needing", "keeping", "starting", "running", "moving", "living",
+            "waiting", "talking", "walking", "reading", "writing", "learning", "helping", "showing",
+            "opening", "closing", "changing", "putting", "setting", "sending", "buying", "paying",
+            "favorite", "awesome", "amazing", "wonderful", "beautiful", "terrible", "interesting",
+            "available", "possible", "problem", "question", "answer", "reason", "idea", "moment",
+            "minute", "second", "hour", "night", "energy", "story", "movie", "thumbnail", "esim",
+            "todays", "got", "did", "was", "were", "has", "had", "does", "done", "gone", "went",
+            "came", "made", "said", "told", "took", "gave", "found", "thought", "knew", "felt", "left",
+            "kept", "held", "brought", "bought", "built", "sent", "spent", "heard", "met", "sat",
+            "stood", "lost", "paid", "won", "ran", "grew", "drew", "flew", "threw", "broke", "chose",
+            "spoke", "wrote", "drove", "woke", "wore", "adjust", "august", "nonfiction", "screenshot",
+            "playlist", "subtitle", "podcast"
+        )
+
+        private val CORE_PROPER_BRANDS = setOf(
+            "google", "youtube", "twitter", "github", "iphone", "android", "claude", "gemini",
+            "chatgpt", "openai", "wordle", "illit", "aespa", "newjeans", "ive", "vivaldi",
+            "obsidian", "bitwarden", "tailscale", "meltype", "shizuku", "discord", "slack",
+            "zoom", "notion", "amazon", "apple", "microsoft", "windows", "linux", "python",
+            "kotlin", "steam", "netflix", "spotify", "instagram", "tiktok", "line", "reddit",
+            "wikipedia", "uber"
         )
 
         private val COMPOUND_SUFFIX_PAIRS = listOf(

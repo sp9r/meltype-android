@@ -34,7 +34,8 @@ class ScoreEngine(
 
         // 1. Check whole-input English sentence heuristic when spaces exist
         if (input.contains(' ') && isLikelyEnglishSentence(input) && overrides.isEmpty()) {
-            return listOf(ScoredSegment(SegmentKind.LITERAL, input, 0, input.length))
+            val canon = canonicalizeEnglishSentence(input)
+            return listOf(ScoredSegment(SegmentKind.LITERAL, input, 0, input.length, canonicalEnglish = canon))
         }
 
         // 2. Partition input into coarse runs: whitespace/punctuation, literal tokens (/cmd, @user, $var, URL, model numbers), or alpha runs
@@ -248,6 +249,32 @@ class ScoreEngine(
             }
         }
         return englishVotes >= 2 && englishVotes > romajiVotes
+    }
+
+    private fun canonicalizeEnglishSentence(input: String): String? {
+        val sb = StringBuilder(input.length)
+        var changed = false
+        var i = 0
+        while (i < input.length) {
+            if (isAsciiAlpha(input[i])) {
+                var end = i + 1
+                while (end < input.length && isAsciiAlpha(input[end])) end++
+                val word = input.substring(i, end)
+                val lower = word.lowercase()
+                val proper = if (word == lower) dictionaries.properNounCanonical[lower] else null
+                if (proper != null && proper != word) {
+                    sb.append(proper)
+                    changed = true
+                } else {
+                    sb.append(word)
+                }
+                i = end
+            } else {
+                sb.append(input[i])
+                i++
+            }
+        }
+        return if (changed) sb.toString() else null
     }
 
     /**
@@ -516,6 +543,12 @@ class ScoreEngine(
         if (!analysis.isStrictValid) return null
         if (analysis.pendingTail.isNotEmpty() && !allowPendingTail) return null
         if (prevWasEnglish && analysis.hiragana.isEmpty()) return null
+        // Never chop off a broken 1-kana incomplete tail right after an English word ("ill" + "いt")
+        if (prevWasEnglish && analysis.hiragana.length <= 1 && analysis.pendingTail.isNotEmpty() &&
+            !PARTICLES.any { effectiveSub.startsWith(it) }
+        ) {
+            return null
+        }
 
         val hira = analysis.displayKanaOrTail
         var score = effectiveSub.length * 1.15 - typoPenalty
@@ -605,6 +638,13 @@ class ScoreEngine(
                 val nextIsBoundary = (nextPos == totalLen) || PARTICLES.any { fullRun.startsWith(it, nextPos) }
                 if (isPrefix && nextIsBoundary) {
                     return len * 1.35 + 2.5
+                }
+                // Unknown non-romaji whole alpha run (e.g. uncatalogued brand or unknown English word like xyllit):
+                // keep as one ENGLISH segment unless typoEngine can repair it as Japanese.
+                if (prevIdx == 0 && nextPos == totalLen && len >= 3 &&
+                    (!typoCorrectionEnabled() || typoEngine.fixUnreadable(sub, final = true) == null)
+                ) {
+                    return len * 1.15 + 1.5
                 }
                 // Fallback for unknown non-romaji token (e.g., typo or code identifier)
                 if (nextPos == totalLen || len >= 3) {

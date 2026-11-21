@@ -254,3 +254,9 @@ docs
 
 # Issue #887
 exe
+
+# --- 一般的な現代英語・日常語 ---
+thumbnail thumbnails esim todays screenshot screenshots playlist playlists subtitle subtitles podcast podcasts
+nonfiction supernova awesome different important actually probably definitely together everyone something anything
+because through without already remember favorite amazing listening watching working playing thinking looking
+adjust august perfect sweet super green sorry story nothing energy

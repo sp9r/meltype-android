@@ -60,6 +60,10 @@ class MeltypeDictionaries(source: DictionarySource) {
     val englishFocusedWords: SortedWordList
     val englishAllWords: SortedWordList
     val englishReadableWords: SortedWordList
+    val englishCommonWords: Set<String>
+    val englishTechAndAcronymWords: Set<String>
+    val glideBrandLoanwords: Set<String>
+    val englishGlossFreq: Map<String, Int>
     val japaneseWords: SortedWordList
     val japaneseCanonicalWords: List<String>
     val japaneseOriginEnglishWords: Set<String>
@@ -86,27 +90,41 @@ class MeltypeDictionaries(source: DictionarySource) {
             return txt.lines()
         }
 
-        // 1. english.txt (space-separated, plus Japanese-origin section tracking)
+        // 1. english.txt (space-separated, plus section category tracking)
         val engFocused = HashSet<String>()
         val jpOrigin = HashSet<String>()
+        val engCommon = HashSet<String>()
+        val engTechOrAcronym = HashSet<String>()
         var inJpOrigin = false
+        var inTechOrAcronym = false
         for (rawLine in readLines("english.txt")) {
             if (rawLine.startsWith("# ---")) {
                 inJpOrigin = rawLine.contains("日本語由来")
+                inTechOrAcronym = rawLine.contains("技術用語") ||
+                    rawLine.contains("略語・ゲームの名前") ||
+                    rawLine.contains("テスターのチャット")
                 continue
             }
             val line = stripHashComment(rawLine)
-            if (inJpOrigin && line.isEmpty()) {
-                inJpOrigin = false
+            if (line.isEmpty()) {
+                if (inJpOrigin) inJpOrigin = false
                 continue
             }
             for (tok in line.splitWhitespace()) {
                 val lower = tok.lowercase()
                 engFocused.add(lower)
-                if (inJpOrigin) jpOrigin.add(lower)
+                if (inJpOrigin) {
+                    jpOrigin.add(lower)
+                } else if (inTechOrAcronym) {
+                    engTechOrAcronym.add(lower)
+                } else {
+                    engCommon.add(lower)
+                }
             }
         }
         japaneseOriginEnglishWords = jpOrigin
+        englishCommonWords = engCommon
+        englishTechAndAcronymWords = engTechOrAcronym
 
         // 2. propernouns.txt (case-preserved)
         val properMap = LinkedHashMap<String, String>()
@@ -291,7 +309,41 @@ class MeltypeDictionaries(source: DictionarySource) {
         readingsSet = rSet
         readingWithTags = rTagged
 
-        // 11. Build priority English glide vocabulary list
+        // 11. Extract lowercase English word frequencies from JMdict translations.txt
+        val glossFreq = HashMap<String, Int>(20000)
+        for (rawLine in readLines("translations.txt")) {
+            if (rawLine.isEmpty() || rawLine[0] == '#') continue
+            val tab1 = rawLine.indexOf('\t')
+            if (tab1 < 0) continue
+            val tab2 = rawLine.indexOf('\t', tab1 + 1)
+            if (tab2 < 0 || tab2 + 1 >= rawLine.length) continue
+            val sb = StringBuilder(16)
+            var invalid = false
+            for (idx in (tab2 + 1) until rawLine.length) {
+                val c = rawLine[idx]
+                when {
+                    c in 'a'..'z' -> if (!invalid) sb.append(c)
+                    c in 'A'..'Z' -> if (!invalid) sb.append((c.code + 32).toChar())
+                    c in '0'..'9' -> invalid = true
+                    else -> {
+                        if (!invalid && sb.length in 2..16) {
+                            val w = sb.toString()
+                            glossFreq[w] = (glossFreq[w] ?: 0) + 1
+                        }
+                        sb.setLength(0)
+                        invalid = false
+                    }
+                }
+            }
+            if (!invalid && sb.length in 2..16) {
+                val w = sb.toString()
+                glossFreq[w] = (glossFreq[w] ?: 0) + 1
+            }
+        }
+        englishGlossFreq = glossFreq
+        glideBrandLoanwords = glideBrands
+
+        // 12. Build priority English glide vocabulary list (preserved for callers expecting combined list)
         val glideEng = LinkedHashSet<String>()
         glideEng.addAll(properMap.keys)
         glideEng.addAll(engFocused)

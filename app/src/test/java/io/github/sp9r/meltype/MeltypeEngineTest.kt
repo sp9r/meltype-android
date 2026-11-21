@@ -1220,4 +1220,70 @@ class MeltypeEngineTest {
         for (ch in "FF") ffSess.appendChar(ch)
         assertEquals("FF", ffSess.snapshot.previewText)
     }
+
+    @Test
+    fun illitTypingAndEnglishGlideAccuracyAndInitSpeed() {
+        val tInit0 = System.nanoTime()
+        val freshDecoder = GlideDecoder(dictionaries)
+        val initMs = (System.nanoTime() - tInit0) / 1_000_000.0
+        assertTrue("Expected GlideDecoder init < 2500ms on JVM, got ${initMs}ms", initMs < 2500.0)
+
+        val converter = AndroidMozcConverter(dictionaries)
+
+        // 1. Direct typing of ILLIT and mixed phrases never falls back to broken 'いt'
+        val illitSingle = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "illit") illitSingle.appendChar(ch)
+        assertEquals("ILLIT", illitSingle.snapshot.previewText)
+
+        val illitParticle = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "illitwo") illitParticle.appendChar(ch)
+        assertEquals("ILLITを", illitParticle.snapshot.previewText)
+
+        val superIllit = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "super illit") superIllit.appendChar(ch)
+        assertFalse("Must not break illit into 'いt': ${superIllit.snapshot.previewText}", superIllit.snapshot.previewText.contains("い"))
+        assertEquals("super ILLIT", superIllit.snapshot.previewText)
+
+        val superUnknown = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "super xyllit") superUnknown.appendChar(ch)
+        assertFalse("Unknown non-romaji word must not produce broken kana: ${superUnknown.snapshot.previewText}", superUnknown.snapshot.previewText.contains("い"))
+
+        // 2. English-only glide (preferJapanese = false) recovers common English words and ILLIT accurately
+        fun swipeFromKeys(trace: String, scale: Float = 1.0f): List<io.github.sp9r.meltype.glide.TouchPoint> {
+            val pts = KeyLayoutGeometry.syntheticPathForWord(trace, jitter = 0.02f)
+            if (scale == 1.0f || pts.isEmpty()) return pts
+            val cx = pts.map { it.x }.average().toFloat()
+            val cy = pts.map { it.y }.average().toFloat()
+            return pts.map {
+                io.github.sp9r.meltype.glide.TouchPoint(
+                    cx + (it.x - cx) * scale,
+                    cy + (it.y - cy) * scale,
+                    it.tMs
+                )
+            }
+        }
+
+        val mustRankFirst = listOf(
+            "perfect", "green", "got", "sorry", "sweet",
+            "thumbnail", "different", "important", "actually",
+            "nonfiction", "esim", "illit"
+        )
+        for (word in mustRankFirst) {
+            val decoded = freshDecoder.decode(swipeFromKeys(word), maxResults = 5, preferJapanese = false).map { it.word }
+            assertEquals("Expected '$word' #1 in English glide, got $decoded", word, decoded.firstOrNull())
+        }
+
+        // Perturbed traces observed in real usage: perfebt -> perfect, scaled ilut-like illit
+        val perfebtDecoded = freshDecoder.decode(swipeFromKeys("perfebt"), maxResults = 5, preferJapanese = false).map { it.word }
+        assertTrue(
+            "Expected 'perfect' in top-2 for perturbed 'perfebt', got $perfebtDecoded",
+            perfebtDecoded.take(2).contains("perfect")
+        )
+
+        val illitScaled = freshDecoder.decode(swipeFromKeys("illit", scale = 0.85f), maxResults = 5, preferJapanese = false).map { it.word }
+        assertTrue(
+            "Expected 'illit' in top-2 for scaled swipe, got $illitScaled",
+            illitScaled.take(2).contains("illit")
+        )
+    }
 }

@@ -1134,6 +1134,10 @@ class CompositionSession(
 
                 SegmentKind.LITERAL -> {
                     val cands = mutableListOf<String>()
+                    val canon = seg.canonicalEnglish
+                    if (canon != null && canon != seg.raw) {
+                        cands.add(canon)
+                    }
                     val calc = UtilityConverter.evaluateCalculator(seg.raw)
                     if (calc != null && seg.raw.endsWith("=")) {
                         cands.add(calc)
