@@ -56,6 +56,13 @@ class SortedWordList(words: Collection<String>) {
     }
 }
 
+data class PhraseEntry(
+    val reading: String,
+    val surface: String,
+    val headOnly: Boolean,
+    val clauses: List<ConversionClause>
+)
+
 class MeltypeDictionaries(source: DictionarySource) {
     val englishFocusedWords: SortedWordList
     val englishAllWords: SortedWordList
@@ -63,12 +70,15 @@ class MeltypeDictionaries(source: DictionarySource) {
     val englishCommonWords: Set<String>
     val englishTechAndAcronymWords: Set<String>
     val glideBrandLoanwords: Set<String>
+    val countryWords: Set<String>
     val englishGlossFreq: Map<String, Int>
     val japaneseWords: SortedWordList
     val japaneseCanonicalWords: List<String>
     val japaneseOriginEnglishWords: Set<String>
+    val japaneseNameReadings: Set<String>
     val properNounCanonical: Map<String, String>
     val kanaToBrandsAndLoanwords: Map<String, List<String>>
+    val phraseEntries: Map<String, PhraseEntry>
     val readingToPhrases: Map<String, String>
     val extraCandidates: Map<String, List<String>>
     val emojiCandidates: Map<String, List<String>>
@@ -138,6 +148,26 @@ class MeltypeDictionaries(source: DictionarySource) {
                 }
             }
         }
+        // 2a. countries.txt (CLDR country/region words; skip romaji-valid ones like Oman/San from proper-noun forcing)
+        val countrySet = LinkedHashSet<String>()
+        for (rawLine in readLines("countries.txt")) {
+            val line = stripHashComment(rawLine)
+            for (tok in line.splitWhitespace()) {
+                if (tok.length < 3) continue
+                if (!tok.all { it in 'a'..'z' || it in 'A'..'Z' || it in '0'..'9' }) continue
+                val lower = tok.lowercase()
+                if (lower.all { it in 'a'..'z' } && lower.length in 3..18) {
+                    countrySet.add(lower)
+                }
+                val rom = RomajiDetector.analyze(lower, strictForDetection = true)
+                val validRomaji = rom.isStrictValid && (rom.pendingTail.isEmpty() || rom.pendingTail == "n")
+                if (!validRomaji) {
+                    properMap.putIfAbsent(lower, tok)
+                    engFocused.add(lower)
+                }
+            }
+        }
+        countryWords = countrySet
         // Hyphenated canonical forms that users type without the hyphen.
         properMap.putIfAbsent("wifi", "Wi-Fi")
         properNounCanonical = properMap
@@ -199,17 +229,39 @@ class MeltypeDictionaries(source: DictionarySource) {
         }
         kanaToBrandsAndLoanwords = latinCandMap
 
-        // 7. phrases.txt (reading\tphrase)
+        // 7. phrases.txt ([^]reading1|reading2\tsurface1|surface2)
+        val phraseEntryMap = LinkedHashMap<String, PhraseEntry>()
         val phraseMap = LinkedHashMap<String, String>()
         for (rawLine in readLines("phrases.txt")) {
             if (rawLine.isBlank() || rawLine.lstripStartsWithHash()) continue
             val tab = rawLine.indexOf('\t')
             if (tab > 0) {
-                val r = rawLine.substring(0, tab).trim()
-                val w = rawLine.substring(tab + 1).trim()
-                if (r.isNotEmpty() && w.isNotEmpty()) phraseMap.putIfAbsent(r, w)
+                var rRaw = rawLine.substring(0, tab).trim()
+                val wRaw = rawLine.substring(tab + 1).trim()
+                if (rRaw.isEmpty() || wRaw.isEmpty()) continue
+                val headOnly = rRaw.startsWith('^')
+                if (headOnly) rRaw = rRaw.substring(1)
+                if (rRaw.isEmpty()) continue
+                val clauses = if ('|' in rRaw || '|' in wRaw) {
+                    val rParts = rRaw.split('|')
+                    val wParts = wRaw.split('|')
+                    if (rParts.size == wParts.size && rParts.all { it.isNotEmpty() } && wParts.all { it.isNotEmpty() }) {
+                        rParts.indices.map { idx -> ConversionClause(rParts[idx], wParts[idx]) }
+                    } else {
+                        continue
+                    }
+                } else {
+                    listOf(ConversionClause(rRaw, wRaw))
+                }
+                val plainR = rRaw.replace("|", "")
+                val plainW = wRaw.replace("|", "")
+                if (plainR.isNotEmpty() && plainW.isNotEmpty()) {
+                    phraseEntryMap.putIfAbsent(plainR, PhraseEntry(plainR, plainW, headOnly, clauses))
+                    phraseMap.putIfAbsent(plainR, plainW)
+                }
             }
         }
+        phraseEntries = phraseEntryMap
         readingToPhrases = phraseMap
 
         // 8. candidates.txt (reading cand1 cand2 ...)
@@ -309,6 +361,18 @@ class MeltypeDictionaries(source: DictionarySource) {
         readingsSet = rSet
         readingWithTags = rTagged
 
+        // 11b. names.txt (Japanese surname/given-name readings without long vowels for TitleCase detection)
+        val nameSet = HashSet<String>(24576)
+        for (rawLine in readLines("names.txt")) {
+            if (rawLine.isBlank() || rawLine.lstripStartsWithHash()) continue
+            val tab = rawLine.indexOf('\t')
+            val r = (if (tab >= 0) rawLine.substring(0, tab) else rawLine).trim()
+            if (r.isNotEmpty()) {
+                nameSet.add(withoutLongVowels(r))
+            }
+        }
+        japaneseNameReadings = nameSet
+
         // 11. Extract lowercase English word frequencies from JMdict translations.txt
         val glossFreq = HashMap<String, Int>(20000)
         for (rawLine in readLines("translations.txt")) {
@@ -379,7 +443,23 @@ class MeltypeDictionaries(source: DictionarySource) {
         return out.toList()
     }
 
+    fun isJapaneseNameReading(kana: String): Boolean =
+        kana.isNotEmpty() && japaneseNameReadings.contains(withoutLongVowels(kana))
+
     companion object {
+        /** Strips long-vowel trailing う/お after お-row and う after う-row (さとう -> さと, ゆうき -> ゆき). */
+        fun withoutLongVowels(kana: String): String {
+            val sb = StringBuilder(kana.length)
+            for (c in kana) {
+                val prev = if (sb.isNotEmpty()) sb[sb.length - 1] else '\u0000'
+                val oRow = prev in "おこそとのほもよろをごぞどぼぽょぉ"
+                val uRow = prev in "うくすつぬふむゆるぐずづぶぷゅぅ"
+                if ((c == 'う' && (oRow || uRow)) || (c == 'お' && oRow)) continue
+                sb.append(c)
+            }
+            return sb.toString()
+        }
+
         private fun looksLikeKaomoji(token: String): Boolean {
             if (token.length <= 1) return false
             return token.any { ch ->

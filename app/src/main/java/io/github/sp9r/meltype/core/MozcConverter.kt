@@ -132,9 +132,9 @@ class AndroidMozcConverter(
             }
             return listOf(ConversionClause(hiragana, exactUser))
         }
-        val exactPhrase = dictionaries?.readingToPhrases?.get(hiragana)
+        val exactPhrase = dictionaries?.phraseEntries?.get(hiragana)
         if (exactPhrase != null) {
-            return listOf(ConversionClause(hiragana, exactPhrase))
+            return exactPhrase.clauses
         }
 
         if (transport == null && !MozcRuntime.initialized) {
@@ -386,8 +386,8 @@ class AndroidMozcConverter(
     }
 
     private fun fallbackConvert(hiragana: String): List<ConversionClause> {
-        dictionaries?.readingToPhrases?.get(hiragana)?.let {
-            return listOf(ConversionClause(hiragana, it))
+        dictionaries?.phraseEntries?.get(hiragana)?.let {
+            return it.clauses
         }
         val builtIn = BUILTIN_FALLBACK[hiragana]
         if (builtIn != null) return listOf(ConversionClause(hiragana, builtIn))

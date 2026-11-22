@@ -1286,4 +1286,98 @@ class MeltypeEngineTest {
             illitScaled.take(2).contains("illit")
         )
     }
+
+    @Test
+    fun upstreamV171PortsAndLogDrivenImprovementsWorkCleanly() {
+        val converter = AndroidMozcConverter(dictionaries)
+        fun previewFor(raw: String): String {
+            val s = CompositionSession(dictionaries, scoreEngine, converter)
+            for (ch in raw) s.appendChar(ch)
+            return s.snapshot.previewText
+        }
+
+        // 1. countries.txt: non-romaji countries are English; romaji-valid Oman stays Japanese-safe
+        val colSegs = scoreEngine.segment("colombia")
+        assertEquals(listOf(SegmentKind.ENGLISH), colSegs.map { it.kind })
+        assertEquals("Colombia", previewFor("colombia"))
+        assertEquals("Latvia", previewFor("latvia"))
+        assertEquals(listOf(SegmentKind.JAPANESE), scoreEngine.segment("omanjuu").map { it.kind })
+
+        // 2. Capitalized Japanese names (#1744/#2168) stay intact while particle suffix splits and lowercase stays kana
+        for (name in listOf("Takahashi", "Yukishiro", "Takemoto", "Toyoda", "Satoshi", "Sato", "Satou")) {
+            assertEquals("Expected capitalized name '$name' intact", name, previewFor(name))
+        }
+        assertEquals("Tanakaが", previewFor("Tanakaga"))
+        assertEquals("Satoshiは", previewFor("Satoshiha"))
+        assertEquals("たかはし", previewFor("takahashi"))
+
+        // 3. Short 2-char English words (#2159) and kitya (#2169) and all-uppercase acronym prefix
+        assertEquals("ろんぱ", previewFor("ronpa"))
+        assertEquals("すべをもたない", previewFor("subewomotanai"))
+        assertEquals("まえのご", previewFor("maenogo"))
+        assertEquals("きちゃ", previewFor("kitya"))
+        assertEquals("きちゃった", previewFor("kityatta"))
+        assertEquals("みちゃった", previewFor("mityatta"))
+        assertEquals("catや", previewFor("catya"))
+        assertEquals("robotや", previewFor("robotya"))
+        assertEquals("USENさま", previewFor("USENsama"))
+        assertEquals("Xのpost", previewFor("Xnopost"))
+        assertEquals("Goでrewrite", previewFor("Goderewrite"))
+        assertEquals("lsして", previewFor("lsshite"))
+        assertEquals("beepおん", previewFor("beepon"))
+        assertEquals("Androidわ", previewFor("Androidwa"))
+
+        // 4. z-sequences after kana/English and inside caret edits (#2013), while keeping English "quiz." / "puzzle"
+        val zlSess = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "hoge") zlSess.appendChar(ch)
+        zlSess.appendChar('z')
+        zlSess.tryZSymbol('l')
+        for (ch in "fuga") zlSess.appendChar(ch)
+        assertEquals("ほげ→ふが", zlSess.snapshot.previewText)
+
+        val engZl = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "true") engZl.appendChar(ch)
+        engZl.appendChar('z')
+        assertNotNull("Expected tryZSymbol to trigger after English 'true'", engZl.tryZSymbol('l'))
+        for (ch in "false") engZl.appendChar(ch)
+        assertEquals("true→false", engZl.snapshot.previewText)
+
+        val quizSess = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "quiz") quizSess.appendChar(ch)
+        assertNull("English word 'quiz' must not consume 'z' for z.", quizSess.tryZSymbol('.'))
+        val puzzleSess = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "puzz") puzzleSess.appendChar(ch)
+        assertNull("English prefix 'puzz' must not consume 'z' for zl", puzzleSess.tryZSymbol('l'))
+
+        // 5. phrases.txt: multi-clause '|' split and '^' head-only marker and real-log menheraka
+        assertEquals(listOf("一", "学期"), converter.convertClauses("いちがっき")?.map { it.text })
+        assertEquals("メンヘラ化", previewFor("menheraka"))
+
+        // 6. English glide improvements from device log (youtuber, saint, colombia, thumbnail)
+        fun swipeFromKeys(trace: String): List<io.github.sp9r.meltype.glide.TouchPoint> =
+            KeyLayoutGeometry.syntheticPathForWord(trace, jitter = 0.02f)
+
+        for (w in listOf("youtuber", "saint", "colombia", "latvia", "thumbnail")) {
+            val decoded = glideDecoder.decode(swipeFromKeys(w), maxResults = 5, preferJapanese = false).map { it.word }
+            assertEquals("Expected '$w' #1 in English glide, got $decoded", w, decoded.firstOrNull())
+        }
+        // Real user swipe pattern where 'thumbnail' terminates slightly short near 'n'/'i' -> 'thumbnai'
+        val thumbShort = swipeFromKeys("thumbnai")
+        val thumbShortDecoded = glideDecoder.decode(thumbShort, maxResults = 5, preferJapanese = false).map { it.word }
+        assertTrue(
+            "Expected 'thumbnail' in top-3 for short-ending swipe, got $thumbShortDecoded",
+            thumbShortDecoded.take(3).contains("thumbnail")
+        )
+
+        // 7. Toggling focused segment language while composing converts clause between ja and en
+        val toggleSess = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "mada") toggleSess.appendChar(ch)
+        assertEquals("まだ", toggleSess.snapshot.previewText)
+        val afterToggle = toggleSess.toggleFocusedSegmentLanguage()
+        assertEquals("mada", afterToggle.previewText)
+        assertTrue(afterToggle.clauses.first().isEnglish)
+        val backToJa = toggleSess.toggleFocusedSegmentLanguage()
+        assertEquals("まだ", backToJa.previewText)
+        assertFalse(backToJa.clauses.first().isEnglish)
+    }
 }

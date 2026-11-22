@@ -367,18 +367,41 @@ class CompositionSession(
      */
     fun tryZSymbol(key: Char, surroundingContext: String? = null): CompositionSnapshot? {
         val sym = Z_SYMBOLS[key] ?: return null
-        if (englishMode || caretRaw != null) return null
-        if (buffer.isEmpty() || buffer.last() != 'z') return null
-        val lastIdx = buffer.length - 1
-        if (overrides.keys.any { lastIdx in it }) return null
-        if (cachedSnapshot.clauses.lastOrNull()?.isEnglish == true) return null
-        var s = buffer.length
+        if (englishMode) return null
+        val pos = caretRaw ?: buffer.length
+        if (pos <= 0 || buffer[pos - 1] != 'z') return null
+        val zIdx = pos - 1
+        if (overrides.keys.any { zIdx in it }) return null
+        var s = zIdx
         while (s > 0 && buffer[s - 1] in 'a'..'z') s--
-        if (s > 0 && buffer[s - 1] in 'A'..'Z') return null
-        val analysis = RomajiDetector.analyze(buffer.substring(s), strictForDetection = false)
-        if (!analysis.isStrictValid || analysis.pendingTail != "z") return null
-        buffer.setLength(lastIdx)
-        bufferSpatialHints.removeAt(bufferSpatialHints.lastIndex)
+        while (s > 0 && buffer[s - 1] in 'A'..'Z') s--
+        val wordWithZ = buffer.substring(s, pos).lowercase()
+        if (wordWithZ.length >= 2 &&
+            (dictionaries.englishAllWords.contains(wordWithZ) || dictionaries.properNounCanonical.containsKey(wordWithZ))
+        ) {
+            return null
+        }
+        if (key in 'a'..'z' &&
+            (dictionaries.englishAllWords.hasPrefix(wordWithZ + key) || dictionaries.englishFocusedWords.hasPrefix(wordWithZ + key))
+        ) {
+            return null
+        }
+        val prefixBeforeZ = buffer.substring(s, zIdx).lowercase()
+        val canTrigger = if (prefixBeforeZ.isEmpty()) {
+            true
+        } else {
+            val a = RomajiDetector.analyze(prefixBeforeZ, strictForDetection = false)
+            val prefixLooksValid = a.isStrictValid && (a.pendingTail.isEmpty() || a.pendingTail == "n")
+            val prefixLooksEnglish = dictionaries.englishFocusedWords.contains(prefixBeforeZ) ||
+                dictionaries.englishAllWords.contains(prefixBeforeZ) ||
+                dictionaries.properNounCanonical.containsKey(prefixBeforeZ)
+            prefixLooksValid || prefixLooksEnglish
+        }
+        if (!canTrigger) return null
+        deleteRaw(zIdx, pos)
+        if (caretRaw != null) {
+            caretRaw = zIdx
+        }
         return appendText(sym, surroundingContext)
     }
 
@@ -1624,7 +1647,7 @@ class CompositionSession(
         clauses: List<ConversionClause>,
         baseContext: String?
     ): List<ConversionClause> {
-        val phrases = dictionaries.readingToPhrases
+        val phrases = dictionaries.phraseEntries
         if (phrases.isEmpty() || reading.length < 4 || clauses.isEmpty()) return clauses
 
         val out = ArrayList<ConversionClause>(clauses.size + 2)
@@ -1634,17 +1657,19 @@ class CompositionSession(
 
         while (idx < clauses.size && readingPos < reading.length) {
             var matchedKey: String? = null
-            var matchedVal: String? = null
+            var matchedEntry: PhraseEntry? = null
             val remaining = reading.substring(readingPos)
-            for ((k, v) in phrases) {
+            val prevEndsSokuon = idx > 0 && clauses[idx - 1].reading.endsWith('っ')
+            for ((k, entry) in phrases) {
                 if (k.length >= 4 && remaining.startsWith(k)) {
+                    if (entry.headOnly && readingPos > 0 && prevEndsSokuon) continue
                     if (matchedKey == null || k.length > matchedKey.length) {
                         matchedKey = k
-                        matchedVal = v
+                        matchedEntry = entry
                     }
                 }
             }
-            if (matchedKey != null && matchedVal != null) {
+            if (matchedKey != null && matchedEntry != null) {
                 // Check if Mozc already produced the exact phrase surface at this position
                 var coverLen = 0
                 var coverIdx = idx
@@ -1654,7 +1679,7 @@ class CompositionSession(
                     coverText.append(clauses[coverIdx].text)
                     coverIdx++
                 }
-                if (coverLen == matchedKey.length && coverText.toString() == matchedVal) {
+                if (coverLen == matchedKey.length && coverText.toString() == matchedEntry.surface && matchedEntry.clauses.size == 1) {
                     while (idx < coverIdx) {
                         out.add(clauses[idx])
                         ctx.append(clauses[idx].text)
@@ -1663,8 +1688,8 @@ class CompositionSession(
                     }
                     continue
                 }
-                out.add(ConversionClause(matchedKey, matchedVal))
-                ctx.append(matchedVal)
+                out.addAll(matchedEntry.clauses)
+                ctx.append(matchedEntry.surface)
                 readingPos += matchedKey.length
                 val tailAfter = reading.substring(readingPos)
                 if (tailAfter.isEmpty()) break

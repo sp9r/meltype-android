@@ -367,7 +367,7 @@ class ScoreEngine(
                 val enScore = if (wholeRunReadable && sub !in READABLE_EMBEDDED_BRANDS) {
                     null
                 } else {
-                    scoreEnglishSpan(sub, run.substring(i, j), prevIdx = i, nextPos = j, totalLen = n, fullRun = lowerRun)
+                    scoreEnglishSpan(sub, run.substring(i, j), prevIdx = i, nextPos = j, totalLen = n, fullRun = lowerRun, fullOriginalRun = run)
                 }
                 if (enScore != null) {
                     val enSplitPenalty = if (i > 0 && cur.kind == SegmentKind.ENGLISH) -6.0 else 0.0
@@ -421,6 +421,13 @@ class ScoreEngine(
         if (seg.kind != SegmentKind.ENGLISH) return false
         if (seg.raw.any { it.isUpperCase() }) return false
         val lower = seg.raw.lowercase()
+        if (lower in SHORT_CLI_COMMANDS) {
+            val prevSeg = segments.getOrNull(idx - 1)
+            val nextSeg = segments.getOrNull(idx + 1)
+            if (prevSeg == null && (nextSeg == null || (nextSeg.kind == SegmentKind.JAPANESE && nextSeg.raw.length >= 3))) {
+                return false
+            }
+        }
         if (!dictionaries.englishAllWords.contains(lower)) return true
         if (lower.length <= 2) {
             val nextSeg = segments.getOrNull(idx + 1)
@@ -575,7 +582,7 @@ class ScoreEngine(
             val restHira = RomajiDetector.analyze(effectiveSub.substring(leadingParticle.length)).finalizedHiragana()
             if (dictionaries.readingsSet.contains(restHira) || dictionaries.japaneseWords.contains(effectiveSub.substring(leadingParticle.length))) {
                 score += if (prevWasEnglish) 5.5 else 3.2
-            } else if (prevWasEnglish) {
+            } else if (prevWasEnglish && restHira.length >= 2) {
                 score += 2.2
             }
         }
@@ -607,21 +614,57 @@ class ScoreEngine(
         return score to hira
     }
 
+    private fun isJapanesePersonNameRun(fullOriginalRun: String, fullLower: String): Int {
+        if (fullOriginalRun.length < 2 || !fullOriginalRun[0].isUpperCase() || !fullOriginalRun.drop(1).all { it.isLowerCase() }) {
+            return -1
+        }
+        val aFull = RomajiDetector.analyze(fullLower, strictForDetection = true)
+        if (aFull.isStrictValid && (aFull.pendingTail.isEmpty() || aFull.pendingTail == "n") &&
+            dictionaries.isJapaneseNameReading(aFull.finalizedHiragana())
+        ) {
+            return fullOriginalRun.length
+        }
+        for (p in PARTICLES) {
+            if (fullLower.length > p.length + 1 && fullLower.endsWith(p)) {
+                val stemLen = fullLower.length - p.length
+                val aStem = RomajiDetector.analyze(fullLower.substring(0, stemLen), strictForDetection = true)
+                if (aStem.isStrictValid && (aStem.pendingTail.isEmpty() || aStem.pendingTail == "n") &&
+                    dictionaries.isJapaneseNameReading(aStem.finalizedHiragana())
+                ) {
+                    return stemLen
+                }
+            }
+        }
+        return -1
+    }
+
     private fun scoreEnglishSpan(
         sub: String,
         originalSlice: String,
         prevIdx: Int,
         nextPos: Int,
         totalLen: Int,
-        fullRun: String
+        fullRun: String,
+        fullOriginalRun: String
     ): Double? {
         val len = sub.length
         val analysisStrict = RomajiDetector.analyze(sub, strictForDetection = true)
         val isPureStrictRomaji = analysisStrict.isStrictValid
+        val isCompleteRomaji = isPureStrictRomaji && (analysisStrict.pendingTail.isEmpty() || analysisStrict.pendingTail == "n")
+        val hasNonChC = sub.indices.any { sub[it] == 'c' && sub.getOrNull(it + 1) != 'h' }
+        val isRomajiLike = isPureStrictRomaji && !(len >= 3 && hasNonChC)
         val hasUppercase = originalSlice.any { it.isUpperCase() }
+        val isAllUpper = len >= 2 && originalSlice.all { it.isUpperCase() }
+        val isTitleCase = len >= 2 && originalSlice[0].isUpperCase() && (1 until len).all { originalSlice[it].isLowerCase() }
 
-        // Single unmapped letter fallback (l, q, v, x or invalid char at end like "g" after space, etc.)
+        // Single-char uppercase (e.g. Xnopost) or l/q/v/x fallback; never split a capitalized Japanese name at char 1.
         if (len == 1) {
+            if (originalSlice[0].isUpperCase()) {
+                val nextLower = nextPos < totalLen && fullOriginalRun[nextPos].isLowerCase()
+                val nextParticle = nextPos < totalLen && PARTICLES.any { fullRun.startsWith(it, nextPos) }
+                if (!nextLower || nextParticle) return 2.5
+                return null
+            }
             return if (sub[0] in charArrayOf('l', 'q', 'v', 'x')) -1.5 else null
         }
 
@@ -630,9 +673,28 @@ class ScoreEngine(
         val isWord = dictionaries.englishAllWords.contains(sub)
         val isReadable = dictionaries.englishReadableWords.contains(sub)
         val isJpOrigin = sub in dictionaries.japaneseOriginEnglishWords
+        val isJpPersonName = isTitleCase && isPureStrictRomaji &&
+            (analysisStrict.pendingTail.isEmpty() || analysisStrict.pendingTail == "n") &&
+            dictionaries.isJapaneseNameReading(analysisStrict.finalizedHiragana())
+
+        // All-uppercase acronym run (e.g. USENsama, AInomodel): keep contiguous uppercase run as ENGLISH.
+        if (isAllUpper && (prevIdx == 0 || !fullOriginalRun[prevIdx - 1].isUpperCase()) &&
+            (nextPos == totalLen || !fullOriginalRun[nextPos].isUpperCase())
+        ) {
+            var score = len * 1.45 + 12.0
+            if (nextPos == totalLen) {
+                score += 1.0
+            } else {
+                val remaining = fullRun.substring(nextPos)
+                if (PARTICLES.any { remaining.startsWith(it) } || dictionaries.japaneseWords.hasPrefix(remaining)) {
+                    score += 2.2
+                }
+            }
+            return score
+        }
 
         // If sub is a standalone prefix typing of an English word at the end of input (length >= 3 & non-romaji)
-        if (!isWord && !isFocused && !isProper) {
+        if (!isWord && !isFocused && !isProper && !isJpPersonName) {
             if (!isPureStrictRomaji) {
                 val isPrefix = len >= 2 && (dictionaries.englishFocusedWords.hasPrefix(sub) || dictionaries.englishAllWords.hasPrefix(sub))
                 val nextIsBoundary = (nextPos == totalLen) || PARTICLES.any { fullRun.startsWith(it, nextPos) }
@@ -646,16 +708,18 @@ class ScoreEngine(
                 ) {
                     return len * 1.15 + 1.5
                 }
-                // Fallback for unknown non-romaji token (e.g., typo or code identifier)
-                if (nextPos == totalLen || len >= 3) {
-                    return len * 0.7 - 3.0
+                // Fallback for unknown non-romaji token (e.g., 2-letter acronyms like ls before Japanese, or code identifier)
+                if (nextPos == totalLen || len >= 3 ||
+                    (len == 2 && typoEngine.firstUnreadableOffset(fullRun.substring(nextPos), final = true) < 0)
+                ) {
+                    return len * 0.7 - (if (len == 2) 0.5 else 3.0)
                 }
                 return null
             }
             return null
         }
 
-        // Known English word!
+        // Known English word or capitalized Japanese name!
         if (isJpOrigin && isPureStrictRomaji && !hasUppercase) {
             // Word like "sushi", "karaoke", "anime": favor Japanese unless surrounded by English context
             return 0.5
@@ -665,14 +729,17 @@ class ScoreEngine(
         if (len <= 2 && !isProper && !hasUppercase && !isFocused && (prevIdx > 0 || nextPos < totalLen)) {
             return -5.5
         }
-        // Very short 2-3 char romaji-valid English words ("to", "ha", "no", "go", "de", "in", "at", "he", "me", "so", "do", "ma", "ai")
-        // should NOT split Japanese strings unless typed with uppercase or surrounded by particle/space boundaries.
-        if (len <= 3 && isPureStrictRomaji && !hasUppercase) {
+        // Very short 2-3 char romaji-valid lowercase English words ("to", "ha", "be", "pa", "on", "go", "he", "ma", ...)
+        // should NOT split Japanese strings unless typed with uppercase or as an isolated single word.
+        if (len <= 3 && isRomajiLike && !hasUppercase) {
             val midRunWithoutParticles = prevIdx > 0 && nextPos < totalLen &&
                 !PARTICLES.any { fullRun.substring(0, prevIdx).endsWith(it) } &&
                 !PARTICLES.any { fullRun.substring(nextPos).startsWith(it) }
             if (midRunWithoutParticles && !isProper) {
                 return -6.0
+            }
+            if (len <= 2 && !isProper && (prevIdx > 0 || nextPos < totalLen)) {
+                return -5.5
             }
             if (isReadable || sub in SHORT_AMBIGUOUS_STOPWORDS || isProper) {
                 return -4.0
@@ -692,15 +759,17 @@ class ScoreEngine(
             )
         val isLowerStrictCollidingProper = isProper && !hasUppercase && isPureStrictRomaji && isCommonJpReading
 
-        if (isProper) {
+        if (isJpPersonName) {
+            score += 10.0
+        } else if (isProper && (len >= 3 || hasUppercase)) {
             if (isLowerStrictCollidingProper && isCommonJpReading) {
                 return -2.5
             }
             score += if (isLowerStrictCollidingProper) 1.5 else 9.0
         } else if (isFocused) {
             score += 6.0
-        } else if (!isPureStrictRomaji) {
-            // Contains non-romaji sequence (th, l, v, x, ng, ck, ld, st, or trailing consonant like meet/meeting) + in English dict => strong signal
+        } else if (!isRomajiLike || (len >= 4 && !isCompleteRomaji)) {
+            // Contains non-romaji sequence or trailing consonant (e.g. robot, meet/meeting, cat) + in English dict => strong signal
             score += 7.0
         } else {
             // Valid pure romaji AND in broad English dictionary (e.g. "time", "banana", "radio", "camera", "hero").
@@ -715,6 +784,14 @@ class ScoreEngine(
                 dictionaries.readingsSet.contains(subKana)
             ) {
                 score -= 2.8
+            }
+        }
+
+        // Prevent splitting a capitalized Japanese name mid-word before non-particle Japanese (Takemoto != Take+もと)
+        if (prevIdx == 0 && hasUppercase && nextPos < totalLen) {
+            val expectedNameEnd = isJapanesePersonNameRun(fullOriginalRun, fullRun)
+            if (expectedNameEnd > 0 && nextPos != expectedNameEnd) {
+                return null
             }
         }
 
@@ -761,7 +838,9 @@ class ScoreEngine(
             score += 1.0
         } else {
             val remaining = fullRun.substring(nextPos)
-            if (PARTICLES.any { remaining.startsWith(it) } || (!isPureStrictRomaji && dictionaries.japaneseWords.hasPrefix(remaining))) {
+            if (PARTICLES.any { remaining.startsWith(it) } ||
+                (!isPureStrictRomaji && remaining.length >= 2 && dictionaries.japaneseWords.hasPrefix(remaining))
+            ) {
                 score += 2.2
             } else {
                 // Followed by consonant/non-particle -> slightly less likely clean split unless itself is English
@@ -1110,6 +1189,7 @@ class ScoreEngine(
             "youtube", "wifi", "amazon", "notion", "gemini", "java", "ubuntu", "office",
             "yahoo", "google", "claude", "twitter", "github", "wordle", "vscode", "codex"
         )
+        private val SHORT_CLI_COMMANDS = setOf("ls", "cd", "cp", "mv", "rm", "ln", "wc", "df", "ps", "tr")
         private val KNOWN_TLDS = setOf(
             "com", "jp", "net", "org", "io", "dev", "app", "ai", "me", "co", "uk", "au",
             "edu", "gov", "info", "biz", "xyz", "tv", "cc", "us", "ca", "de", "fr",

@@ -1345,6 +1345,10 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
     }
 
     override fun onToggleLanguage() {
+        if (!session.isEmpty) {
+            onToggleSegmentLanguage()
+            return
+        }
         if (shouldLogEval()) {
             evalLogger.logEvent("mode", if (englishMode) "en->ja" else "ja->en", session.snapshot.previewText)
         }

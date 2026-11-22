@@ -323,6 +323,9 @@ class GlideDecoder(private val dictionaries: MeltypeDictionaries) {
             val properBonus = if (w in CORE_PROPER_BRANDS) 0.26f else 0.06f
             registerTemplate(w, w, isEnglish = true, freqBonus = properBonus)
         }
+        for (w in dictionaries.countryWords) {
+            registerTemplate(w, w, isEnglish = true, freqBonus = 0.22f)
+        }
         for (w in dictionaries.englishCommonWords) {
             registerTemplate(w, w, isEnglish = true, freqBonus = 0.20f)
         }
@@ -1314,7 +1317,7 @@ class GlideDecoder(private val dictionaries: MeltypeDictionaries) {
             "kept", "held", "brought", "bought", "built", "sent", "spent", "heard", "met", "sat",
             "stood", "lost", "paid", "won", "ran", "grew", "drew", "flew", "threw", "broke", "chose",
             "spoke", "wrote", "drove", "woke", "wore", "adjust", "august", "nonfiction", "screenshot",
-            "playlist", "subtitle", "podcast"
+            "playlist", "subtitle", "podcast", "youtuber", "saint"
         )
 
         private val CORE_PROPER_BRANDS = setOf(

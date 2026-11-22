@@ -354,6 +354,14 @@ authorization of the copyright holder.
 SPDX-License-Identifier: Unicode-3.0
 ```
 
+### 国名の語 (dictionaries/countries.txt)
+
+かなに割れる国名 (Bermuda → Bermuだ) を英語にするのに使います (ローマ字として最後まで読める語は除く)。[Unicode CLDR](https://github.com/unicode-org/cldr) の `common/main/en.xml` の国・地域名から作られており、著作権・ライセンスは絵文字の辞書と同じ (Unicode, Inc.、Unicode License v3 / SPDX: Unicode-3.0) です。
+
+### 日本人の姓・名の読みの一覧 (dictionaries/names.txt)
+
+大文字で始めてローマ字で打った日本人名 (Takahashi, Sato 等) の判定に使います。[SKK 辞書](https://github.com/skk-dev/dict) `SKK-JISYO.jinmei` (Copyright (C) 1993 Wnn Consortium / Copyright (C) 2002, 2003, 2004 SKK Development Team) の送り仮名の無い語の読みから作られており、ライセンスは GPL-2.0-or-later（Meltype では GPL-3.0-or-later で使用）です。
+
 ### そのほかの辞書
 
 `dictionaries/` の辞書 (日本語・英語の単語、固有名詞、同音異義語の候補、文脈の手がかり) は Meltype のために作成したもので、
