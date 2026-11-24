@@ -555,14 +555,15 @@ class GlideDecoder(private val dictionaries: MeltypeDictionaries) {
 
         // Stage 2 reranking: corner anchors + direction channel + arc-fraction waypoint penalty
         val anchors = KeyLayoutGeometry.extractAnchorPoints(normalizedPoints)
-        debugMetaOut?.let { meta ->
-            val dedup = StringBuilder(anchors.size)
-            for (a in anchors) {
-                if (dedup.isEmpty() || dedup[dedup.length - 1] != a.nearestChar) {
-                    dedup.append(a.nearestChar)
-                }
+        val dedupAnchorSeq = StringBuilder(anchors.size)
+        for (a in anchors) {
+            if (dedupAnchorSeq.isEmpty() || dedupAnchorSeq[dedupAnchorSeq.length - 1] != a.nearestChar) {
+                dedupAnchorSeq.append(a.nearestChar)
             }
-            meta.anchorSeq = dedup.toString()
+        }
+        val anchorSeq = dedupAnchorSeq.toString()
+        debugMetaOut?.let { meta ->
+            meta.anchorSeq = anchorSeq
         }
         val nearThreshold = if (preferJapanese) 0.36f else 0.27f
         val interiorAnchors = anchors.filter { !it.isEndpoint }.map { a ->
@@ -641,7 +642,19 @@ class GlideDecoder(private val dictionaries: MeltypeDictionaries) {
                 if (cWp < wpPenalty) wpPenalty = cWp
             }
 
-            val finalCost = hit.baseCost + cornerAdj + dirDist * 1.40f + wpPenalty * 0.60f
+            var engModeAdj = 0f
+            if (!preferJapanese) {
+                if (startKeys.isNotEmpty() &&
+                    startKeys.first().first == e.traceWord.first() &&
+                    startKeys.first().second < 0.22f
+                ) {
+                    engModeAdj -= 0.06f
+                }
+                if (e.traceWord.length in 2..5 && anchorSeq == e.traceWord) {
+                    engModeAdj -= 0.085f
+                }
+            }
+            val finalCost = hit.baseCost + cornerAdj + engModeAdj + dirDist * 1.40f + wpPenalty * 0.60f
             candidates.add(GlideCandidate(e.outputWord, e.isEnglish, finalCost, e.kanaHint))
             debugBreakdownsOut?.add(
                 GlideScoreBreakdown(
@@ -1317,7 +1330,9 @@ class GlideDecoder(private val dictionaries: MeltypeDictionaries) {
             "kept", "held", "brought", "bought", "built", "sent", "spent", "heard", "met", "sat",
             "stood", "lost", "paid", "won", "ran", "grew", "drew", "flew", "threw", "broke", "chose",
             "spoke", "wrote", "drove", "woke", "wore", "adjust", "august", "nonfiction", "screenshot",
-            "playlist", "subtitle", "podcast", "youtuber", "saint"
+            "playlist", "subtitle", "podcast", "youtuber", "saint", "vpn", "japan",
+            "germany", "korea", "china", "france", "italy", "australia", "canada",
+            "brazil", "india", "wordle", "wireless"
         )
 
         private val CORE_PROPER_BRANDS = setOf(

@@ -71,6 +71,7 @@ class MeltypeDictionaries(source: DictionarySource) {
     val englishTechAndAcronymWords: Set<String>
     val glideBrandLoanwords: Set<String>
     val countryWords: Set<String>
+    val countryWordList: SortedWordList
     val englishGlossFreq: Map<String, Int>
     val japaneseWords: SortedWordList
     val japaneseCanonicalWords: List<String>
@@ -155,20 +156,24 @@ class MeltypeDictionaries(source: DictionarySource) {
             val line = stripHashComment(rawLine)
             for (tok in line.splitWhitespace()) {
                 if (tok.length < 3) continue
-                if (!tok.all { it in 'a'..'z' || it in 'A'..'Z' || it in '0'..'9' }) continue
-                val lower = tok.lowercase()
+                val asciiTok = Normalizer.normalize(tok, Normalizer.Form.NFD).replace(Regex("\\p{M}+"), "")
+                if (!asciiTok.all { it in 'a'..'z' || it in 'A'..'Z' || it in '0'..'9' }) continue
+                val lower = asciiTok.lowercase()
                 if (lower.all { it in 'a'..'z' } && lower.length in 3..18) {
                     countrySet.add(lower)
                 }
                 val rom = RomajiDetector.analyze(lower, strictForDetection = true)
                 val validRomaji = rom.isStrictValid && (rom.pendingTail.isEmpty() || rom.pendingTail == "n")
                 if (!validRomaji) {
-                    properMap.putIfAbsent(lower, tok)
+                    if (tok == asciiTok) {
+                        properMap.putIfAbsent(lower, tok)
+                    }
                     engFocused.add(lower)
                 }
             }
         }
         countryWords = countrySet
+        countryWordList = SortedWordList(countrySet)
         // Hyphenated canonical forms that users type without the hyphen.
         properMap.putIfAbsent("wifi", "Wi-Fi")
         properNounCanonical = properMap
@@ -176,6 +181,7 @@ class MeltypeDictionaries(source: DictionarySource) {
 
         // 3. english-words.txt (broad English spellcheck dictionary)
         val allEng = HashSet<String>(engFocused)
+        allEng.addAll(countrySet)
         for (rawLine in readLines("english-words.txt")) {
             val line = stripHashComment(rawLine)
             if (line.isNotEmpty()) {

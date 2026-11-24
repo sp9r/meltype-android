@@ -352,7 +352,8 @@ class ScoreEngine(
                 val jpEval = scoreJapaneseSpan(
                     sub = sub,
                     allowPendingTail = isAtEnd && !endedByDelimiter,
-                    prevWasEnglish = (i > 0 && cur.kind == SegmentKind.ENGLISH)
+                    prevWasEnglish = (i > 0 && cur.kind == SegmentKind.ENGLISH),
+                    isAtEnd = isAtEnd
                 )
                 if (jpEval != null) {
                     val mergeBonus = if (i > 0 && cur.kind == SegmentKind.JAPANESE) -2.0 else 0.0
@@ -528,12 +529,13 @@ class ScoreEngine(
         allowPendingTail: Boolean,
         prevWasEnglish: Boolean,
         allowTypoRecovery: Boolean = false,
-        allowFinalTypoTrim: Boolean = false
+        allowFinalTypoTrim: Boolean = false,
+        isAtEnd: Boolean = false
     ): Pair<Double, String>? {
         var effectiveSub = sub
         var cRead = RomajiDetector.readCRow(sub)
         var analysis = RomajiDetector.analyze(cRead, strictForDetection = true)
-        var typoPenalty = 0.0
+        var typoPenalty = if (cRead != sub && (dictionaries.countryWordList.contains(sub) || dictionaries.englishFocusedWords.contains(sub) || dictionaries.englishAllWords.contains(sub))) 5.0 else 0.0
 
         if (!analysis.isStrictValid || (analysis.pendingTail.isNotEmpty() && !allowPendingTail)) {
             if (allowTypoRecovery && sub.length >= 4 && !dictionaries.englishAllWords.contains(sub)) {
@@ -550,6 +552,10 @@ class ScoreEngine(
         if (!analysis.isStrictValid) return null
         if (analysis.pendingTail.isNotEmpty() && !allowPendingTail) return null
         if (prevWasEnglish && analysis.hiragana.isEmpty()) return null
+        // Never treat a bare 1-vowel tail at the end of an English word ("van" + "u", "cot" + "e") as Japanese.
+        if (prevWasEnglish && isAtEnd && effectiveSub.length == 1 && effectiveSub[0].lowercaseChar() in charArrayOf('a', 'i', 'u', 'e', 'o')) {
+            return null
+        }
         // Never chop off a broken 1-kana incomplete tail right after an English word ("ill" + "いt")
         if (prevWasEnglish && analysis.hiragana.length <= 1 && analysis.pendingTail.isNotEmpty() &&
             !PARTICLES.any { effectiveSub.startsWith(it) }
@@ -693,26 +699,37 @@ class ScoreEngine(
             return score
         }
 
-        // If sub is a standalone prefix typing of an English word at the end of input (length >= 3 & non-romaji)
+        // If sub is a standalone prefix typing of an English word at the end of input (length >= 3 & non-romaji or dangling consonant)
         if (!isWord && !isFocused && !isProper && !isJpPersonName) {
-            if (!isPureStrictRomaji) {
-                val isPrefix = len >= 2 && (dictionaries.englishFocusedWords.hasPrefix(sub) || dictionaries.englishAllWords.hasPrefix(sub))
+            if (!isPureStrictRomaji || (len >= 3 && !isCompleteRomaji && prevIdx == 0 && nextPos == totalLen)) {
+                val precededByParticle = prevIdx > 0 && PARTICLES.any { fullRun.substring(0, prevIdx).endsWith(it) }
+                val isPrefix = len >= 2 && (len >= 3 || prevIdx == 0 || precededByParticle || nextPos < totalLen) && (
+                    dictionaries.englishFocusedWords.hasPrefix(sub) ||
+                        dictionaries.englishAllWords.hasPrefix(sub) ||
+                        dictionaries.countryWordList.hasPrefix(sub)
+                    )
                 val nextIsBoundary = (nextPos == totalLen) || PARTICLES.any { fullRun.startsWith(it, nextPos) }
                 if (isPrefix && nextIsBoundary) {
                     return len * 1.35 + 2.5
                 }
-                // Unknown non-romaji whole alpha run (e.g. uncatalogued brand or unknown English word like xyllit):
-                // keep as one ENGLISH segment unless typoEngine can repair it as Japanese.
-                if (prevIdx == 0 && nextPos == totalLen && len >= 3 &&
-                    (!typoCorrectionEnabled() || typoEngine.fixUnreadable(sub, final = true) == null)
-                ) {
-                    return len * 1.15 + 1.5
-                }
-                // Fallback for unknown non-romaji token (e.g., 2-letter acronyms like ls before Japanese, or code identifier)
-                if (nextPos == totalLen || len >= 3 ||
-                    (len == 2 && typoEngine.firstUnreadableOffset(fullRun.substring(nextPos), final = true) < 0)
-                ) {
-                    return len * 0.7 - (if (len == 2) 0.5 else 3.0)
+                if (!isPureStrictRomaji) {
+                    // Unknown non-romaji whole alpha run (e.g. uncatalogued brand or unknown English word):
+                    // keep as one ENGLISH segment unless typoEngine can repair it as Japanese.
+                    if (prevIdx == 0 && nextPos == totalLen && len >= 3 &&
+                        (!typoCorrectionEnabled() || typoEngine.fixUnreadable(sub, final = true) == null)
+                    ) {
+                        return len * 1.15 + 1.5
+                    }
+                    // Disallow splitting off unknown uncapitalized 2-char tails at run end (e.g. "au" + "st")
+                    if (prevIdx > 0 && nextPos == totalLen && len <= 2 && !hasUppercase && !precededByParticle && sub !in SHORT_CLI_COMMANDS) {
+                        return null
+                    }
+                    // Fallback for unknown non-romaji token (e.g., 2-letter acronyms like ls before Japanese, or code identifier)
+                    if (nextPos == totalLen || len >= 3 ||
+                        (len == 2 && typoEngine.firstUnreadableOffset(fullRun.substring(nextPos), final = true) < 0)
+                    ) {
+                        return len * 0.7 - (if (len == 2) 0.5 else 3.0)
+                    }
                 }
                 return null
             }
@@ -732,6 +749,9 @@ class ScoreEngine(
         // Very short 2-3 char romaji-valid lowercase English words ("to", "ha", "be", "pa", "on", "go", "he", "ma", ...)
         // should NOT split Japanese strings unless typed with uppercase or as an isolated single word.
         if (len <= 3 && isRomajiLike && !hasUppercase) {
+            if (len == 3 && !isCompleteRomaji && prevIdx == 0 && nextPos == totalLen) {
+                return len * 1.45 + (if (isFocused) 4.0 else 2.0)
+            }
             val midRunWithoutParticles = prevIdx > 0 && nextPos < totalLen &&
                 !PARTICLES.any { fullRun.substring(0, prevIdx).endsWith(it) } &&
                 !PARTICLES.any { fullRun.substring(nextPos).startsWith(it) }
@@ -1175,6 +1195,7 @@ class ScoreEngine(
         // A trailing consonant still being typed ("jouhourir", "...ron") does not make the run English.
         if (analysis.pendingTail.length > 2) return false
         val kana = analysis.hiragana
+        if (analysis.pendingTail.isNotEmpty() && analysis.pendingTail != "n" && kana.length < 3) return false
         if (kana.any { it in 'a'..'z' }) return false
         if (hasSmallLx && analysis.chunks.any { it.rawRomaji in RomajiDetector.SMALL_SOKUON_KEYS } && kana.length >= 2) {
             return true

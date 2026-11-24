@@ -1466,4 +1466,37 @@ class MeltypeEngineTest {
             dir.deleteRecursively()
         }
     }
+
+    @Test
+    fun standaloneShortEnglishAndCountryPrefixAndPeriodComposition() {
+        for (word in listOf("new", "now", "eth", "mor", "pap", "vanu", "cote", "aust")) {
+            val segs = scoreEngine.segment(word)
+            assertEquals("Expected single segment for '$word', got $segs", 1, segs.size)
+            assertEquals("Expected ENGLISH for '$word', got $segs", SegmentKind.ENGLISH, segs[0].kind)
+            assertEquals(word, segs[0].raw)
+        }
+
+        // Japanese words mid-typing or mixed sentences stay accurate
+        val ka = scoreEngine.segment("ka")
+        assertEquals(SegmentKind.JAPANESE, ka.single().kind)
+        val mori = scoreEngine.segment("mori")
+        assertEquals(SegmentKind.JAPANESE, mori.single().kind)
+        val python = scoreEngine.segment("pythondekaku")
+        assertEquals(listOf(SegmentKind.ENGLISH, SegmentKind.JAPANESE), python.map { it.kind })
+
+        // Period "。" keeps composition active without auto-committing
+        val converter = AndroidMozcConverter(dictionaries)
+        val sess = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "kyouhaiitenki") sess.appendChar(ch)
+        sess.appendText("。")
+        assertTrue("Expected composition to remain active after period", sess.snapshot.isComposing)
+        assertTrue(sess.snapshot.previewText.endsWith("。"))
+
+        // English-mode glide prefers vpn, got, japan, youtuber cleanly
+        for (target in listOf("vpn", "got", "japan", "youtuber")) {
+            val path = KeyLayoutGeometry.syntheticPathForWord(target, jitter = 0.02f)
+            val decoded = glideDecoder.decode(path, maxResults = 5, preferJapanese = false).map { it.word }
+            assertEquals("Expected '$target' ranked #1 in English glide, got $decoded", target, decoded.firstOrNull())
+        }
+    }
 }
