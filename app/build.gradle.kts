@@ -10,8 +10,8 @@ android {
         applicationId = "io.github.sp9r.meltype"
         minSdk = 24
         targetSdk = 36
-        versionCode = 19
-        versionName = "1.8.0"
+        versionCode = 20
+        versionName = "1.9.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 

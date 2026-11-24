@@ -1449,29 +1449,66 @@ class CompositionSession(
         val barCandidates = ArrayList<CandidateItem>()
         if (focused != null) {
             val focusedMisspellings = if (!focused.isEnglish) dictionaries.resolveMisspelling(focused.reading).toSet() else emptySet()
-            for (cand in focused.candidates.take(36)) {
-                val isEmoji = dictionaries.emojiCandidates[focused.reading]?.contains(cand) == true
+            val exactEmojiRaw = if (focused.isEnglish) {
+                dictionaries.englishEmojiCandidates[focused.reading.lowercase()].orEmpty()
+            } else {
+                dictionaries.emojiCandidates[focused.reading].orEmpty()
+            }
+            val exactEmojiList = exactEmojiRaw
+                .filterNot { MeltypeDictionaries.looksLikeKaomoji(it) }
+                .distinct()
+            val exactEmojiSet = exactEmojiList.toSet()
+
+            for (cand in focused.candidates.take(40)) {
+                if (cand in exactEmojiSet) continue
                 val isMisspellFix = cand in focusedMisspellings
                 barCandidates.add(
                     CandidateItem(
                         text = cand,
                         subtitle = when {
                             isMisspellFix -> "もしかして"
-                            isEmoji -> "絵文字"
                             focused.isEnglish && dictionaries.properNounCanonical.containsValue(cand) -> "固有名"
                             else -> ""
                         },
-                        kind = if (isEmoji) CandidateKind.EMOJI else CandidateKind.CONVERSION,
+                        kind = CandidateKind.CONVERSION,
                         targetClauseIndex = focusedClauseIdx
                     )
                 )
             }
+
+            // Promote top exact-match emojis right after the top text candidates while keeping index 0 as text.
+            if (exactEmojiList.isNotEmpty()) {
+                val topEmojiItems = exactEmojiList.take(3).map { emoji ->
+                    CandidateItem(
+                        text = emoji,
+                        subtitle = "絵文字",
+                        kind = CandidateKind.EMOJI,
+                        targetClauseIndex = focusedClauseIdx
+                    )
+                }
+                val insertAt = minOf(2, barCandidates.size)
+                barCandidates.addAll(insertAt, topEmojiItems)
+                for (emoji in exactEmojiList.drop(3).take(12)) {
+                    if (barCandidates.none { it.text == emoji }) {
+                        barCandidates.add(
+                            CandidateItem(
+                                text = emoji,
+                                subtitle = "絵文字",
+                                kind = CandidateKind.EMOJI,
+                                targetClauseIndex = focusedClauseIdx
+                            )
+                        )
+                    }
+                }
+            }
+
             // Also surface prefix-matched emoji suggestions when typing 2+ kana
             if (!focused.isEnglish && focused.reading.length >= 2) {
                 var addedPrefixEmoji = 0
                 for ((rKey, eList) in dictionaries.emojiCandidates) {
                     if (rKey != focused.reading && rKey.startsWith(focused.reading) && rKey.length <= focused.reading.length + 3) {
-                        for (e in eList.take(2)) {
+                        for (e in eList) {
+                            if (MeltypeDictionaries.looksLikeKaomoji(e)) continue
                             if (barCandidates.none { it.text == e }) {
                                 barCandidates.add(
                                     CandidateItem(
@@ -1482,7 +1519,7 @@ class CompositionSession(
                                     )
                                 )
                                 addedPrefixEmoji++
-                                if (addedPrefixEmoji >= 4) break
+                                break
                             }
                         }
                     }

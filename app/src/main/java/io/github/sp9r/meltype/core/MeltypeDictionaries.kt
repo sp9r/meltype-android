@@ -82,6 +82,7 @@ class MeltypeDictionaries(source: DictionarySource) {
     val readingToPhrases: Map<String, String>
     val extraCandidates: Map<String, List<String>>
     val emojiCandidates: Map<String, List<String>>
+    val englishEmojiCandidates: Map<String, List<String>>
     val kaomojiList: List<String>
     val misspellingExact: Map<String, String>
     val misspellingRightSet: Set<String>
@@ -307,6 +308,61 @@ class MeltypeDictionaries(source: DictionarySource) {
         emojiCandidates = emojiMap
         kaomojiList = kaomojis.toList()
 
+        // 9b. Build lightweight English keyword -> emoji map from emoji-catalog.txt
+        val engEmojiMap = LinkedHashMap<String, MutableList<String>>()
+        fun addEngEmoji(word: String, emoji: String) {
+            if (word.length < 2) return
+            val list = engEmojiMap.getOrPut(word) { ArrayList(4) }
+            if (emoji !in list && list.size < 4) list.add(emoji)
+        }
+        for (rawLine in readLines("emoji-catalog.txt")) {
+            if (rawLine.isBlank() || rawLine.lstripStartsWithHash()) continue
+            val parts = rawLine.split('\t')
+            if (parts.size < 3) continue
+            val emoji = parts[1].trim()
+            val name = parts[2].trim().lowercase()
+            if (emoji.isEmpty() || name.isEmpty()) continue
+            val tokens = name.split(' ', '-', '_').filter { it.length >= 2 && it.all { c -> c in 'a'..'z' } }
+            if (tokens.size == 1) {
+                addEngEmoji(tokens[0], emoji)
+            } else if (tokens.size >= 2) {
+                val joined = tokens.joinToString("")
+                if (joined.length in 3..16) addEngEmoji(joined, emoji)
+                tokens.last().let { lastTok ->
+                    if (lastTok !in setOf("face", "with", "and", "of", "the", "in", "on", "person")) {
+                        addEngEmoji(lastTok, emoji)
+                    }
+                }
+            }
+        }
+        mapOf(
+            "bulb" to "💡",
+            "idea" to "💡",
+            "fire" to "🔥",
+            "heart" to "❤️",
+            "star" to "⭐",
+            "check" to "✅",
+            "ok" to "👌",
+            "smile" to "😊",
+            "laugh" to "😂",
+            "cry" to "😭",
+            "thanks" to "🙏",
+            "coffee" to "☕",
+            "beer" to "🍺",
+            "pizza" to "🍕",
+            "ramen" to "🍜",
+            "car" to "🚗",
+            "train" to "🚃",
+            "phone" to "📱",
+            "music" to "🎵"
+        ).forEach { (w, e) ->
+            val list = engEmojiMap.getOrPut(w) { ArrayList(4) }
+            list.remove(e)
+            list.add(0, e)
+            if (list.size > 4) list.subList(4, list.size).clear()
+        }
+        englishEmojiCandidates = engEmojiMap
+
         // 10. misspellings.txt (wrong\tright or right-only)
         val misExact = LinkedHashMap<String, String>()
         val misRight = HashSet<String>()
@@ -460,7 +516,7 @@ class MeltypeDictionaries(source: DictionarySource) {
             return sb.toString()
         }
 
-        private fun looksLikeKaomoji(token: String): Boolean {
+        internal fun looksLikeKaomoji(token: String): Boolean {
             if (token.length <= 1) return false
             return token.any { ch ->
                 ch in ' '..'~' || ch in listOf('ω', '∀', 'Д', 'ﾟ', '▽', '≧', '≦', '・', '｀', '´', 'ノ', '￣', '∩', '•', 'ᴥ')

@@ -2,10 +2,13 @@ package io.github.sp9r.meltype
 
 import io.github.sp9r.meltype.core.AndroidMozcConverter
 import io.github.sp9r.meltype.core.CandidateKind
+import io.github.sp9r.meltype.core.ClipboardImageStore
 import io.github.sp9r.meltype.core.CompositionSession
+import io.github.sp9r.meltype.core.ConversionClause
 import io.github.sp9r.meltype.core.EmojiCatalog
 import io.github.sp9r.meltype.core.EmojiCategory
 import io.github.sp9r.meltype.core.FileDictionarySource
+import io.github.sp9r.meltype.core.KanjiConverter
 import io.github.sp9r.meltype.core.MeltypeDictionaries
 import io.github.sp9r.meltype.core.RomajiDetector
 import io.github.sp9r.meltype.core.RomajiTypoEngine
@@ -1379,5 +1382,88 @@ class MeltypeEngineTest {
         val backToJa = toggleSess.toggleFocusedSegmentLanguage()
         assertEquals("まだ", backToJa.previewText)
         assertFalse(backToJa.clauses.first().isEnglish)
+    }
+
+    @Test
+    fun emojiCandidatesPromoteTopAfterPrimaryTextWithoutOutranking() {
+        val converter = object : KanjiConverter {
+            override val engineName: String = "FakeMozc"
+            private val table = mapOf(
+                "でんきゅう" to listOf("電球"),
+                "しんぶん" to listOf("新聞", "新文", "身辺")
+            )
+
+            override fun convertClauses(hiragana: String, context: String?): List<ConversionClause>? {
+                val top = table[hiragana]?.firstOrNull() ?: return null
+                return listOf(ConversionClause(hiragana, top))
+            }
+
+            override fun candidates(reading: String): List<String> {
+                val base = table[reading].orEmpty()
+                val emojis = dictionaries.emojiCandidates[reading].orEmpty()
+                return (base + reading + RomajiDetector.toKatakana(reading) + emojis).distinct()
+            }
+
+            override fun learn(context: String?, clauses: List<ConversionClause>): Boolean = false
+        }
+
+        val bulbSess = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "denkyuu") bulbSess.appendChar(ch)
+        val bulbCands = bulbSess.snapshot.candidates
+        assertEquals("電球", bulbCands.firstOrNull()?.text)
+        val bulbIdx = bulbCands.indexOfFirst { it.text == "💡" && it.kind == CandidateKind.EMOJI }
+        assertTrue("Expected 💡 in top 4 candidates for でんきゅう, got ${bulbCands.take(6)}", bulbIdx in 1..3)
+        assertEquals(1, bulbCands.count { it.text == "💡" })
+
+        val paperSess = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "shinbun") paperSess.appendChar(ch)
+        val paperCands = paperSess.snapshot.candidates
+        assertEquals("新聞", paperCands.firstOrNull()?.text)
+        val paperIdx = paperCands.indexOfFirst { it.text == "📰" && it.kind == CandidateKind.EMOJI }
+        assertTrue("Expected 📰 promoted after 新聞, got ${paperCands.take(6)}", paperIdx in 1..3)
+
+        val enBulbSess = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "bulb") enBulbSess.appendChar(ch)
+        val enCands = enBulbSess.snapshot.candidates
+        assertTrue(
+            "Expected 💡 for English 'bulb', got ${enCands.take(6)}",
+            enCands.indexOfFirst { it.text == "💡" && it.kind == CandidateKind.EMOJI } in 1..3
+        )
+    }
+
+    @Test
+    fun clipboardImageStoreHandlesDedupeLruAndMimeMatching() {
+        val dir = java.nio.file.Files.createTempDirectory("meltype_clip_img_test").toFile()
+        try {
+            val store = ClipboardImageStore(dir, maxItems = 3)
+            val e1 = store.importBytes("png-1".toByteArray(), "image/png", 100, 100, "t1".toByteArray(), nowMs = 1000L)
+            val e2 = store.importBytes("jpg-2".toByteArray(), "image/jpg", 200, 150, "t2".toByteArray(), nowMs = 2000L)
+            assertNotNull(e1)
+            assertNotNull(e2)
+            assertEquals("image/jpeg", e2!!.mimeType)
+
+            // Duplicate hash moves existing entry to head instead of duplicating.
+            val e1Dup = store.importBytes("png-1".toByteArray(), "image/png", 100, 100, "t1".toByteArray(), nowMs = 2500L)
+            assertEquals(e1!!.id, e1Dup!!.id)
+            assertEquals(2, store.list().size)
+
+            val e3 = store.importBytes("webp-3".toByteArray(), "image/webp", 300, 300, null, nowMs = 3000L)
+            val e4 = store.importBytes("gif-4".toByteArray(), "image/gif", 400, 400, null, nowMs = 4000L)
+            assertNotNull(e3)
+            assertNotNull(e4)
+            val listed = store.list()
+            assertEquals(3, listed.size)
+            assertEquals(listOf(e4!!.id, e3!!.id, e1.id), listed.map { it.id })
+            assertFalse("Evicted entry file should be deleted", File(dir, e2.fileName).exists())
+
+            assertEquals("image/png", ClipboardImageStore.selectCompatibleMime("image/png", arrayOf("image/jpeg", "image/png")))
+            assertEquals("image/webp", ClipboardImageStore.selectCompatibleMime("image/webp", arrayOf("image/*")))
+            assertEquals("image/png", ClipboardImageStore.selectCompatibleMime("image/webp", arrayOf("image/png")))
+            assertNull(ClipboardImageStore.selectCompatibleMime("image/png", emptyArray()))
+            assertTrue(store.delete(e4.id))
+            assertEquals(2, store.list().size)
+        } finally {
+            dir.deleteRecursively()
+        }
     }
 }

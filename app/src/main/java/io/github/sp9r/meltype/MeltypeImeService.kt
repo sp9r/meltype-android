@@ -1,9 +1,12 @@
 package io.github.sp9r.meltype
 
+import android.content.ClipDescription
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.res.Configuration
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.RectF
@@ -12,6 +15,7 @@ import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.StateListDrawable
 import android.inputmethodservice.InputMethodService
+import android.net.Uri
 import android.os.Build
 import android.os.SystemClock
 import android.text.SpannableString
@@ -29,18 +33,26 @@ import android.view.inputmethod.InputConnection
 import android.view.inputmethod.ExtractedTextRequest
 import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
+import androidx.core.content.FileProvider
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.inputmethod.EditorInfoCompat
+import androidx.core.view.inputmethod.InputConnectionCompat
+import androidx.core.view.inputmethod.InputContentInfoCompat
 import androidx.recyclerview.widget.GridLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import io.github.sp9r.meltype.core.AndroidMozcConverter
 import io.github.sp9r.meltype.core.AppEngineHolder
 import io.github.sp9r.meltype.core.CandidateItem
 import io.github.sp9r.meltype.core.CandidateKind
+import io.github.sp9r.meltype.core.ClipboardImageEntry
+import io.github.sp9r.meltype.core.ClipboardImageStore
 import io.github.sp9r.meltype.core.CompositionSession
 import io.github.sp9r.meltype.core.CompositionSnapshot
 import io.github.sp9r.meltype.core.EmojiCatalog
@@ -57,6 +69,8 @@ import io.github.sp9r.meltype.glide.TouchPoint
 import io.github.sp9r.meltype.ui.KeyboardActionListener
 import io.github.sp9r.meltype.ui.QwertyKeyboardView
 import io.github.sp9r.meltype.ui.SmileyDrawable
+import java.io.ByteArrayOutputStream
+import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -88,7 +102,9 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
     private var glideDecoder: GlideDecoder? = null
     private val bgExecutor = Executors.newSingleThreadExecutor()
     private val glidePreviewExecutor = Executors.newSingleThreadExecutor()
+    private val clipboardImageExecutor = Executors.newSingleThreadExecutor()
     private val glidePreviewSeq = AtomicLong(0L)
+    private lateinit var clipboardImageStore: ClipboardImageStore
 
     private lateinit var rootContainer: LinearLayout
     private lateinit var clauseBar: LinearLayout
@@ -151,6 +167,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         settings.migrateV170()
         settings.migrateV174()
         evalLogger = GlideEvalLogger(filesDir)
+        clipboardImageStore = ClipboardImageStore(File(cacheDir, "clipboard_images"))
         try {
             (getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager)?.addPrimaryClipChangedListener(clipListener)
         } catch (_: Throwable) {
@@ -474,7 +491,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         isEmojiSearchActive = false
         emojiSearchQuery.setLength(0)
         expandedTab = ExpandedTab.CANDIDATES
-        captureClipboardText()
+        captureClipboard()
         applySettingsToViews()
         renderSnapshot(session.snapshot)
     }
@@ -487,20 +504,191 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         }
     }
 
-    private fun captureClipboardText() {
+    private fun captureClipboard() {
         try {
             val cm = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager ?: return
             val clip = cm.primaryClip ?: return
-            if (clip.itemCount > 0) {
-                val txt = clip.getItemAt(0)?.coerceToText(this)?.toString()?.trim()
-                val sensitive = isSensitiveClip(clip.description)
-                if (!txt.isNullOrEmpty() && txt.length <= 500 && !sensitive) {
-                    settings.addClipboardItem(txt)
-                }
-                offerPaste(txt, clip.description, sensitive)
+            if (clip.itemCount <= 0) return
+            val desc = clip.description
+            val sensitive = isSensitiveClip(desc)
+            val item = clip.getItemAt(0)
+            val uri = item?.uri
+            val resolvedMime = resolveClipboardImageMime(desc, uri)
+            if (uri != null && resolvedMime != null) {
+                captureClipboardImage(uri, resolvedMime, desc, sensitive)
+                return
+            }
+            val txt = item?.coerceToText(this)?.toString()?.trim()
+            if (!txt.isNullOrEmpty() && txt.length <= 500 && !sensitive) {
+                settings.addClipboardItem(txt)
+            }
+            if (!txt.isNullOrEmpty()) {
+                pasteOfferImage = null
+                offerPaste(txt, desc, sensitive)
             }
         } catch (_: Throwable) {
         }
+    }
+
+    private fun resolveClipboardImageMime(desc: ClipDescription?, uri: Uri?): String? {
+        if (uri == null) return null
+        if (desc != null) {
+            for (i in 0 until desc.mimeTypeCount) {
+                val m = desc.getMimeType(i)
+                if (m.startsWith("image/")) return m
+            }
+        }
+        val resolverType = runCatching { contentResolver.getType(uri) }.getOrNull()
+        return resolverType?.takeIf { it.startsWith("image/") }
+    }
+
+    private fun captureClipboardImage(
+        uri: Uri,
+        rawMime: String,
+        desc: ClipDescription?,
+        sensitive: Boolean
+    ) {
+        val uriKey = "${uri}|${desc?.timestamp ?: 0L}|$rawMime"
+        if (uriKey == lastCapturedImageUriKey) return
+        lastCapturedImageUriKey = uriKey
+        val now = SystemClock.elapsedRealtime()
+        val ts = if (Build.VERSION.SDK_INT >= 26 && desc != null) desc.timestamp else 0L
+        val age = when {
+            ts <= 0L -> 0L
+            ts > now + PASTE_OFFER_MS -> System.currentTimeMillis() - ts
+            else -> now - ts
+        }
+        val offerFresh = age <= PASTE_OFFER_MS && !sensitive
+        val copiedAt = now - age.coerceAtLeast(0L)
+        clipboardImageExecutor.execute {
+            val rawBytes = readBoundedBytes(uri, ClipboardImageStore.MAX_IMAGE_BYTES + 1) ?: return@execute
+            if (rawBytes.size > ClipboardImageStore.MAX_IMAGE_BYTES) return@execute
+            val prepared = prepareClipboardImagePayload(rawBytes, rawMime) ?: return@execute
+            val entry = clipboardImageStore.importBytes(
+                bytes = prepared.bytes,
+                rawMimeType = prepared.mime,
+                width = prepared.width,
+                height = prepared.height,
+                thumbBytes = prepared.thumbBytes
+            ) ?: return@execute
+            pillHandler.post {
+                if (offerFresh && entry.id != lastHandledImageId) {
+                    pasteOfferText = null
+                    pasteOfferImage = entry
+                    pasteOfferImageSince = copiedAt
+                    pasteOfferImageSensitive = sensitive
+                }
+                if (::candidateRow.isInitialized && session.isEmpty) {
+                    renderSnapshot(session.snapshot)
+                }
+                if (isExpandedPanelOpen && expandedTab == ExpandedTab.TEMPLATES) {
+                    populateExpandedPanel(session.snapshot)
+                }
+            }
+        }
+    }
+
+    private data class PreparedImagePayload(
+        val bytes: ByteArray,
+        val mime: String,
+        val width: Int,
+        val height: Int,
+        val thumbBytes: ByteArray
+    )
+
+    private fun readBoundedBytes(uri: Uri, maxBytes: Int): ByteArray? {
+        return runCatching {
+            contentResolver.openInputStream(uri)?.use { input ->
+                val buffer = ByteArray(16 * 1024)
+                val out = ByteArrayOutputStream()
+                var total = 0
+                while (true) {
+                    val read = input.read(buffer)
+                    if (read <= 0) break
+                    total += read
+                    if (total > maxBytes) return null
+                    out.write(buffer, 0, read)
+                }
+                out.toByteArray()
+            }
+        }.getOrNull()
+    }
+
+    private fun prepareClipboardImagePayload(rawBytes: ByteArray, rawMime: String): PreparedImagePayload? {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(rawBytes, 0, rawBytes.size, bounds)
+        val srcW = bounds.outWidth
+        val srcH = bounds.outHeight
+        if (srcW <= 0 || srcH <= 0) return null
+
+        val normMime = ClipboardImageStore.normalizeMimeType(rawMime) ?: "image/png"
+        val rawLower = rawMime.substringBefore(';').trim().lowercase(Locale.US)
+        val keepOriginal = rawLower in setOf("image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif")
+
+        val finalBytes: ByteArray
+        val finalMime: String
+        if (keepOriginal) {
+            finalBytes = rawBytes
+            finalMime = normMime
+        } else {
+            val fullSample = computeSampleSize(srcW, srcH, 2048)
+            val fullBmp = BitmapFactory.decodeByteArray(
+                rawBytes,
+                0,
+                rawBytes.size,
+                BitmapFactory.Options().apply { inSampleSize = fullSample }
+            ) ?: return null
+            val baos = ByteArrayOutputStream()
+            fullBmp.compress(Bitmap.CompressFormat.PNG, 100, baos)
+            fullBmp.recycle()
+            finalBytes = baos.toByteArray()
+            finalMime = "image/png"
+        }
+
+        val thumbSample = computeSampleSize(srcW, srcH, 160)
+        val thumbDecoded = BitmapFactory.decodeByteArray(
+            rawBytes,
+            0,
+            rawBytes.size,
+            BitmapFactory.Options().apply { inSampleSize = thumbSample }
+        ) ?: return null
+        val thumbBytes = encodeThumbnailJpeg(thumbDecoded, 160)
+        thumbDecoded.recycle()
+
+        return PreparedImagePayload(
+            bytes = finalBytes,
+            mime = finalMime,
+            width = srcW,
+            height = srcH,
+            thumbBytes = thumbBytes
+        )
+    }
+
+    private fun computeSampleSize(w: Int, h: Int, maxDim: Int): Int {
+        var sample = 1
+        var curW = w
+        var curH = h
+        while (curW / 2 >= maxDim && curH / 2 >= maxDim) {
+            curW /= 2
+            curH /= 2
+            sample *= 2
+        }
+        return sample
+    }
+
+    private fun encodeThumbnailJpeg(bmp: Bitmap, maxDim: Int): ByteArray {
+        val scale = minOf(1f, maxDim.toFloat() / maxOf(bmp.width, bmp.height).coerceAtLeast(1))
+        val targetW = (bmp.width * scale).roundToInt().coerceAtLeast(1)
+        val targetH = (bmp.height * scale).roundToInt().coerceAtLeast(1)
+        val scaled = if (targetW != bmp.width || targetH != bmp.height) {
+            Bitmap.createScaledBitmap(bmp, targetW, targetH, true)
+        } else {
+            bmp
+        }
+        val out = ByteArrayOutputStream()
+        scaled.compress(Bitmap.CompressFormat.JPEG, 82, out)
+        if (scaled !== bmp) scaled.recycle()
+        return out.toByteArray()
     }
 
     // ---- Password manager: inline autofill suggestions (Android 11+) ----
@@ -607,14 +795,19 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         }
     }
 
-    // Paste suggestion: text copied in another app shows up at the head of the idle candidate bar.
+    // Paste suggestion: text or image copied in another app shows up at the head of the idle candidate bar.
     private var pasteOfferText: String? = null
     private var pasteOfferSensitive = false
     private var pasteOfferSince = 0L
     private var lastHandledClip: String? = null
+    private var pasteOfferImage: ClipboardImageEntry? = null
+    private var pasteOfferImageSensitive = false
+    private var pasteOfferImageSince = 0L
+    private var lastHandledImageId: String? = null
+    private var lastCapturedImageUriKey: String? = null
 
     private val clipListener = ClipboardManager.OnPrimaryClipChangedListener {
-        captureClipboardText()
+        captureClipboard()
         if (::candidateRow.isInitialized && session.isEmpty) renderSnapshot(session.snapshot)
     }
 
@@ -663,6 +856,106 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         renderSnapshot(session.snapshot)
     }
 
+    private fun currentPasteOfferImage(): ClipboardImageEntry? {
+        val img = pasteOfferImage ?: return null
+        if (SystemClock.elapsedRealtime() - pasteOfferImageSince > PASTE_OFFER_MS) {
+            pasteOfferImage = null
+            return null
+        }
+        if (pasteOfferImageSensitive || isPasswordField) return null
+        if (!clipboardImageStore.resolveFile(img).isFile) {
+            pasteOfferImage = null
+            return null
+        }
+        return img
+    }
+
+    private fun commitClipboardImage(entry: ClipboardImageEntry) {
+        val ic = currentInputConnection ?: return
+        val editorInfo = currentCurrentInputEditorInfoFallback()
+        val accepted = if (editorInfo != null) EditorInfoCompat.getContentMimeTypes(editorInfo) else emptyArray()
+        val chosenMime = ClipboardImageStore.selectCompatibleMime(entry.mimeType, accepted) ?: entry.mimeType
+        val sendFile = prepareImageFileForCommit(entry, chosenMime) ?: return
+        val uri = runCatching {
+            FileProvider.getUriForFile(this, "${packageName}.fileprovider", sendFile)
+        }.getOrNull() ?: return
+
+        var committed = false
+        if (editorInfo != null) {
+            val contentInfo = InputContentInfoCompat(
+                uri,
+                ClipDescription("クリップボード画像", arrayOf(chosenMime)),
+                null
+            )
+            committed = runCatching {
+                InputConnectionCompat.commitContent(
+                    ic,
+                    editorInfo,
+                    contentInfo,
+                    InputConnectionCompat.INPUT_CONTENT_GRANT_READ_URI_PERMISSION,
+                    null
+                )
+            }.getOrDefault(false)
+        }
+        if (!committed) {
+            // Fallback when the current primary clip itself is an image and the target supports generic paste.
+            val cm = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+            val curClip = cm?.primaryClip
+            val curUri = curClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.uri
+            if (curUri != null && resolveClipboardImageMime(curClip.description, curUri) != null) {
+                committed = runCatching { ic.performContextMenuAction(android.R.id.paste) }.getOrDefault(false)
+            }
+        }
+        if (committed) {
+            lastHandledImageId = entry.id
+            pasteOfferImage = null
+            clearUndoCommit()
+            if (isExpandedPanelOpen) {
+                isExpandedPanelOpen = false
+            }
+            if (shouldLogEval()) evalLogger.logEvent("paste_image", chosenMime, "${entry.width}x${entry.height}")
+            renderSnapshot(session.snapshot)
+        } else {
+            Toast.makeText(this, "この入力欄は画像の貼り付けに対応していません", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun currentCurrentInputEditorInfoFallback(): EditorInfo? = currentInputEditorInfo
+
+    private fun prepareImageFileForCommit(entry: ClipboardImageEntry, targetMime: String): File? {
+        val srcFile = clipboardImageStore.resolveFile(entry)
+        if (!srcFile.isFile) return null
+        if (targetMime == entry.mimeType) return srcFile
+        val ext = ClipboardImageStore.extensionForMime(targetMime)
+        val outFile = File(srcFile.parentFile, "send_${entry.id}.$ext")
+        val bmp = BitmapFactory.decodeFile(srcFile.absolutePath) ?: return srcFile
+        return runCatching {
+            outFile.outputStream().use { fos ->
+                val fmt = if (targetMime == "image/jpeg") Bitmap.CompressFormat.JPEG else Bitmap.CompressFormat.PNG
+                bmp.compress(fmt, 92, fos)
+            }
+            bmp.recycle()
+            outFile
+        }.getOrElse {
+            bmp.recycle()
+            srcFile
+        }
+    }
+
+    private fun loadThumbnailBitmap(entry: ClipboardImageEntry): Bitmap? {
+        val target = clipboardImageStore.resolveThumbFile(entry) ?: clipboardImageStore.resolveFile(entry)
+        if (!target.isFile) return null
+        return runCatching {
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(target.absolutePath, bounds)
+            val sample = computeSampleSize(bounds.outWidth.coerceAtLeast(1), bounds.outHeight.coerceAtLeast(1), 160)
+            BitmapFactory.decodeFile(
+                target.absolutePath,
+                BitmapFactory.Options().apply { inSampleSize = sample }
+            )
+        }.getOrNull()
+    }
+
     private fun isPasswordInputType(info: EditorInfo?): Boolean {
         val type = info?.inputType ?: return false
         val cls = type and android.text.InputType.TYPE_MASK_CLASS
@@ -702,6 +995,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         }
         bgExecutor.shutdownNow()
         glidePreviewExecutor.shutdownNow()
+        clipboardImageExecutor.shutdownNow()
         super.onDestroy()
     }
 
@@ -1476,6 +1770,9 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
     }
 
     private fun selectCandidateAndLog(snap: CompositionSnapshot, item: CandidateItem, closeExpanded: Boolean) {
+        if (item.kind == CandidateKind.EMOJI && item.text.isNotEmpty()) {
+            settings.addRecentEmoji(item.text)
+        }
         val rawBefore = snap.rawInput
         val focusedClause = snap.clauses.getOrNull(snap.focusedClauseIndex)
         noteFix(
@@ -1865,6 +2162,48 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
                     candidateRow.addView(btn)
                 }
             }
+            currentPasteOfferImage()?.let { imgEntry ->
+                val chip = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    setPadding(dp(6), dp(3), dp(9), dp(3))
+                    background = GradientDrawable().apply {
+                        setColor(chipAltBg)
+                        cornerRadius = dp(5).toFloat()
+                        setStroke(dp(1), accent)
+                    }
+                    layoutParams = LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                        dp(33)
+                    ).apply { marginEnd = dp(5) }
+                    contentDescription = "コピーした画像を貼り付け"
+                    setOnClickListener { commitClipboardImage(imgEntry) }
+                    setOnLongClickListener {
+                        lastHandledImageId = imgEntry.id
+                        pasteOfferImage = null
+                        renderSnapshot(session.snapshot)
+                        true
+                    }
+                }
+                loadThumbnailBitmap(imgEntry)?.let { bmp ->
+                    val thumb = ImageView(this).apply {
+                        setImageBitmap(bmp)
+                        scaleType = ImageView.ScaleType.CENTER_CROP
+                        layoutParams = LinearLayout.LayoutParams(dp(24), dp(24)).apply {
+                            marginEnd = dp(6)
+                        }
+                    }
+                    chip.addView(thumb)
+                }
+                val label = TextView(this).apply {
+                    text = "画像貼付"
+                    maxLines = 1
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
+                    setTextColor(textCol)
+                }
+                chip.addView(label)
+                candidateRow.addView(chip)
+            }
             currentPasteOffer()?.let { clip ->
                 val oneLine = clip.replace(Regex("\\s+"), " ")
                 val masked = isPasswordField || pasteOfferSensitive
@@ -1978,6 +2317,9 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
 
         val focusedText = snap.clauses.getOrNull(snap.focusedClauseIndex)?.text
         for ((idx, item) in snap.candidates.withIndex()) {
+            if (item.kind == CandidateKind.EMOJI && !canRenderEmoji(item.text)) {
+                continue
+            }
             val chip = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
                 gravity = Gravity.CENTER_VERTICAL
@@ -2008,7 +2350,8 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
                 } else {
                     item.text
                 }
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, if (item.kind == CandidateKind.EMOJI) 16f else 14f)
+                includeFontPadding = false
                 setTextColor(textCol)
                 maxLines = 1
             }
@@ -2884,7 +3227,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         textCol: Int,
         mutedCol: Int
     ) {
-        captureClipboardText()
+        captureClipboard()
 
         val now = Date()
         val dateChips = listOf(
@@ -2966,7 +3309,77 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         }
 
         expandedContent.addView(TextView(this).apply {
-            text = "クリップボード履歴"
+            text = "クリップボード履歴（画像）"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            setTextColor(mutedCol)
+            setPadding(0, dp(6), 0, dp(4))
+        })
+        val imgClips = clipboardImageStore.list()
+        if (imgClips.isEmpty()) {
+            expandedContent.addView(TextView(this).apply {
+                text = "コピーされた画像はまだありません（長押しで削除）"
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                setTextColor(mutedCol)
+                setPadding(0, dp(2), 0, dp(6))
+            })
+        } else {
+            val imgScroll = HorizontalScrollView(this).apply {
+                isHorizontalScrollBarEnabled = false
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply { bottomMargin = dp(6) }
+            }
+            val imgRow = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+            }
+            for (img in imgClips) {
+                val card = LinearLayout(this).apply {
+                    orientation = LinearLayout.VERTICAL
+                    gravity = Gravity.CENTER_HORIZONTAL
+                    setPadding(dp(5), dp(5), dp(5), dp(5))
+                    background = GradientDrawable().apply {
+                        setColor(cardBg)
+                        cornerRadius = dp(6).toFloat()
+                        setStroke(dp(1), border)
+                    }
+                    layoutParams = LinearLayout.LayoutParams(
+                        dp(76),
+                        ViewGroup.LayoutParams.WRAP_CONTENT
+                    ).apply { marginEnd = dp(6) }
+                    setOnClickListener { commitClipboardImage(img) }
+                    setOnLongClickListener {
+                        clipboardImageStore.delete(img.id)
+                        if (pasteOfferImage?.id == img.id) pasteOfferImage = null
+                        populateExpandedPanel(session.snapshot)
+                        true
+                    }
+                }
+                val thumbView = ImageView(this).apply {
+                    scaleType = ImageView.ScaleType.CENTER_CROP
+                    setBackgroundColor(border)
+                    layoutParams = LinearLayout.LayoutParams(dp(64), dp(64))
+                    loadThumbnailBitmap(img)?.let { setImageBitmap(it) }
+                }
+                card.addView(thumbView)
+                val dimLabel = if (img.width > 0 && img.height > 0) "${img.width}×${img.height}" else img.mimeType.removePrefix("image/")
+                card.addView(TextView(this).apply {
+                    text = dimLabel
+                    maxLines = 1
+                    ellipsize = TextUtils.TruncateAt.END
+                    gravity = Gravity.CENTER
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 9.5f)
+                    setTextColor(mutedCol)
+                    setPadding(0, dp(3), 0, 0)
+                })
+                imgRow.addView(card)
+            }
+            imgScroll.addView(imgRow)
+            expandedContent.addView(imgScroll)
+        }
+
+        expandedContent.addView(TextView(this).apply {
+            text = "クリップボード履歴（テキスト）"
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
             setTextColor(mutedCol)
             setPadding(0, dp(6), 0, dp(4))
@@ -3070,15 +3483,23 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
                 },
                 "コピー" to {
                     currentInputConnection?.performContextMenuAction(android.R.id.copy)
-                    captureClipboardText()
+                    captureClipboard()
                 },
                 "切取" to {
                     currentInputConnection?.performContextMenuAction(android.R.id.cut)
-                    captureClipboardText()
+                    captureClipboard()
                 },
                 "貼付" to {
                     clearUndoCommit()
-                    currentInputConnection?.performContextMenuAction(android.R.id.paste)
+                    val cm = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                    val curClip = cm?.primaryClip
+                    val curUri = curClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.uri
+                    val imgOffer = currentPasteOfferImage()
+                    if (curUri != null && resolveClipboardImageMime(curClip.description, curUri) != null && imgOffer != null) {
+                        commitClipboardImage(imgOffer)
+                    } else {
+                        currentInputConnection?.performContextMenuAction(android.R.id.paste)
+                    }
                 }
             )
         )

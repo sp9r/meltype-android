@@ -3,12 +3,14 @@ package io.github.sp9r.meltype
 import android.content.Intent
 import android.content.res.ColorStateList
 import android.content.res.Configuration
+import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.net.Uri
 import android.os.Bundle
 import android.provider.Settings
 import android.text.Editable
@@ -21,17 +23,21 @@ import android.view.ViewGroup
 import android.view.inputmethod.InputMethodManager
 import android.widget.EditText
 import android.widget.HorizontalScrollView
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.widget.SwitchCompat
+import androidx.core.view.OnReceiveContentListener
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import io.github.sp9r.meltype.core.AndroidMozcConverter
 import io.github.sp9r.meltype.core.AppEngineHolder
+import io.github.sp9r.meltype.core.CandidateKind
+import io.github.sp9r.meltype.core.ClipboardImageStore
 import io.github.sp9r.meltype.core.CompositionSession
 import io.github.sp9r.meltype.core.GlideEvalLogger
 import io.github.sp9r.meltype.core.MeltypeDictionaries
@@ -88,6 +94,9 @@ class MainActivity : AppCompatActivity() {
     private val workspaceContainers = ArrayList<LinearLayout>()
 
     private lateinit var sandboxInput: EditText
+    private lateinit var sandboxImagePreviewRow: LinearLayout
+    private lateinit var sandboxImageThumb: ImageView
+    private lateinit var sandboxImageMeta: TextView
     private lateinit var probeResultBanner: TextView
     private lateinit var evalPromptCounter: TextView
     private lateinit var evalTargetTextView: TextView
@@ -534,12 +543,14 @@ class MainActivity : AppCompatActivity() {
             setOnClickListener {
                 sandboxInput.setText("")
                 probeResultBanner.visibility = View.GONE
+                sandboxImagePreviewRow.visibility = View.GONE
+                sandboxImageThumb.setImageDrawable(null)
             }
         })
         sandboxCard.addView(sandboxHead)
 
         sandboxInput = EditText(this).apply {
-            hint = "ここをタップして文字キーのタップやグライド入力を試せます"
+            hint = "ここをタップして文字キーのタップやグライド入力・画像貼付を試せます"
             setHintTextColor(cFaint)
             setTextColor(cText)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 14.5f)
@@ -574,7 +585,46 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
+        ViewCompat.setOnReceiveContentListener(
+            sandboxInput,
+            arrayOf("image/*"),
+            OnReceiveContentListener { _, payload ->
+                val split = payload.partition { item -> item.uri != null }
+                val uriContent = split.first
+                if (uriContent != null && uriContent.clip.itemCount > 0) {
+                    val uri = uriContent.clip.getItemAt(0).uri
+                    if (uri != null) showSandboxReceivedImage(uri, uriContent.clip.description.getMimeType(0))
+                }
+                split.second
+            }
+        )
         sandboxCard.addView(sandboxInput)
+
+        sandboxImagePreviewRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            visibility = View.GONE
+            background = boxBg(cSurfaceSubtle, cBorder, 5)
+            setPadding(dp(10), dp(8), dp(10), dp(8))
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                setMargins(dp(12), 0, dp(12), dp(8))
+            }
+        }
+        sandboxImageThumb = ImageView(this).apply {
+            scaleType = ImageView.ScaleType.CENTER_CROP
+            layoutParams = LinearLayout.LayoutParams(dp(48), dp(48)).apply { marginEnd = dp(10) }
+        }
+        sandboxImageMeta = TextView(this).apply {
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setTextColor(cText)
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        sandboxImagePreviewRow.addView(sandboxImageThumb)
+        sandboxImagePreviewRow.addView(sandboxImageMeta)
+        sandboxCard.addView(sandboxImagePreviewRow)
 
         // 1-tap sample probes to showcase live Japanese/English conversion + typo correction
         val sampleScroll = HorizontalScrollView(this).apply {
@@ -1986,6 +2036,34 @@ class MainActivity : AppCompatActivity() {
             "traceW=$topBarTraceW maxAllowed=${dp(90)} candW=$topBarCandW"
         )
 
+        val denkyuSess = CompositionSession(dicts, engine, converter)
+        for (c in "denkyuu") denkyuSess.appendChar(c)
+        val denkyuCands = denkyuSess.snapshot.candidates
+        val denkyuFirst = denkyuCands.firstOrNull()?.text
+        val denkyuBulbIdx = denkyuCands.indexOfFirst { it.text == "💡" && it.kind == CandidateKind.EMOJI }
+        val shimbunSess = CompositionSession(dicts, engine, converter)
+        for (c in "shinbun") shimbunSess.appendChar(c)
+        val shimbunFirst = shimbunSess.snapshot.candidates.firstOrNull()?.text
+        val shimbunPaperIdx = shimbunSess.snapshot.candidates.indexOfFirst { it.text == "📰" && it.kind == CandidateKind.EMOJI }
+        check(
+            "EmojiCandidatePromotion",
+            denkyuFirst == "電球" && denkyuBulbIdx in 1..4 && shimbunFirst == "新聞" && shimbunPaperIdx in 1..4,
+            "denkyuFirst=$denkyuFirst bulbIdx=$denkyuBulbIdx shimbunFirst=$shimbunFirst paperIdx=$shimbunPaperIdx"
+        )
+
+        val testImgDir = File(cacheDir, "selftest_clipboard_images").apply { deleteRecursively() }
+        val imgStore = ClipboardImageStore(testImgDir)
+        val fakePng = byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A)
+        val storedImg = imgStore.importBytes(fakePng, "image/png", width = 64, height = 64, thumbBytes = byteArrayOf(1, 2, 3))
+        val mimePick = ClipboardImageStore.selectCompatibleMime("image/png", arrayOf("image/jpeg", "image/png"))
+        val imgOk = storedImg != null && imgStore.list().size == 1 && mimePick == "image/png" && imgStore.delete(storedImg.id)
+        testImgDir.deleteRecursively()
+        check(
+            "ClipboardImageStore",
+            imgOk,
+            "stored=${storedImg?.id} mime=$mimePick"
+        )
+
         val header = if (allPassed) "PASS\n" else "FAIL\n"
         val report = header + sb.toString()
         if (writeFile) {
@@ -2400,6 +2478,26 @@ class MainActivity : AppCompatActivity() {
             bgPaint.color = cPrimaryText
             canvas.drawCircle(width - pad, height - pad, 1.8f * d, bgPaint)
         }
+    }
+
+    private fun showSandboxReceivedImage(uri: Uri, rawMime: String?) {
+        val meta = runCatching {
+            contentResolver.openInputStream(uri)?.use { stream ->
+                val bytes = stream.readBytes()
+                val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                val mime = rawMime ?: contentResolver.getType(uri) ?: "image/*"
+                Triple(bmp, mime, bytes.size)
+            }
+        }.getOrNull() ?: return
+        val (bmp, mime, sizeBytes) = meta
+        if (bmp != null) {
+            sandboxImageThumb.setImageBitmap(bmp)
+            sandboxImageMeta.text = "画像を受信しました (${bmp.width}×${bmp.height}, $mime, ${sizeBytes / 1024} KB)"
+        } else {
+            sandboxImageThumb.setImageDrawable(null)
+            sandboxImageMeta.text = "画像を受信しました ($mime, ${sizeBytes / 1024} KB)"
+        }
+        sandboxImagePreviewRow.visibility = View.VISIBLE
     }
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
