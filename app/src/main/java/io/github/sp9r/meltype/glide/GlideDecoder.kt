@@ -320,8 +320,12 @@ class GlideDecoder(private val dictionaries: MeltypeDictionaries) {
             }
         }
         for (w in dictionaries.properNounCanonical.keys) {
-            val properBonus = if (w in CORE_PROPER_BRANDS) 0.26f else 0.06f
+            val properBonus = if (w in CORE_PROPER_BRANDS) 0.28f else 0.08f
             registerTemplate(w, w, isEnglish = true, freqBonus = properBonus)
+        }
+        for (w in CORE_TECH_ACRONYMS) {
+            val acronymBonus = if (w.length <= 2) 0.16f else 0.22f
+            registerTemplate(w, w, isEnglish = true, freqBonus = acronymBonus)
         }
         for (w in dictionaries.countryWords) {
             registerTemplate(w, w, isEnglish = true, freqBonus = 0.22f)
@@ -469,16 +473,18 @@ class GlideDecoder(private val dictionaries: MeltypeDictionaries) {
         val pairBuckets = IntArray(maxPairs)
         val pairCosts = FloatArray(maxPairs)
         var pairCount = 0
-        val endpointSlack = if (preferJapanese) 0.13f else 0.09f
-        val endpointWeight = if (preferJapanese) 0.76f else 1.05f
+        val startSlack = if (preferJapanese) 0.12f else 0.08f
+        val endSlack = if (preferJapanese) 0.14f else 0.12f
+        val startWeight = if (preferJapanese) 0.80f else 1.20f
+        val endWeight = if (preferJapanese) 0.72f else 0.90f
         for ((sChar, sDist) in startKeys) {
             if (sDist > maxEndpointDist && startKeys.first().first != sChar) continue
-            val effSDist = max(0f, sDist - endpointSlack)
+            val effSDist = max(0f, sDist - startSlack)
             val sIdx = (sChar - 'a') * 26
             for ((eChar, eDist) in endKeys) {
                 if (eDist > maxEndpointDist && endKeys.first().first != eChar) continue
-                val effEDist = max(0f, eDist - endpointSlack)
-                val endpointCost = (effSDist + effEDist) * endpointWeight
+                val effEDist = max(0f, eDist - endSlack)
+                val endpointCost = effSDist * startWeight + effEDist * endWeight
                 var ins = pairCount
                 while (ins > 0 && pairCosts[ins - 1] > endpointCost) {
                     pairCosts[ins] = pairCosts[ins - 1]
@@ -654,7 +660,7 @@ class GlideDecoder(private val dictionaries: MeltypeDictionaries) {
                     engModeAdj -= 0.085f
                 }
             }
-            val finalCost = hit.baseCost + cornerAdj + engModeAdj + dirDist * 1.40f + wpPenalty * 0.60f
+            val finalCost = hit.baseCost + cornerAdj + engModeAdj + dirDist * 1.40f + wpPenalty * 1.05f
             candidates.add(GlideCandidate(e.outputWord, e.isEnglish, finalCost, e.kanaHint))
             debugBreakdownsOut?.add(
                 GlideScoreBreakdown(
@@ -1332,7 +1338,15 @@ class GlideDecoder(private val dictionaries: MeltypeDictionaries) {
             "spoke", "wrote", "drove", "woke", "wore", "adjust", "august", "nonfiction", "screenshot",
             "playlist", "subtitle", "podcast", "youtuber", "saint", "vpn", "japan",
             "germany", "korea", "china", "france", "italy", "australia", "canada",
-            "brazil", "india", "wordle", "wireless"
+            "brazil", "india", "wordle", "wireless",
+            "tasks", "files", "apps", "links", "users", "modes", "sounds", "alarms",
+            "items", "pages", "tools", "tests", "logs", "keys", "ports", "hosts",
+            "cards", "views", "forms", "lists", "types", "rules", "steps", "plans",
+            "goals", "hours", "days", "weeks", "months", "years", "times", "names",
+            "places", "things", "parts", "groups", "points", "levels", "events", "issues",
+            "changes", "updates", "details", "options", "results", "messages", "videos",
+            "photos", "cameras", "devices", "routers", "servers", "folders", "screens",
+            "buttons", "alerts", "checks"
         )
 
         private val CORE_PROPER_BRANDS = setOf(
@@ -1341,7 +1355,17 @@ class GlideDecoder(private val dictionaries: MeltypeDictionaries) {
             "obsidian", "bitwarden", "tailscale", "meltype", "shizuku", "discord", "slack",
             "zoom", "notion", "amazon", "apple", "microsoft", "windows", "linux", "python",
             "kotlin", "steam", "netflix", "spotify", "instagram", "tiktok", "line", "reddit",
-            "wikipedia", "uber"
+            "wikipedia", "uber", "tplink", "tapo", "archer", "synology", "wifi", "usbc",
+            "bluray", "kpop", "jpop", "tshirt", "gshock", "pipewire", "wayland", "postmarketos",
+            "homeassistant", "motorola", "vscode", "codex", "vaultwarden", "colab", "leetcode",
+            "atcoder", "zenn", "qiita"
+        )
+
+        private val CORE_TECH_ACRONYMS = setOf(
+            "tp", "ip", "os", "ui", "ai", "pc", "id", "qr",
+            "ssh", "vpn", "api", "apk", "nas", "lan", "wan", "dns", "url", "usb",
+            "cpu", "gpu", "ram", "ssd", "led", "ble", "nfc", "sim", "pdf", "csv",
+            "sql", "git", "cli", "sdk", "adb", "wsl", "llm"
         )
 
         private val COMPOUND_SUFFIX_PAIRS = listOf(

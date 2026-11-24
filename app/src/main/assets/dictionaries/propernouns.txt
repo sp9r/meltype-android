@@ -97,4 +97,4 @@ holoX
 # --- Local additions ---
 ILLIT aespa NewJeans IVE TWICE BTS BLACKPINK SEVENTEEN YOASOBI Ado Wordle VSCode
 Codex Tailscale Bitwarden Vaultwarden Shizuku Synology Motorola Obsidian Colab LeetCode AtCoder Zenn
-Qiita
+Qiita TP-Link Tapo Archer PipeWire Wayland postmarketOS HomeAssistant Wi-Fi USB-C Blu-ray K-POP J-POP T-shirt G-Shock

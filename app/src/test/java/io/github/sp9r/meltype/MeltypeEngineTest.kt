@@ -17,6 +17,7 @@ import io.github.sp9r.meltype.core.SegmentKind
 import io.github.sp9r.meltype.core.UtilityConverter
 import io.github.sp9r.meltype.glide.GlideDecoder
 import io.github.sp9r.meltype.glide.KeyLayoutGeometry
+import io.github.sp9r.meltype.glide.TouchPoint
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -1498,5 +1499,104 @@ class MeltypeEngineTest {
             val decoded = glideDecoder.decode(path, maxResults = 5, preferJapanese = false).map { it.word }
             assertEquals("Expected '$target' ranked #1 in English glide, got $decoded", target, decoded.firstOrNull())
         }
+    }
+
+    @Test
+    fun tplinkHyphenatedProperNounAndRealSwipeAccuracy() {
+        fun pts(vararg triples: DoubleArray): List<TouchPoint> =
+            triples.map { TouchPoint(it[0].toFloat(), it[1].toFloat(), it[2].toLong()) }
+
+        // Real device trace recorded when user swiped "tplink" (preferJp=false)
+        val tplinkSwipe = pts(
+            doubleArrayOf(1.1651, 0.2425, 0.0), doubleArrayOf(1.1989, 0.2499, 31.0),
+            doubleArrayOf(1.2558, 0.2586, 41.0), doubleArrayOf(1.309, 0.2642, 49.0),
+            doubleArrayOf(1.3685, 0.2697, 58.0), doubleArrayOf(1.4336, 0.2747, 66.0),
+            doubleArrayOf(1.5054, 0.2795, 74.0), doubleArrayOf(1.5819, 0.2852, 83.0),
+            doubleArrayOf(1.6575, 0.2914, 91.0), doubleArrayOf(1.7291, 0.2977, 99.0),
+            doubleArrayOf(1.7952, 0.3046, 108.0), doubleArrayOf(1.851, 0.3094, 116.0),
+            doubleArrayOf(1.9399, 0.3179, 133.0), doubleArrayOf(1.9692, 0.3173, 141.0),
+            doubleArrayOf(1.9972, 0.3157, 158.0), doubleArrayOf(2.0256, 0.3101, 174.0),
+            doubleArrayOf(2.0566, 0.3042, 191.0), doubleArrayOf(2.085, 0.2974, 208.0),
+            doubleArrayOf(2.11, 0.2903, 224.0), doubleArrayOf(2.1338, 0.2831, 266.0),
+            doubleArrayOf(2.1347, 0.3082, 341.0), doubleArrayOf(2.1275, 0.3321, 358.0),
+            doubleArrayOf(2.1206, 0.3595, 374.0), doubleArrayOf(2.1129, 0.3929, 391.0),
+            doubleArrayOf(2.0989, 0.4593, 424.0), doubleArrayOf(2.0933, 0.4795, 433.0),
+            doubleArrayOf(2.085, 0.5054, 449.0), doubleArrayOf(2.077, 0.524, 474.0),
+            doubleArrayOf(2.0624, 0.539, 508.0), doubleArrayOf(2.0374, 0.5419, 533.0),
+            doubleArrayOf(1.9976, 0.5315, 549.0), doubleArrayOf(1.9706, 0.5171, 558.0),
+            doubleArrayOf(1.945, 0.4952, 566.0), doubleArrayOf(1.9216, 0.4683, 574.0),
+            doubleArrayOf(1.9006, 0.4387, 583.0), doubleArrayOf(1.8815, 0.4041, 591.0),
+            doubleArrayOf(1.8551, 0.3359, 608.0), doubleArrayOf(1.8445, 0.3032, 616.0),
+            doubleArrayOf(1.8359, 0.273, 624.0), doubleArrayOf(1.8284, 0.2463, 633.0),
+            doubleArrayOf(1.8219, 0.2236, 641.0), doubleArrayOf(1.8168, 0.2041, 649.0),
+            doubleArrayOf(1.8108, 0.1746, 666.0), doubleArrayOf(1.8074, 0.1513, 691.0),
+            doubleArrayOf(1.7952, 0.1714, 733.0), doubleArrayOf(1.7822, 0.2009, 741.0),
+            doubleArrayOf(1.7651, 0.2389, 750.0), doubleArrayOf(1.7419, 0.2881, 758.0),
+            doubleArrayOf(1.6933, 0.4019, 774.0), doubleArrayOf(1.6697, 0.4673, 783.0),
+            doubleArrayOf(1.6487, 0.5236, 791.0), doubleArrayOf(1.6295, 0.5776, 799.0),
+            doubleArrayOf(1.6115, 0.6291, 808.0), doubleArrayOf(1.5948, 0.676, 816.0),
+            doubleArrayOf(1.5809, 0.718, 824.0), doubleArrayOf(1.5728, 0.7493, 833.0),
+            doubleArrayOf(1.567, 0.7753, 841.0), doubleArrayOf(1.5626, 0.7969, 849.0),
+            doubleArrayOf(1.5573, 0.8176, 858.0), doubleArrayOf(1.552, 0.8503, 874.0),
+            doubleArrayOf(1.588, 0.8584, 966.0), doubleArrayOf(1.6325, 0.8234, 975.0),
+            doubleArrayOf(1.6832, 0.7792, 983.0), doubleArrayOf(1.7299, 0.7381, 991.0),
+            doubleArrayOf(1.7726, 0.6956, 999.0), doubleArrayOf(1.8083, 0.6551, 1008.0),
+            doubleArrayOf(1.8399, 0.6178, 1016.0), doubleArrayOf(1.8686, 0.5839, 1024.0),
+            doubleArrayOf(1.8933, 0.5554, 1033.0), doubleArrayOf(1.9135, 0.5308, 1041.0),
+            doubleArrayOf(1.9285, 0.5085, 1050.0), doubleArrayOf(1.9556, 0.4687, 1080.0)
+        )
+        val tplinkDecoded = glideDecoder.decode(tplinkSwipe, maxResults = 5, preferJapanese = false).map { it.word }
+        assertEquals("Expected 'tplink' ranked #1 on real swipe, got $tplinkDecoded", "tplink", tplinkDecoded.firstOrNull())
+
+        // Real device trace #1 recorded when user swiped "tasks" (previously lost to "take")
+        val tasksSwipe = pts(
+            doubleArrayOf(1.2522, 0.1925, 0.0), doubleArrayOf(1.2302, 0.2059, 16.0),
+            doubleArrayOf(1.1961, 0.2262, 24.0), doubleArrayOf(1.1484, 0.2519, 33.0),
+            doubleArrayOf(1.0877, 0.2831, 41.0), doubleArrayOf(1.023, 0.3172, 49.0),
+            doubleArrayOf(0.9581, 0.348, 58.0), doubleArrayOf(0.8944, 0.3764, 66.0),
+            doubleArrayOf(0.8262, 0.4059, 74.0), doubleArrayOf(0.7608, 0.4337, 83.0),
+            doubleArrayOf(0.6911, 0.4614, 91.0), doubleArrayOf(0.6306, 0.4861, 99.0),
+            doubleArrayOf(0.5669, 0.5084, 108.0), doubleArrayOf(0.5106, 0.5274, 116.0),
+            doubleArrayOf(0.4608, 0.5448, 124.0), doubleArrayOf(0.4152, 0.5604, 133.0),
+            doubleArrayOf(0.3759, 0.5751, 141.0), doubleArrayOf(0.3453, 0.5879, 149.0),
+            doubleArrayOf(0.3229, 0.5986, 158.0), doubleArrayOf(0.303, 0.6139, 199.0),
+            doubleArrayOf(0.3266, 0.6295, 233.0), doubleArrayOf(0.3503, 0.6344, 241.0),
+            doubleArrayOf(0.3776, 0.6379, 249.0), doubleArrayOf(0.4078, 0.6401, 258.0),
+            doubleArrayOf(0.4379, 0.6411, 266.0), doubleArrayOf(0.4618, 0.6416, 274.0),
+            doubleArrayOf(0.4951, 0.6415, 291.0), doubleArrayOf(0.5179, 0.6416, 316.0),
+            doubleArrayOf(0.5405, 0.6414, 433.0), doubleArrayOf(0.581, 0.6369, 449.0),
+            doubleArrayOf(0.6184, 0.6302, 458.0), doubleArrayOf(0.6639, 0.6222, 466.0),
+            doubleArrayOf(0.7141, 0.616, 474.0), doubleArrayOf(0.765, 0.6125, 483.0),
+            doubleArrayOf(0.817, 0.6115, 491.0), doubleArrayOf(0.874, 0.611, 499.0),
+            doubleArrayOf(0.931, 0.611, 508.0), doubleArrayOf(0.9939, 0.6103, 516.0),
+            doubleArrayOf(1.0598, 0.6077, 524.0), doubleArrayOf(1.1299, 0.6035, 533.0),
+            doubleArrayOf(1.2055, 0.5962, 541.0), doubleArrayOf(1.2806, 0.5863, 549.0),
+            doubleArrayOf(1.3522, 0.5746, 558.0), doubleArrayOf(1.4164, 0.5634, 566.0),
+            doubleArrayOf(1.4769, 0.5543, 574.0), doubleArrayOf(1.53, 0.5487, 583.0),
+            doubleArrayOf(1.5734, 0.5443, 591.0), doubleArrayOf(1.6076, 0.542, 599.0),
+            doubleArrayOf(1.6332, 0.5419, 608.0), doubleArrayOf(1.6561, 0.5428, 616.0),
+            doubleArrayOf(1.6817, 0.5445, 633.0), doubleArrayOf(1.631, 0.5464, 749.0),
+            doubleArrayOf(1.5694, 0.5454, 758.0), doubleArrayOf(1.496, 0.5428, 766.0),
+            doubleArrayOf(1.4191, 0.541, 774.0), doubleArrayOf(1.3337, 0.5389, 783.0),
+            doubleArrayOf(1.2438, 0.5362, 791.0), doubleArrayOf(1.158, 0.5341, 799.0),
+            doubleArrayOf(1.0754, 0.5305, 808.0), doubleArrayOf(0.9944, 0.5259, 816.0),
+            doubleArrayOf(0.9186, 0.5211, 824.0), doubleArrayOf(0.8474, 0.5151, 833.0),
+            doubleArrayOf(0.7841, 0.5093, 841.0), doubleArrayOf(0.7316, 0.5058, 849.0),
+            doubleArrayOf(0.6819, 0.5022, 858.0), doubleArrayOf(0.6502, 0.501, 866.0),
+            doubleArrayOf(0.6203, 0.5023, 874.0), doubleArrayOf(0.5916, 0.5057, 891.0),
+            doubleArrayOf(0.5741, 0.5243, 916.0)
+        )
+        val tasksDecoded = glideDecoder.decode(tasksSwipe, maxResults = 5, preferJapanese = false).map { it.word }
+        assertEquals("Expected 'tasks' ranked #1 on real swipe, got $tasksDecoded", "tasks", tasksDecoded.firstOrNull())
+
+        // Hyphenated proper nouns typed or glided resolve cleanly in CompositionSession
+        assertEquals("TP-Link", dictionaries.properNounCanonical["tplink"])
+        assertEquals("USB-C", dictionaries.properNounCanonical["usbc"])
+        assertEquals("Wi-Fi", dictionaries.properNounCanonical["wifi"])
+
+        val converter = AndroidMozcConverter(dictionaries)
+        val sess = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "tplinkno") sess.appendChar(ch)
+        assertEquals("TP-Linkの", sess.snapshot.previewText)
     }
 }

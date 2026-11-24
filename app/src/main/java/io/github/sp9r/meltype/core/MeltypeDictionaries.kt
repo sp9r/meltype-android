@@ -147,6 +147,11 @@ class MeltypeDictionaries(source: DictionarySource) {
                 if (lower.isNotEmpty()) {
                     properMap.putIfAbsent(lower, tok)
                     engFocused.add(lower)
+                    val stripped = lower.filterNot { it in "-.'/" }
+                    if (stripped != lower && stripped.length in 3..18 && stripped.all { it in 'a'..'z' }) {
+                        properMap.putIfAbsent(stripped, tok)
+                        engFocused.add(stripped)
+                    }
                 }
             }
         }
@@ -227,8 +232,9 @@ class MeltypeDictionaries(source: DictionarySource) {
                     for (idx in 1 until parts.size) {
                         val w = parts[idx]
                         if (w !in list) list.add(w)
-                        if (w.all { it in 'a'..'z' || it in 'A'..'Z' } && w.length >= 2) {
-                            glideBrands.add(w.lowercase())
+                        val cleanAlpha = w.lowercase().filterNot { it in "-.'/" }
+                        if (cleanAlpha.all { it in 'a'..'z' } && cleanAlpha.length >= 2) {
+                            glideBrands.add(cleanAlpha)
                         }
                     }
                 }
