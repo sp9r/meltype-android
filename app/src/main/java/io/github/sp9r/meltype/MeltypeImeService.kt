@@ -1074,6 +1074,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         keyboardView.themeMode = settings.themeMode
         keyboardView.oneHandedMode = settings.oneHandedMode
         keyboardView.heightScale = settings.keyboardHeightScale
+        keyboardView.sideMarginDp = settings.keyboardSideMarginDp
         keyboardView.punctuationStyle = settings.punctuationStyle
         keyboardView.refreshAppearance()
         oneHandBtn.text = shortHandLabel(settings.oneHandedMode)

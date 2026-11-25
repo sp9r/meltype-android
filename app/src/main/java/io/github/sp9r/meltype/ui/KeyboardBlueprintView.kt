@@ -32,6 +32,11 @@ class KeyboardBlueprintView @JvmOverloads constructor(
             field = value.coerceIn(0.65f, 1.55f)
             invalidate()
         }
+    var sideMarginDp: Int = 12
+        set(value) {
+            field = value.coerceIn(0, 40)
+            invalidate()
+        }
     var showNumberRow: Boolean = true
         set(value) {
             field = value
@@ -122,11 +127,14 @@ class KeyboardBlueprintView @JvmOverloads constructor(
             OneHandedMode.FULL -> trayW
             else -> trayW * 0.80f
         }
-        val kbLeft = when (oneHandedMode) {
+        val rawKbLeft = when (oneHandedMode) {
             OneHandedMode.FULL, OneHandedMode.LEFT -> trayLeft + 2f * d
             OneHandedMode.RIGHT -> trayRight - kbW - 2f * d
         }
-        val kbRight = kbLeft + kbW - 4f * d
+        // 実キーボードの余白(dp)を360dp幅の画面比でプレビューへ反映する
+        val marginPx = sideMarginDp / 360f * trayW
+        val kbLeft = rawKbLeft + marginPx
+        val kbRight = rawKbLeft + kbW - 4f * d - marginPx
         val innerW = kbRight - kbLeft
 
         // Top mini rail + key rows

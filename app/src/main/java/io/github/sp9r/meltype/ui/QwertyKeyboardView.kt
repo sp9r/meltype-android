@@ -16,6 +16,7 @@ import io.github.sp9r.meltype.BottomKeyMode
 import io.github.sp9r.meltype.OneHandedMode
 import io.github.sp9r.meltype.PunctuationStyle
 import io.github.sp9r.meltype.ThemeMode
+import io.github.sp9r.meltype.glide.KeyLayoutGeometry
 import io.github.sp9r.meltype.glide.TouchPoint
 import kotlin.math.abs
 import kotlin.math.hypot
@@ -154,6 +155,10 @@ class QwertyKeyboardView @JvmOverloads constructor(
 
     private val keys = ArrayList<VisualKey>(60)
     private val letterBounds = RectF()
+    var sideMarginDp: Int = 12
+    private var sideMarginPx = 0f
+    private var keyAreaLeft = 0f
+    private var keyAreaWidth = 0f
     private var numAlphaDeadTop = 0f
     private var numAlphaDeadBottom = 0f
 
@@ -343,18 +348,21 @@ class QwertyKeyboardView @JvmOverloads constructor(
         val h = height.toFloat()
         if (w <= 0f || h <= 0f) return
 
-        val sideMargin = dp(4f)
+        val sideMargin = dp(sideMarginDp.toFloat())
         val topPad = dp(5f)
         val bottomPad = dp(5f)
         val availH = (h - topPad - bottomPad).coerceAtLeast(100f)
 
         val activeFrac = if (oneHandedMode == OneHandedMode.FULL) 1.0f else 0.85f
-        val areaW = (w - sideMargin * 2f) * activeFrac
-        val areaLeft = when (oneHandedMode) {
-            OneHandedMode.FULL -> sideMargin
-            OneHandedMode.LEFT -> sideMargin
-            OneHandedMode.RIGHT -> w - sideMargin - areaW
-        }
+        val (areaLeft, areaW) = KeyLayoutGeometry.keyAreaSpan(
+            viewWidth = w,
+            sideMargin = sideMargin,
+            activeFrac = activeFrac,
+            anchorRight = oneHandedMode == OneHandedMode.RIGHT
+        )
+        sideMarginPx = sideMargin
+        keyAreaLeft = areaLeft
+        keyAreaWidth = areaW
 
         val gapX = dp(3.5f)
         val gapY = dp(5f)
@@ -1271,7 +1279,9 @@ class QwertyKeyboardView @JvmOverloads constructor(
         handler.postDelayed(arrowSwipeRepeatRunnable, 360L)
     }
 
-    private fun findKeyAt(x: Float, y: Float): VisualKey? {
+    private fun findKeyAt(rawX: Float, y: Float): VisualKey? {
+        // 左右の余白内のタップ・スワイプ開始は、いちばん近い端のキーとして扱う
+        val x = KeyLayoutGeometry.snapToKeyArea(rawX, keyAreaLeft, keyAreaWidth, sideMarginPx)
         for (k in keys) {
             if (k.rect.contains(x, y)) return k
         }

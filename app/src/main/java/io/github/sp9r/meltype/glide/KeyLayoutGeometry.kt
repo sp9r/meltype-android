@@ -74,6 +74,35 @@ object KeyLayoutGeometry {
         keyCenters = map
     }
 
+    /**
+     * キー配列領域の(left, width)をピクセルで返す。描画・グライド判定の共通の計算元。
+     * 余白[sideMargin]の分だけ左右を内側へ寄せ、片手モードでは[activeFrac]幅の領域を左右どちらかへ寄せる。
+     */
+    fun keyAreaSpan(viewWidth: Float, sideMargin: Float, activeFrac: Float = 1f, anchorRight: Boolean = false): Pair<Float, Float> {
+        val areaW = (viewWidth - sideMargin * 2f).coerceAtLeast(1f) * activeFrac
+        val left = if (anchorRight) viewWidth - sideMargin - areaW else sideMargin
+        return left to areaW
+    }
+
+    /** [ch]のキー中心のX座標(ピクセル)。 */
+    fun keyCenterXPx(ch: Char, areaLeft: Float, areaWidth: Float): Float? {
+        val c = centerOf(ch) ?: return null
+        return areaLeft + c.x / ASPECT_RATIO * areaWidth
+    }
+
+    /**
+     * 左右の余白内にあるX座標を、端のキー領域の縁へ寄せる(余白タップを端のキーとして扱うため)。
+     * 余白より外側や領域内の値はそのまま返す。
+     */
+    fun snapToKeyArea(x: Float, areaLeft: Float, areaWidth: Float, sideMargin: Float): Float {
+        val right = areaLeft + areaWidth
+        return when {
+            x < areaLeft && x >= areaLeft - sideMargin -> areaLeft
+            x > right && x <= right + sideMargin -> right
+            else -> x
+        }
+    }
+
     fun centerOf(ch: Char): KeyCenter? {
         val idx = ch.lowercaseChar() - 'a'
         return if (idx in 0 until 26) keyByIndex[idx] else null

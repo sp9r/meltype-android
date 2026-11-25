@@ -1106,6 +1106,7 @@ class MainActivity : AppCompatActivity() {
         blueprintView = KeyboardBlueprintView(this).apply {
             previewDark = isDarkPalette
             heightScale = settings.keyboardHeightScale
+            sideMarginDp = settings.keyboardSideMarginDp
             showNumberRow = settings.showNumberRow
             showSubLabels = settings.showSubLabels
             oneHandedMode = settings.oneHandedMode
@@ -1118,6 +1119,7 @@ class MainActivity : AppCompatActivity() {
         }
         previewCard.addView(blueprintView)
         addFreeHeightControl(previewCard)
+        addSideMarginControl(previewCard)
         pane.addView(previewCard)
 
         // 2. Segmented Appearance & Mode Controls
@@ -2411,6 +2413,25 @@ class MainActivity : AppCompatActivity() {
             stepLabels = listOf("-5%", "-1%", "100%", "+1%", "+5%"),
             stepValues = listOf(-0.05f, -0.01f, null, +0.01f, +0.05f),
             resetValue = 1.0f
+        )
+    }
+
+    private fun addSideMarginControl(parent: LinearLayout) {
+        // 値は dp/100f で受け渡し(0〜40dp、2dp刻みで丸めて保存)
+        addSteppedPercentSlider(
+            parent = parent,
+            title = "キーボード左右の余白",
+            minPct = 0,
+            maxPct = MeltypeSettings.MAX_SIDE_MARGIN_DP,
+            currentValue = { settings.keyboardSideMarginDp / 100f },
+            applyValue = { next ->
+                settings.keyboardSideMarginDp = (next * 100f).roundToInt()
+                blueprintView.sideMarginDp = settings.keyboardSideMarginDp
+            },
+            formatLabel = { value -> "${(value * 100f).roundToInt()}dp" },
+            stepLabels = listOf("-4", "-2", "12dp", "+2", "+4"),
+            stepValues = listOf(-0.04f, -0.02f, null, +0.02f, +0.04f),
+            resetValue = MeltypeSettings.DEFAULT_SIDE_MARGIN_DP / 100f
         )
     }
 

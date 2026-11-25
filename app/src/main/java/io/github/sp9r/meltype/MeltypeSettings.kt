@@ -85,6 +85,11 @@ class MeltypeSettings(context: Context) {
         get() = prefs.getFloat(KEY_HEIGHT_SCALE, 1.0f).coerceIn(0.65f, 1.55f)
         set(value) = prefs.edit().putFloat(KEY_HEIGHT_SCALE, value.coerceIn(0.65f, 1.55f)).apply()
 
+    /** キーボード左右の余白(dp)。0〜40dpを2dp刻み。既定12dp。 */
+    var keyboardSideMarginDp: Int
+        get() = snapSideMarginDp(prefs.getInt(KEY_SIDE_MARGIN_DP, DEFAULT_SIDE_MARGIN_DP))
+        set(value) = prefs.edit().putInt(KEY_SIDE_MARGIN_DP, snapSideMarginDp(value)).apply()
+
     var showNumberRow: Boolean
         get() = prefs.getBoolean(KEY_SHOW_NUMBER_ROW, true)
         set(value) = prefs.edit().putBoolean(KEY_SHOW_NUMBER_ROW, value).apply()
@@ -355,6 +360,12 @@ class MeltypeSettings(context: Context) {
         private const val KEY_THEME_MODE = "theme_mode"
         private const val KEY_ONE_HANDED = "one_handed_mode"
         private const val KEY_HEIGHT_SCALE = "keyboard_height_scale"
+        private const val KEY_SIDE_MARGIN_DP = "keyboard_side_margin_dp"
+        const val DEFAULT_SIDE_MARGIN_DP = 12
+        const val MAX_SIDE_MARGIN_DP = 40
+
+        /** 0〜40dpに丸め、2dp刻みへ揃える。 */
+        fun snapSideMarginDp(value: Int): Int = ((value.coerceIn(0, MAX_SIDE_MARGIN_DP) + 1) / 2) * 2
         private const val KEY_SHOW_NUMBER_ROW = "show_number_row"
         private const val KEY_BOTTOM_KEY = "bottom_key_mode"
         private const val KEY_AUTO_RETURN_SYMBOLS = "auto_return_symbols"
