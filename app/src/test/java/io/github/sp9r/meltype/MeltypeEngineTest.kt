@@ -4,6 +4,7 @@ import io.github.sp9r.meltype.core.AndroidMozcConverter
 import io.github.sp9r.meltype.core.CandidateKind
 import io.github.sp9r.meltype.core.ClipboardImageStore
 import io.github.sp9r.meltype.core.CompositionSession
+import io.github.sp9r.meltype.core.CompositionSync
 import io.github.sp9r.meltype.core.ConversionClause
 import io.github.sp9r.meltype.core.EmojiCatalog
 import io.github.sp9r.meltype.core.EmojiCategory
@@ -1712,5 +1713,55 @@ class MeltypeEngineTest {
         val text = s.commitAndLearn()
         assertEquals("ありがとう", got?.first)
         assertEquals(text, got?.second)
+    }
+
+    @Test
+    fun unknownEnglishWordsStayEnglishWhenTapTyped() {
+        val converter = AndroidMozcConverter(dictionaries)
+        fun typed(w: String): CompositionSession {
+            val s = CompositionSession(dictionaries, scoreEngine, converter)
+            for (c in w) s.appendChar(c)
+            return s
+        }
+        for (w in listOf("aliexpress", "tiktok", "chatgpt", "github", "tailscale", "vaultwarden")) {
+            val sn = typed(w).snapshot
+            assertEquals("$w should be one English clause", 1, sn.clauses.size)
+            assertTrue("$w should be English", sn.clauses[0].isEnglish)
+            assertEquals(w, sn.previewText.lowercase())
+            assertTrue("$w as typed must be offered", sn.candidates.any { it.text == w })
+        }
+        // Ambiguous valid romaji (temu, shein) stays kana but the as-typed spelling is the 2nd candidate.
+        for (w in listOf("temu", "shein")) {
+            val sn = typed(w).snapshot
+            assertEquals(w, sn.candidates[1].text)
+        }
+        // Legitimate Japanese romaji is untouched.
+        for ((w, kana) in listOf("kaiten" to "かいてん", "aisu" to "あいす", "sentaku" to "せんたく")) {
+            val sn = typed(w).snapshot
+            assertTrue("$w should stay Japanese", sn.clauses.none { it.isEnglish })
+            assertTrue(sn.candidates.any { it.text == kana })
+        }
+    }
+
+    @Test
+    fun externalReplacementOfComposingTextDropsInternalComposition() {
+        val converter = AndroidMozcConverter(dictionaries)
+        val session = CompositionSession(dictionaries, scoreEngine, converter)
+        for (c in "kensaku") session.appendChar(c)
+        val len = session.snapshot.previewText.length
+        // Composing region cleared by the host app (suggestion tapped).
+        assertTrue(CompositionSync.shouldDiscardOnSelectionUpdate(true, -1, -1, 9, 9, len, 1000))
+        // Region changed length / caret jumped away.
+        assertTrue(CompositionSync.shouldDiscardOnSelectionUpdate(true, 0, len + 1, 1, 1, len, 1000))
+        assertTrue(CompositionSync.shouldDiscardOnSelectionUpdate(true, 0, len, len + 5, len + 5, len, 1000))
+        // Our own update, a stale callback right after our edit, and an empty session are ignored.
+        assertFalse(CompositionSync.shouldDiscardOnSelectionUpdate(true, 0, len, len, len, len, 1000))
+        assertFalse(CompositionSync.shouldDiscardOnSelectionUpdate(true, -1, -1, 0, 0, len, 20))
+        assertFalse(CompositionSync.shouldDiscardOnSelectionUpdate(false, -1, -1, 0, 0, 0, 1000))
+        // After discarding, new typing starts fresh and never re-inserts the old buffer.
+        session.clearAll()
+        for (c in "kyou") session.appendChar(c)
+        assertEquals("kyou", session.snapshot.rawInput)
+        assertFalse(session.snapshot.rawInput.contains("kensaku"))
     }
 }

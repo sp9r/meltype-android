@@ -54,6 +54,7 @@ import io.github.sp9r.meltype.core.CandidateKind
 import io.github.sp9r.meltype.core.ClipboardImageEntry
 import io.github.sp9r.meltype.core.ClipboardImageStore
 import io.github.sp9r.meltype.core.CompositionSession
+import io.github.sp9r.meltype.core.CompositionSync
 import io.github.sp9r.meltype.core.CompositionSnapshot
 import io.github.sp9r.meltype.core.EmojiCatalog
 import io.github.sp9r.meltype.core.EmojiCategory
@@ -492,10 +493,45 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         super.onStartInput(attribute, restarting)
         isPasswordField = isPasswordInputType(attribute)
         isIncognitoField = isIncognito(attribute)
-        if (!restarting && ::session.isInitialized) {
-            session.clearAll()
-            clearUndoCommit()
+        if (::session.isInitialized) {
+            // Also on restarting: the app re-created its input connection (e.g. after replacing the
+            // composing text with a search suggestion), so the old composition no longer exists there.
+            discardCompositionWithoutCommit()
         }
+    }
+
+    private var lastOwnEditUptime = 0L
+
+    /** Drops the internal composition without inserting it into the editor. */
+    private fun discardCompositionWithoutCommit() {
+        if (!session.isEmpty) {
+            session.clearAll()
+        }
+        clearUndoCommit()
+        if (::keyboardView.isInitialized) renderSnapshot(session.snapshot)
+    }
+
+    override fun onUpdateSelection(
+        oldSelStart: Int,
+        oldSelEnd: Int,
+        newSelStart: Int,
+        newSelEnd: Int,
+        candidatesStart: Int,
+        candidatesEnd: Int
+    ) {
+        super.onUpdateSelection(oldSelStart, oldSelEnd, newSelStart, newSelEnd, candidatesStart, candidatesEnd)
+        if (!::session.isInitialized) return
+        val snap = session.snapshot
+        val discard = CompositionSync.shouldDiscardOnSelectionUpdate(
+            hasComposition = !session.isEmpty,
+            candidatesStart = candidatesStart,
+            candidatesEnd = candidatesEnd,
+            newSelStart = newSelStart,
+            newSelEnd = newSelEnd,
+            expectedLength = snap.previewText.length,
+            msSinceOwnEdit = android.os.SystemClock.uptimeMillis() - lastOwnEditUptime
+        )
+        if (discard) discardCompositionWithoutCommit()
     }
 
     override fun onStartInputView(info: EditorInfo?, restarting: Boolean) {
@@ -783,6 +819,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
 
     override fun onFinishInput() {
         super.onFinishInput()
+        if (::session.isInitialized && !session.isEmpty) discardCompositionWithoutCommit()
         inlineGen++
         inlineViews = emptyList()
     }
@@ -1941,6 +1978,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         val focusBgSpan = if (dark) Color.argb(90, 92, 138, 196) else Color.argb(65, 74, 111, 158)
 
         val ic = currentInputConnection
+        lastOwnEditUptime = android.os.SystemClock.uptimeMillis()
         if (snap.isComposing && snap.isEditing) {
             val spanned = SpannableString(snap.previewText)
             spanned.setSpan(UnderlineSpan(), 0, spanned.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)

@@ -1607,6 +1607,23 @@ class CompositionSession(
             barCandidates.addAll(insertAt, focusedCorrections)
         }
 
+        // As-typed English spelling: for a Japanese reading that has no real conversion (new words,
+        // brand names such as "temu"), always offer the typed letters right after the top candidate.
+        if (focused != null && !focused.isEnglish && !converting && !kanaRevert && caretRaw == null) {
+            val typed = focused.raw
+            val isPlainKana = focused.text == focused.reading || focused.text == RomajiDetector.toKatakana(focused.reading)
+            if (typed.length >= 3 && typed.all { it in 'a'..'z' } && isPlainKana &&
+                !dictionaries.japaneseWords.contains(typed.lowercase()) &&
+                displayClauses.count { it.segmentIndex == focused.segmentIndex } == 1
+            ) {
+                barCandidates.removeAll { it.text == typed && it.kind == CandidateKind.CONVERSION }
+                barCandidates.add(
+                    minOf(1, barCandidates.size),
+                    CandidateItem(text = typed, subtitle = "英字そのまま", kind = CandidateKind.CONVERSION, targetClauseIndex = focusedClauseIdx)
+                )
+            }
+        }
+
         // Prefix completion (user phrases / frequently committed phrases), shown while typing.
         if (!converting && !kanaRevert && caretRaw == null && raw.isNotEmpty()) {
             val previewNow = displayClauses.joinToString("") { it.text }

@@ -407,11 +407,61 @@ class ScoreEngine(
             cursor = prev
         }
         reversed.reverse()
+        val unknownEnglish = collapseUnknownEnglishRun(reversed, run, lowerRun, baseOffset, wholeRunReadable)
+        if (unknownEnglish != null) return unknownEnglish
         return if (typoCorrectionEnabled()) {
             rescueUnreadableJapaneseSlices(reversed, run, baseOffset, endedByDelimiter)
         } else {
             reversed
         }
+    }
+
+    /**
+     * Unknown English words (brand and service names such as "aliexpress", "vaultwarden") are not in
+     * any dictionary, so the DP carves them into fragments (あlいExpress). When the run contains a
+     * letter pattern that romaji never produces (x/q/l outside small-kana, e.g. "xp", "lt") and the
+     * DP result is fragmentary, treat the whole lowercase run as one English word instead.
+     */
+    private fun collapseUnknownEnglishRun(
+        dp: List<ScoredSegment>,
+        run: String,
+        lowerRun: String,
+        baseOffset: Int,
+        wholeRunReadable: Boolean
+    ): List<ScoredSegment>? {
+        if (wholeRunReadable || run.length < 5 || dp.size < 2) return null
+        if (!run.all { it in 'a'..'z' }) return null
+        if (!hasRomajiAlienLetter(lowerRun)) return null
+        if (dp.none { it.kind == SegmentKind.ENGLISH }) return null
+        // A real Japanese chunk (particle + verb tail, typo-prone word) means this is a Japanese/English mix.
+        if (dp.any { it.kind == SegmentKind.JAPANESE && it.raw.length >= 3 }) return null
+        val fragmentary = dp.any { it.kind == SegmentKind.ENGLISH && it.raw.length == 1 } ||
+            dp.zipWithNext().any { (a, b) -> a.kind == SegmentKind.ENGLISH && b.kind == SegmentKind.ENGLISH }
+        if (!fragmentary) return null
+        return listOf(
+            ScoredSegment(
+                kind = SegmentKind.ENGLISH,
+                raw = run,
+                startIndex = baseOffset,
+                endIndex = baseOffset + run.length,
+                canonicalEnglish = dictionaries.properNounCanonical[lowerRun]
+            )
+        )
+    }
+
+    private fun hasRomajiAlienLetter(lower: String): Boolean {
+        for (i in lower.indices) {
+            val c = lower[i]
+            if (c != 'x' && c != 'l' && c != 'q') continue
+            val rest = lower.substring(i + 1)
+            val ok = rest.startsWith("a") || rest.startsWith("i") || rest.startsWith("u") ||
+                rest.startsWith("e") || rest.startsWith("o") || rest.startsWith("tu") ||
+                rest.startsWith("tsu") || rest.startsWith("ya") || rest.startsWith("yu") ||
+                rest.startsWith("yo") || rest.startsWith("wa") || rest.startsWith("ka") ||
+                rest.startsWith("ke")
+            if (!ok) return true
+        }
+        return false
     }
 
     private fun isWeakEnglishFragment(
