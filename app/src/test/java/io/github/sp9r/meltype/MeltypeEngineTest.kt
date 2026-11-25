@@ -9,7 +9,10 @@ import io.github.sp9r.meltype.core.EmojiCatalog
 import io.github.sp9r.meltype.core.EmojiCategory
 import io.github.sp9r.meltype.core.FileDictionarySource
 import io.github.sp9r.meltype.core.KanjiConverter
+import io.github.sp9r.meltype.core.LearnedPhrase
 import io.github.sp9r.meltype.core.MeltypeDictionaries
+import io.github.sp9r.meltype.core.PhraseSuggester
+import io.github.sp9r.meltype.core.UserPhrase
 import io.github.sp9r.meltype.core.RomajiDetector
 import io.github.sp9r.meltype.core.RomajiTypoEngine
 import io.github.sp9r.meltype.core.ScoreEngine
@@ -1598,5 +1601,116 @@ class MeltypeEngineTest {
         val sess = CompositionSession(dictionaries, scoreEngine, converter)
         for (ch in "tplinkno") sess.appendChar(ch)
         assertEquals("TP-Linkの", sess.snapshot.previewText)
+    }
+    @Test
+    fun correctionChipTapConfirmsInOneStep() {
+        val converter = AndroidMozcConverter(dictionaries)
+        val s = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "arigatpu") s.appendChar(ch)
+        val chip = s.snapshot.candidates.firstOrNull { it.kind == CandidateKind.CORRECTION && it.keepLiteralStart < 0 }
+        assertNotNull("correction chip for arigatpu in ${s.snapshot.candidates}", chip)
+        s.applyCorrectionAndFocus(chip!!)
+        assertTrue(s.snapshot.isConverting)
+        val committed = s.commitFocusedPrefix()
+        assertEquals(chip.text, committed)
+        assertTrue("composition should be closed after one tap", s.isEmpty)
+    }
+
+    @Test
+    fun arrowStepMovesFocusAcrossClausesWhenResizeIsExhausted() {
+        val converter = AndroidMozcConverter(dictionaries)
+        val s = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "kyouhagoogledekensaku") s.appendChar(ch)
+        val total = s.snapshot.clauses.size
+        assertTrue(total >= 3)
+        s.startConversion()
+        // Walk right through the whole composition with the arrow only.
+        var guard = 0
+        while (s.snapshot.focusedClauseIndex < s.snapshot.clauses.lastIndex && guard++ < 60) {
+            s.stepThroughComposition(+1)
+        }
+        assertEquals(s.snapshot.clauses.lastIndex, s.snapshot.focusedClauseIndex)
+        assertEquals("kyouhagoogledekensaku", s.snapshot.rawInput)
+        guard = 0
+        while (s.snapshot.focusedClauseIndex > 0 && guard++ < 60) {
+            s.stepThroughComposition(-1)
+        }
+        assertEquals(0, s.snapshot.focusedClauseIndex)
+        assertEquals("kyouhagoogledekensaku", s.snapshot.rawInput)
+    }
+
+    @Test
+    fun caretMovesThroughWholeCompositionAcrossClauseBoundaries() {
+        val converter = AndroidMozcConverter(dictionaries)
+        val s = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "kyouhagoogledekensaku") s.appendChar(ch)
+        s.startConversion()
+        val startKana = s.moveCaret(-1)
+        assertTrue(startKana.isEditing)
+        val full = s.snapshot.editKana
+        var snap = startKana
+        repeat(full.length + 3) { snap = s.moveCaret(-1) }
+        assertEquals(0, snap.editKanaCaret)
+        repeat(full.length + 3) { snap = s.moveCaret(+1) }
+        assertFalse(snap.isEditing)
+        assertEquals("kyouhagoogledekensaku", snap.rawInput)
+    }
+
+    @Test
+    fun phraseSuggesterMatchesUserPhrasesAndLearnedHistory() {
+        val users = listOf(
+            UserPhrase("めーる", "taro@example.invalid"),
+            UserPhrase("", "090-0000-0000")
+        )
+        // Reading trigger and text prefix and symbol-only input all find the phrases.
+        assertEquals(listOf("taro@example.invalid"), PhraseSuggester.suggest("me-ru", "めーる", users, emptyList()).map { it.text })
+        assertEquals(listOf("090-0000-0000"), PhraseSuggester.suggest("090", "090", users, emptyList()).map { it.text })
+        assertEquals(listOf("taro@example.invalid"), PhraseSuggester.suggest("@", "@", users, emptyList()).map { it.text })
+        assertTrue(PhraseSuggester.suggest("zzz", "zzz", users, emptyList()).isEmpty())
+        // Learned phrases only after repeated commits and prefix-of-reading.
+        var learned = emptyList<LearnedPhrase>()
+        learned = PhraseSuggester.recordCommit(learned, "よろしくおねがいします", "よろしくお願いします", 1L)
+        assertTrue(PhraseSuggester.suggest("yoroshiku", "よろしく", emptyList(), learned).isEmpty())
+        learned = PhraseSuggester.recordCommit(learned, "よろしくおねがいします", "よろしくお願いします", 2L)
+        assertEquals(listOf("よろしくお願いします"), PhraseSuggester.suggest("yoroshiku", "よろしく", emptyList(), learned).map { it.text })
+        // Already-typed full text is not offered again.
+        assertTrue(PhraseSuggester.suggest("yoroshikuonegaishimasu", "よろしくおねがいします", emptyList(), learned, "よろしくお願いします").isEmpty())
+        // History is capped.
+        var big = emptyList<LearnedPhrase>()
+        for (i in 0 until PhraseSuggester.MAX_LEARNED + 20) big = PhraseSuggester.recordCommit(big, "ああ$i", "語句$i", i.toLong())
+        assertEquals(PhraseSuggester.MAX_LEARNED, big.size)
+    }
+
+    @Test
+    fun phraseChipsAppearWhileTypingAndInsertOnTap() {
+        val converter = AndroidMozcConverter(dictionaries)
+        val users = listOf(UserPhrase("めーる", "taro@example.invalid"), UserPhrase("", "090-0000-0000"))
+        val s = CompositionSession(
+            dictionaries, scoreEngine, converter,
+            phraseProvider = { raw, reading, preview -> PhraseSuggester.suggest(raw, reading, users, emptyList(), preview) }
+        )
+        for (ch in "me-ru") s.appendChar(ch)
+        val chip = s.snapshot.candidates.firstOrNull { it.kind == CandidateKind.PHRASE }
+        assertNotNull("phrase chip in ${s.snapshot.candidates}", chip)
+        assertEquals("taro@example.invalid", chip!!.text)
+        assertFalse(s.prepareCandidateCommit(chip))
+        assertEquals("taro@example.invalid", s.takePhrase(chip))
+        assertTrue(s.isEmpty)
+        for (ch in "090") s.appendChar(ch)
+        assertEquals("090-0000-0000", s.snapshot.candidates.first { it.kind == CandidateKind.PHRASE }.text)
+        s.clearAll()
+        s.appendChar('@')
+        assertTrue(s.snapshot.candidates.any { it.kind == CandidateKind.PHRASE && it.text == "taro@example.invalid" })
+    }
+
+    @Test
+    fun learnedCommitCallbackReportsReadingAndText() {
+        val converter = AndroidMozcConverter(dictionaries)
+        var got: Pair<String, String>? = null
+        val s = CompositionSession(dictionaries, scoreEngine, converter, onCommitted = { r, t -> got = r to t })
+        for (ch in "arigatou") s.appendChar(ch)
+        val text = s.commitAndLearn()
+        assertEquals("ありがとう", got?.first)
+        assertEquals(text, got?.second)
     }
 }

@@ -114,6 +114,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var selfTestLogDrawer: LinearLayout
     private lateinit var selfTestLogView: TextView
     private lateinit var userDictContainer: LinearLayout
+    private lateinit var userPhraseContainer: LinearLayout
+    private var editingPhraseText: String? = null
 
     private var cPage = 0
     private var cRail = 0
@@ -1216,6 +1218,14 @@ class MainActivity : AppCompatActivity() {
             settings.typoCorrectionEnabled = it
         }
         switchCard.addView(hairline())
+        addSwitchRow(switchCard, "◀▶キーで入力中の文字全体を移動", "OFF: 文節の長さを変え、限界で次の文節へ移動／ON: 文字単位でカーソルを移動（長さ変更は「短」「長」ボタン）", settings.arrowKeysMoveCaret) {
+            settings.arrowKeysMoveCaret = it
+        }
+        switchCard.addView(hairline())
+        addSwitchRow(switchCard, "入力途中の定型文・よく使う語句の候補", "先頭の数文字で定型文と、よく確定した語句を候補に出す（学習は端末内のみ）", settings.phraseSuggestEnabled) {
+            settings.phraseSuggestEnabled = it
+        }
+        switchCard.addView(hairline())
         addSwitchRow(switchCard, "数字段（1〜0）を常時表示", "最上段に1〜0列を固定（3段グライド領域と分離）", settings.showNumberRow) {
             settings.showNumberRow = it
             blueprintView.showNumberRow = it
@@ -1317,6 +1327,75 @@ class MainActivity : AppCompatActivity() {
         renderUserDictList()
         pane.addView(dictCard)
 
+        // 1b. User phrases (mail address, phone number, greetings) offered while typing
+        val phraseCard = makePanelFrame().apply {
+            (layoutParams as LinearLayout.LayoutParams).topMargin = dp(12)
+        }
+        phraseCard.addView(microHeading("PHRASES (定型文)").apply {
+            setPadding(dp(12), dp(10), dp(12), dp(2))
+        })
+        phraseCard.addView(TextView(this).apply {
+            text = "メールアドレス・電話番号・挨拶など。「読み」か本文の先頭数文字、または「@」を打つと候補に出ます。端末内だけに保存されます。"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+            setTextColor(cMuted)
+            setPadding(dp(12), 0, dp(12), dp(6))
+        })
+        val phraseRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(12), 0, dp(12), dp(10))
+        }
+        val triggerInput = EditText(this).apply {
+            hint = "読み(任意)"
+            inputType = InputType.TYPE_CLASS_TEXT
+            setHintTextColor(cFaint)
+            setTextColor(cText)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            setPadding(dp(9), dp(6), dp(9), dp(6))
+            background = boxBg(cSurfaceSubtle, cBorder, 5)
+            layoutParams = LinearLayout.LayoutParams(0, dp(36), 0.8f).apply { marginEnd = dp(6) }
+        }
+        val phraseInput = EditText(this).apply {
+            hint = "挿入する文字列"
+            inputType = InputType.TYPE_CLASS_TEXT
+            setHintTextColor(cFaint)
+            setTextColor(cText)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            setPadding(dp(9), dp(6), dp(9), dp(6))
+            background = boxBg(cSurfaceSubtle, cBorder, 5)
+            layoutParams = LinearLayout.LayoutParams(0, dp(36), 1.4f).apply { marginEnd = dp(6) }
+        }
+        userPhraseContainer = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val savePhraseBtn = makeCompactChip("+ 登録", filled = true) {
+            val t = phraseInput.text.toString().trim()
+            if (t.isNotEmpty()) {
+                val old = editingPhraseText
+                if (old != null) settings.updateUserPhrase(old, triggerInput.text.toString(), t)
+                else settings.addUserPhrase(triggerInput.text.toString(), t)
+                editingPhraseText = null
+                triggerInput.setText("")
+                phraseInput.setText("")
+                renderUserPhraseList(triggerInput, phraseInput)
+            }
+        }.apply {
+            layoutParams = LinearLayout.LayoutParams(dp(64), dp(36))
+        }
+        phraseRow.addView(triggerInput)
+        phraseRow.addView(phraseInput)
+        phraseRow.addView(savePhraseBtn)
+        phraseCard.addView(phraseRow)
+        phraseCard.addView(userPhraseContainer)
+        renderUserPhraseList(triggerInput, phraseInput)
+        phraseCard.addView(hairline())
+        phraseCard.addView(makeCompactChip("よく使う語句の学習履歴を消去", filled = false) {
+            settings.clearLearnedPhrases()
+        }.apply {
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(32)).apply {
+                setMargins(dp(12), dp(8), dp(12), dp(10))
+            }
+        })
+        pane.addView(phraseCard)
+
         // 2. Gesture & Conversion Reference Table
         val refCard = makePanelFrame().apply {
             (layoutParams as LinearLayout.LayoutParams).topMargin = dp(12)
@@ -1325,7 +1404,7 @@ class MainActivity : AppCompatActivity() {
             setPadding(dp(12), dp(10), dp(12), dp(6))
         })
         val shortcuts = listOf(
-            "◀ / ▶（最下段）" to "変換中は注目文節の区切れを伸縮（短/長）・編集や確定後はカーソル移動",
+            "◀ / ▶（最下段）" to "変換中は注目文節の区切れを伸縮し、限界で次の文節へ移動（設定でカーソル移動に切替可）・編集や確定後はカーソル移動",
             "空白キー左右スライド" to "入力中の文字内・確定後のテキスト内でカーソルを移動",
             "⌫ 左スワイプ" to "入力中の文字や直前単語を一括クリア",
             "縦フリック / 長押し" to "右上の数字・記号を切り替えなしで入力",
@@ -2126,6 +2205,65 @@ class MainActivity : AppCompatActivity() {
             row.addView(labelCol)
             row.addView(delBtn)
             userDictContainer.addView(row)
+        }
+    }
+
+    private fun renderUserPhraseList(triggerInput: EditText, phraseInput: EditText) {
+        userPhraseContainer.removeAllViews()
+        val entries = settings.getUserPhrases()
+        if (entries.isEmpty()) {
+            userPhraseContainer.addView(hairline())
+            userPhraseContainer.addView(TextView(this).apply {
+                text = "登録された定型文はありません"
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
+                setTextColor(cMuted)
+                setPadding(dp(12), dp(12), dp(12), dp(12))
+            })
+            return
+        }
+        for (entry in entries) {
+            userPhraseContainer.addView(hairline())
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(12), dp(8), dp(12), dp(8))
+            }
+            val labelCol = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            }
+            labelCol.addView(TextView(this).apply {
+                text = entry.text
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f)
+                setTypeface(null, Typeface.BOLD)
+                setTextColor(cText)
+            })
+            if (entry.trigger.isNotEmpty()) {
+                labelCol.addView(TextView(this).apply {
+                    text = entry.trigger
+                    typeface = Typeface.MONOSPACE
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+                    setTextColor(cMuted)
+                })
+            }
+            val editBtn = makeCompactChip("編集", filled = false) {
+                editingPhraseText = entry.text
+                triggerInput.setText(entry.trigger)
+                phraseInput.setText(entry.text)
+            }.apply {
+                layoutParams = LinearLayout.LayoutParams(dp(52), dp(30)).apply { marginEnd = dp(6) }
+            }
+            val delBtn = makeCompactChip("削除", filled = false) {
+                settings.removeUserPhrase(entry.text)
+                if (editingPhraseText == entry.text) editingPhraseText = null
+                renderUserPhraseList(triggerInput, phraseInput)
+            }.apply {
+                layoutParams = LinearLayout.LayoutParams(dp(60), dp(30))
+            }
+            row.addView(labelCol)
+            row.addView(editBtn)
+            row.addView(delBtn)
+            userPhraseContainer.addView(row)
         }
     }
 

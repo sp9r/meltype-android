@@ -4,6 +4,9 @@ import android.content.Context
 import android.content.SharedPreferences
 import org.json.JSONArray
 import org.json.JSONObject
+import io.github.sp9r.meltype.core.LearnedPhrase
+import io.github.sp9r.meltype.core.PhraseSuggester
+import io.github.sp9r.meltype.core.UserPhrase
 
 enum class ThemeMode(val key: String, val labelJa: String) {
     SYSTEM("system", "システム連動"),
@@ -134,6 +137,16 @@ class MeltypeSettings(context: Context) {
         get() = prefs.getBoolean(KEY_TYPO_CORRECTION, true)
         set(value) = prefs.edit().putBoolean(KEY_TYPO_CORRECTION, value).apply()
 
+    /** Left/right arrow keys move a text caret through the whole composition instead of resizing the clause. */
+    var arrowKeysMoveCaret: Boolean
+        get() = prefs.getBoolean(KEY_ARROW_CARET, false)
+        set(value) = prefs.edit().putBoolean(KEY_ARROW_CARET, value).apply()
+
+    /** Prefix completion chips (user phrases + frequently committed phrases). */
+    var phraseSuggestEnabled: Boolean
+        get() = prefs.getBoolean(KEY_PHRASE_SUGGEST, true)
+        set(value) = prefs.edit().putBoolean(KEY_PHRASE_SUGGEST, value).apply()
+
     /** Local usage log (commits, candidate picks, language switches) to find what to improve. */
     var usageLoggingEnabled: Boolean
         get() = prefs.getBoolean(KEY_USAGE_LOGGING, true)
@@ -260,7 +273,81 @@ class MeltypeSettings(context: Context) {
         prefs.edit().putString(KEY_USER_DICT, arr.toString()).apply()
     }
 
+    fun getUserPhrases(): List<UserPhrase> {
+        val raw = prefs.getString(KEY_USER_PHRASES, null) ?: return emptyList()
+        return runCatching {
+            val arr = JSONArray(raw)
+            buildList {
+                for (i in 0 until arr.length()) {
+                    val obj = arr.optJSONObject(i) ?: continue
+                    val text = obj.optString("text")
+                    if (text.isNotEmpty()) add(UserPhrase(obj.optString("trigger").trim(), text))
+                }
+            }
+        }.getOrDefault(emptyList())
+    }
+
+    fun addUserPhrase(trigger: String, text: String) {
+        val t = text.trim()
+        if (t.isEmpty()) return
+        val trig = trigger.trim()
+        val next = listOf(UserPhrase(trig, t)) + getUserPhrases().filterNot { it.text == t }
+        saveUserPhrases(next)
+    }
+
+    /** Replaces the phrase whose text is [oldText] (edit); keeps its position. */
+    fun updateUserPhrase(oldText: String, trigger: String, text: String) {
+        val t = text.trim()
+        if (t.isEmpty()) return
+        val list = getUserPhrases()
+        val idx = list.indexOfFirst { it.text == oldText }
+        if (idx < 0) { addUserPhrase(trigger, t); return }
+        val next = list.toMutableList()
+        next[idx] = UserPhrase(trigger.trim(), t)
+        saveUserPhrases(next.distinctBy { it.text })
+    }
+
+    fun removeUserPhrase(text: String) = saveUserPhrases(getUserPhrases().filterNot { it.text == text })
+
+    private fun saveUserPhrases(items: List<UserPhrase>) {
+        val arr = JSONArray()
+        for (p in items) arr.put(JSONObject().apply { put("trigger", p.trigger); put("text", p.text) })
+        prefs.edit().putString(KEY_USER_PHRASES, arr.toString()).apply()
+    }
+
+    /** Commit history for phrase completion; stored on this device only. */
+    fun getLearnedPhrases(): List<LearnedPhrase> {
+        val raw = prefs.getString(KEY_LEARNED_PHRASES, null) ?: return emptyList()
+        return runCatching {
+            val arr = JSONArray(raw)
+            buildList {
+                for (i in 0 until arr.length()) {
+                    val o = arr.optJSONObject(i) ?: continue
+                    val text = o.optString("text")
+                    if (text.isNotEmpty()) add(LearnedPhrase(o.optString("reading"), text, o.optInt("count", 1), o.optLong("last", 0L)))
+                }
+            }
+        }.getOrDefault(emptyList())
+    }
+
+    fun recordCommittedPhrase(reading: String, text: String) {
+        val cur = getLearnedPhrases()
+        val next = PhraseSuggester.recordCommit(cur, reading, text, System.currentTimeMillis())
+        if (next === cur) return
+        val arr = JSONArray()
+        for (l in next) arr.put(JSONObject().apply {
+            put("reading", l.reading); put("text", l.text); put("count", l.count); put("last", l.lastUsed)
+        })
+        prefs.edit().putString(KEY_LEARNED_PHRASES, arr.toString()).apply()
+    }
+
+    fun clearLearnedPhrases() = prefs.edit().remove(KEY_LEARNED_PHRASES).apply()
+
     companion object {
+        private const val KEY_ARROW_CARET = "arrow_keys_move_caret"
+        private const val KEY_PHRASE_SUGGEST = "phrase_suggest_enabled"
+        private const val KEY_USER_PHRASES = "user_phrases"
+        private const val KEY_LEARNED_PHRASES = "learned_phrases"
         private const val PREFS_NAME = "meltype_prefs"
         private const val KEY_GLIDE_ENABLED = "glide_enabled"
         private const val KEY_GLIDE_ENGLISH_ONLY = "glide_english_only"

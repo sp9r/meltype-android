@@ -61,6 +61,7 @@ import io.github.sp9r.meltype.core.GlideEvalLogger
 import io.github.sp9r.meltype.core.MeltypeDictionaries
 import io.github.sp9r.meltype.core.RomajiDetector
 import io.github.sp9r.meltype.core.MozcRuntime
+import io.github.sp9r.meltype.core.PhraseSuggester
 import io.github.sp9r.meltype.core.ScoreEngine
 import io.github.sp9r.meltype.glide.GlideCandidate
 import io.github.sp9r.meltype.glide.GlideDecoder
@@ -184,7 +185,21 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             dictionaries = dictionaries,
             scoreEngine = scoreEngine,
             converter = converter,
-            typoCorrectionEnabled = { settings.typoCorrectionEnabled }
+            typoCorrectionEnabled = { settings.typoCorrectionEnabled },
+            phraseProvider = { raw, reading, preview ->
+                if (!settings.phraseSuggestEnabled || isPasswordField) emptyList()
+                else PhraseSuggester.suggest(
+                    raw, reading,
+                    settings.getUserPhrases(),
+                    if (settings.learningEnabled) settings.getLearnedPhrases() else emptyList(),
+                    preview
+                )
+            },
+            onCommitted = { reading, text ->
+                if (settings.learningEnabled && settings.phraseSuggestEnabled && !isPasswordField && !isIncognitoField) {
+                    settings.recordCommittedPhrase(reading, text)
+                }
+            }
         )
 
         bgExecutor.execute {
@@ -1601,8 +1616,13 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         if (!session.isEmpty) {
             // While converting (or live-converting), ◀▶ shorten / lengthen the focused clause (including alphanumeric).
             // The focus moves with ‹ › on the clause bar or by tapping a clause; Spacebar slide / reading badge moves the caret.
+            if (settings.arrowKeysMoveCaret) {
+                noteFix("caret", conversionFix = false)
+                renderSnapshot(session.moveCaret(delta, getSurroundingTextBefore()))
+                return
+            }
             noteFix("resize")
-            renderSnapshot(session.resizeFocusedClause(delta, getSurroundingTextBefore()))
+            renderSnapshot(session.stepThroughComposition(delta, getSurroundingTextBefore()))
         } else {
             clearUndoCommit()
             val code = if (delta < 0) KeyEvent.KEYCODE_DPAD_LEFT else KeyEvent.KEYCODE_DPAD_RIGHT
@@ -1775,6 +1795,26 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         }
         val rawBefore = snap.rawInput
         val focusedClause = snap.clauses.getOrNull(snap.focusedClauseIndex)
+        if (item.kind == CandidateKind.PHRASE) {
+            val readingBefore = snap.clauses.joinToString("") { it.reading }
+            noteFix("pick[phrase]:${rawBefore}→${item.text}", conversionFix = false)
+            val text = session.takePhrase(item)
+            currentInputConnection?.commitText(text, 1)
+            recordUndoCommit(rawBefore, text)
+            if (settings.learningEnabled && !isPasswordField && !isIncognitoField) settings.recordCommittedPhrase(readingBefore, text)
+            isExpandedPanelOpen = false
+            renderSnapshot(session.snapshot)
+            return
+        }
+        if (item.kind == CandidateKind.CORRECTION) {
+            // One tap on a correction confirms it (and the clauses before it).
+            noteFix("pick[correction]:${focusedClause?.reading.orEmpty()}→${item.text}", conversionFix = false)
+            session.applyCorrectionAndFocus(item, getSurroundingTextBefore())
+            commitFocusedPrefixAndRender("correction")
+            if (closeExpanded || session.isEmpty) isExpandedPanelOpen = false
+            renderSnapshot(session.snapshot)
+            return
+        }
         noteFix(
             "pick[${item.kind.name.lowercase()}]:${focusedClause?.reading.orEmpty()}→${item.text}",
             conversionFix = item.kind != CandidateKind.CORRECTION

@@ -9,7 +9,9 @@ enum class CandidateKind {
     UTILITY,
     EMOJI,
     /** Typo correction ("補正") or the literal "そのまま" reading of an auto-corrected segment. */
-    CORRECTION
+    CORRECTION,
+    /** Prefix completion from user-defined phrases or frequently committed phrases. */
+    PHRASE
 }
 
 data class CandidateItem(
@@ -70,7 +72,11 @@ class CompositionSession(
     private val dictionaries: MeltypeDictionaries,
     private val scoreEngine: ScoreEngine,
     private val converter: KanjiConverter,
-    private val typoCorrectionEnabled: () -> Boolean = { true }
+    private val typoCorrectionEnabled: () -> Boolean = { true },
+    /** Prefix completions for (raw input, kana reading); empty by default. */
+    private val phraseProvider: (raw: String, reading: String, preview: String) -> List<PhraseSuggestion> = { _, _, _ -> emptyList() },
+    /** Called with (reading, committed text) when a whole composition is committed; used for phrase learning. */
+    private val onCommitted: (reading: String, text: String) -> Unit = { _, _ -> }
 ) {
     private val buffer = StringBuilder()
     private val bufferSpatialHints = ArrayList<Map<Char, Float>>()
@@ -834,7 +840,7 @@ class CompositionSession(
      * (Gboard style: picking a conversion confirms it). Returns false when [item] is not one to commit.
      */
     fun prepareCandidateCommit(item: CandidateItem, surroundingContext: String? = null): Boolean {
-        if (item.kind == CandidateKind.GLIDE_ALT || item.kind == CandidateKind.CORRECTION) return false
+        if (item.kind == CandidateKind.GLIDE_ALT || item.kind == CandidateKind.CORRECTION || item.kind == CandidateKind.PHRASE) return false
         val clauses = cachedSnapshot.clauses
         if (clauses.isEmpty()) return false
         val idx = (if (item.targetClauseIndex in clauses.indices) item.targetClauseIndex else focusedClauseIdx)
@@ -873,6 +879,29 @@ class CompositionSession(
             focusedClauseIdx = idx + 1
         }
         return recompute(surroundingContext, keepFocus = true)
+    }
+
+    /**
+     * Correction chip tap: applies the correction and focuses the clause it produced, so the caller can
+     * commit up to it with one tap (no second confirmation step).
+     */
+    fun applyCorrectionAndFocus(item: CandidateItem, surroundingContext: String? = null): CompositionSnapshot {
+        leaveEditing()
+        val snap = applyCorrection(item, surroundingContext)
+        val anchor = if (item.keepLiteralStart >= 0) item.keepLiteralStart else item.replaceStart
+        val segs = scoreEngine.segment(buffer.toString(), overrides)
+        val segIdx = segs.indexOfFirst { anchor >= it.startIndex && anchor < it.endIndex }
+        val idx = snap.clauses.indexOfLast { it.segmentIndex == segIdx }
+        if (idx < 0) return snap
+        converting = true
+        focusedClauseIdx = idx
+        return recompute(surroundingContext, keepFocus = true)
+    }
+
+    /** Phrase chip tap: drops the composition and returns the phrase to insert instead. */
+    fun takePhrase(item: CandidateItem): String {
+        clearAll()
+        return item.text
     }
 
     private fun applyCorrection(item: CandidateItem, surroundingContext: String?): CompositionSnapshot {
@@ -923,6 +952,22 @@ class CompositionSession(
         return recompute(null, keepFocus = true)
     }
 
+    /**
+     * Left/right arrow during a composition: resizes the focused clause; when the clause cannot move
+     * any further that way, focus carries on to the neighbouring clause, so repeated presses reach
+     * every part of the composition instead of stopping at one conversion unit.
+     */
+    fun stepThroughComposition(delta: Int, surroundingContext: String? = null): CompositionSnapshot {
+        if (delta == 0 || cachedSnapshot.clauses.isEmpty()) return cachedSnapshot
+        val before = cachedSnapshot
+        val focusBefore = focusedClauseIdx
+        val resized = resizeFocusedClause(delta, surroundingContext)
+        if (resized !== before) return resized
+        val target = (focusBefore + if (delta < 0) -1 else 1).coerceIn(0, cachedSnapshot.clauses.lastIndex)
+        if (target == focusBefore) return cachedSnapshot
+        return focusClause(target)
+    }
+
     fun focusClause(index: Int): CompositionSnapshot {
         val count = cachedSnapshot.clauses.size
         if (index in 0 until count) {
@@ -952,6 +997,7 @@ class CompositionSession(
             converter.learn(surroundingContext, mozcClauses)
         }
         rememberCommitted(snap.clauses.map { Triple(it.reading, it.text, it.isEnglish) })
+        onCommitted(snap.clauses.joinToString("") { it.reading }, committed)
         clearAll()
         return committed
     }
@@ -1559,6 +1605,19 @@ class CompositionSession(
         if (focusedCorrections.isNotEmpty()) {
             val insertAt = if (barCandidates.isNotEmpty()) 1 else 0
             barCandidates.addAll(insertAt, focusedCorrections)
+        }
+
+        // Prefix completion (user phrases / frequently committed phrases), shown while typing.
+        if (!converting && !kanaRevert && caretRaw == null && raw.isNotEmpty()) {
+            val previewNow = displayClauses.joinToString("") { it.text }
+            val phrases = phraseProvider(raw, displayClauses.joinToString("") { it.reading }, previewNow)
+            if (phrases.isNotEmpty()) {
+                val insertAt = minOf(2, barCandidates.size)
+                barCandidates.addAll(
+                    insertAt,
+                    phrases.map { CandidateItem(text = it.text, subtitle = it.subtitle, kind = CandidateKind.PHRASE) }
+                )
+            }
         }
 
         val scriptVariants = buildScriptVariants(focused, displayClauses.count { it.segmentIndex == focused?.segmentIndex })
