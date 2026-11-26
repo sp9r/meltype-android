@@ -2410,7 +2410,7 @@ class MainActivity : AppCompatActivity() {
             },
             formatLabel = { value ->
                 val pct = (value * 100f).roundToInt().coerceIn(65, 155)
-                val baseDp = if (settings.showNumberRow) 264f else 224f
+                val baseDp = io.github.sp9r.meltype.core.ImeHeightSpec.keyboardBaseHeightDp(settings.showNumberRow)
                 val approxDp = (baseDp * value).roundToInt()
                 "${pct}% · ${approxDp}dp"
             },

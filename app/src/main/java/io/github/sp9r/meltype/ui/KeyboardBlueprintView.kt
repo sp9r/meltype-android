@@ -11,6 +11,7 @@ import android.view.View
 import io.github.sp9r.meltype.BottomKeyMode
 import io.github.sp9r.meltype.OneHandedMode
 import io.github.sp9r.meltype.PunctuationStyle
+import io.github.sp9r.meltype.core.ImeHeightSpec
 import kotlin.math.roundToInt
 
 /**
@@ -97,7 +98,7 @@ class KeyboardBlueprintView @JvmOverloads constructor(
         canvas.drawRoundRect(0.5f * d, 0.5f * d, width - 0.5f * d, height - 0.5f * d, 6f * d, 6f * d, paintStroke)
 
         // Metric telemetry header inside preview
-        val baseDp = if (showNumberRow) 264f else 224f
+        val baseDp = ImeHeightSpec.keyboardBaseHeightDp(showNumberRow)
         val approxDp = (baseDp * heightScale).roundToInt()
         val pct = (heightScale * 100f).roundToInt()
         paintMono.textSize = 10.5f * d

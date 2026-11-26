@@ -16,6 +16,7 @@ import io.github.sp9r.meltype.BottomKeyMode
 import io.github.sp9r.meltype.OneHandedMode
 import io.github.sp9r.meltype.PunctuationStyle
 import io.github.sp9r.meltype.ThemeMode
+import io.github.sp9r.meltype.core.ImeHeightSpec
 import io.github.sp9r.meltype.glide.KeyLayoutGeometry
 import io.github.sp9r.meltype.glide.TouchPoint
 import kotlin.math.abs
@@ -321,12 +322,13 @@ class QwertyKeyboardView @JvmOverloads constructor(
     private fun sp(v: Float): Float = v * resources.displayMetrics.scaledDensity
 
     fun currentBaseHeightDp(): Float {
-        return if (layer == Layer.QWERTY && showNumberRow) 264f else 224f
+        return ImeHeightSpec.keyboardBaseHeightDp(showNumberRow)
     }
 
     override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
         val width = MeasureSpec.getSize(widthMeasureSpec)
-        val desiredHeight = dp(currentBaseHeightDp() * heightScale).toInt()
+        val bodyDp = ImeHeightSpec.bodyHeightDp(showNumberRow, heightScale)
+        val desiredHeight = dp(bodyDp.toFloat()).toInt()
         setMeasuredDimension(width, resolveSize(desiredHeight, heightMeasureSpec))
     }
 
@@ -525,7 +527,7 @@ class QwertyKeyboardView @JvmOverloads constructor(
                         1.15f to VisualKeyBuilder("ABC", "", KeyKind.LAYER_ABC, isFn = true),
                         1.15f to VisualKeyBuilder("テンキー", "", KeyKind.LAYER_NUMPAD, isFn = true),
                         0.85f to VisualKeyBuilder(",", "！", KeyKind.CHAR, ',', '！', isFn = false),
-                        2.30f to VisualKeyBuilder("スペース", "", KeyKind.SPACE, isFn = false),
+                        2.50f to VisualKeyBuilder("スペース", "", KeyKind.SPACE, isFn = false),
                         0.85f to VisualKeyBuilder(".", "？", KeyKind.CHAR, '.', '？', isFn = false),
                         0.85f to VisualKeyBuilder("◀", "↕", KeyKind.CURSOR_LEFT, isFn = true),
                         0.85f to VisualKeyBuilder("▶", "↕", KeyKind.CURSOR_RIGHT, isFn = true),
@@ -559,7 +561,7 @@ class QwertyKeyboardView @JvmOverloads constructor(
                         1.15f to VisualKeyBuilder("ABC", "", KeyKind.LAYER_ABC, isFn = true),
                         1.15f to VisualKeyBuilder("テンキー", "", KeyKind.LAYER_NUMPAD, isFn = true),
                         0.85f to VisualKeyBuilder("<", "", KeyKind.CHAR, '<', isFn = false),
-                        2.30f to VisualKeyBuilder("スペース", "", KeyKind.SPACE, isFn = false),
+                        2.50f to VisualKeyBuilder("スペース", "", KeyKind.SPACE, isFn = false),
                         0.85f to VisualKeyBuilder(">", "", KeyKind.CHAR, '>', isFn = false),
                         0.85f to VisualKeyBuilder("◀", "↕", KeyKind.CURSOR_LEFT, isFn = true),
                         0.85f to VisualKeyBuilder("▶", "↕", KeyKind.CURSOR_RIGHT, isFn = true),

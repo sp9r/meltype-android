@@ -60,6 +60,7 @@ import io.github.sp9r.meltype.core.CompositionSnapshot
 import io.github.sp9r.meltype.core.EmojiCatalog
 import io.github.sp9r.meltype.core.EmojiCategory
 import io.github.sp9r.meltype.core.GlideEvalLogger
+import io.github.sp9r.meltype.core.ImeHeightSpec
 import io.github.sp9r.meltype.core.MeltypeDictionaries
 import io.github.sp9r.meltype.core.RomajiDetector
 import io.github.sp9r.meltype.core.MozcRuntime
@@ -111,28 +112,27 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
     private lateinit var clipboardImageStore: ClipboardImageStore
 
     private lateinit var rootContainer: LinearLayout
-    private lateinit var clauseBar: LinearLayout
-    private lateinit var clauseTopRow: LinearLayout
-    private lateinit var clauseScroll: HorizontalScrollView
-    private lateinit var clausePillRow: LinearLayout
-    private lateinit var prevClauseBtn: TextView
-    private lateinit var nextClauseBtn: TextView
-    private lateinit var partialCommitBtn: TextView
-    private lateinit var langSwitchBtn: TextView
-    private lateinit var boundaryBar: LinearLayout
-    private lateinit var shrinkClauseBtn: TextView
-    private lateinit var boundaryScroll: HorizontalScrollView
-    private lateinit var boundaryKanaRow: LinearLayout
-    private lateinit var extendClauseBtn: TextView
 
     private lateinit var topBar: LinearLayout
     private lateinit var traceBadge: TextView
     private lateinit var candidateScroll: HorizontalScrollView
     private lateinit var candidateRow: LinearLayout
+    private lateinit var clauseModeBtn: TextView
     private lateinit var emojiBarBtn: TextView
     private lateinit var expandPanelBtn: TextView
     private lateinit var oneHandBtn: TextView
     private lateinit var settingsBtn: TextView
+
+    private lateinit var clauseScroll: HorizontalScrollView
+    private lateinit var clausePillRow: LinearLayout
+    private lateinit var partialCommitBtn: TextView
+    private lateinit var langSwitchBtn: TextView
+    private lateinit var backToCandidatesBtn: TextView
+
+    private lateinit var emojiSearchQueryPill: TextView
+    private lateinit var emojiSearchResultScroll: HorizontalScrollView
+    private lateinit var emojiSearchResultRow: LinearLayout
+    private lateinit var emojiSearchCloseBtn: TextView
 
     private lateinit var dividerView: View
     private lateinit var keyboardView: QwertyKeyboardView
@@ -148,6 +148,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
     private lateinit var expandedFooter: LinearLayout
 
     private var isExpandedPanelOpen: Boolean = false
+    private var isClauseSubMode: Boolean = false
     private var expandedTab: ExpandedTab = ExpandedTab.CANDIDATES
     private var selectedEmojiCategory: Int = 0
     private var isEmojiSearchActive: Boolean = false
@@ -220,111 +221,14 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             )
         }
 
-        // Clause focus & 1-tap boundary adjustment bar (visible while composing)
-        clauseBar = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            visibility = View.GONE
-            setPadding(dp(6), dp(3), dp(6), dp(2))
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            )
-        }
-
-        clauseTopRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                dp(34)
-            )
-        }
-
-        clauseScroll = HorizontalScrollView(this).apply {
-            isHorizontalScrollBarEnabled = false
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f)
-        }
-        clausePillRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
-        clauseScroll.addView(clausePillRow)
-
-        prevClauseBtn = makeRailButton("‹").apply {
-            minWidth = dp(30)
-            setOnClickListener { renderSnapshot(session.moveFocus(-1)) }
-        }
-        nextClauseBtn = makeRailButton("›").apply {
-            minWidth = dp(30)
-            setOnClickListener { renderSnapshot(session.moveFocus(+1)) }
-        }
-        partialCommitBtn = makeRailButton("確定✓").apply {
-            setOnClickListener {
-                glidePreviewSeq.incrementAndGet()
-                commitFocusedPrefixAndRender("partial")
-            }
-        }
-        langSwitchBtn = makeRailButton("日/英").apply {
-            setOnClickListener { onToggleSegmentLanguage() }
-        }
-
-        clauseTopRow.addView(clauseScroll)
-        clauseTopRow.addView(prevClauseBtn)
-        clauseTopRow.addView(nextClauseBtn)
-        clauseTopRow.addView(partialCommitBtn)
-        clauseTopRow.addView(langSwitchBtn)
-
-        boundaryBar = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            visibility = View.GONE
-            setPadding(0, dp(3), 0, dp(1))
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                dp(34)
-            )
-        }
-        shrinkClauseBtn = makeRailButton("◀ 短").apply {
-            minWidth = dp(52)
-            setPadding(dp(8), dp(3), dp(8), dp(3))
-            setOnClickListener {
-                noteFix("resize"); renderSnapshot(session.resizeFocusedClause(-1, getSurroundingTextBefore()))
-            }
-        }
-        boundaryScroll = HorizontalScrollView(this).apply {
-            isHorizontalScrollBarEnabled = false
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f).apply {
-                marginStart = dp(2)
-                marginEnd = dp(2)
-            }
-        }
-        boundaryKanaRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
-        boundaryScroll.addView(boundaryKanaRow)
-        extendClauseBtn = makeRailButton("長 ▶").apply {
-            minWidth = dp(52)
-            setPadding(dp(8), dp(3), dp(8), dp(3))
-            setOnClickListener {
-                noteFix("resize"); renderSnapshot(session.resizeFocusedClause(+1, getSurroundingTextBefore()))
-            }
-        }
-        boundaryBar.addView(shrinkClauseBtn)
-        boundaryBar.addView(boundaryScroll)
-        boundaryBar.addView(extendClauseBtn)
-
-        clauseBar.addView(clauseTopRow)
-        clauseBar.addView(boundaryBar)
-
-        // Top Compact-Rail bar (trace + candidate/quick-symbol chips + expand/onehand/settings)
+        // Single fixed-height (44dp) top header bar across all states (idle, candidates, clause sub-mode, emoji search)
         topBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setPadding(dp(6), dp(3), dp(6), dp(3))
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
-                dp(42)
+                dp(ImeHeightSpec.TOP_BAR_HEIGHT_DP)
             )
         }
 
@@ -355,6 +259,16 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         }
         candidateScroll.addView(candidateRow)
 
+        clauseModeBtn = makeRailButton("文節").apply {
+            visibility = View.GONE
+            setOnClickListener {
+                if (session.isEmpty) return@setOnClickListener
+                isClauseSubMode = true
+                val dark = isDarkTheme()
+                renderTopBar(session.snapshot, dark, accentColor(dark))
+            }
+        }
+
         emojiBarBtn = makeRailButton("").apply {
             setCompoundDrawables(SmileyDrawable(dp(17)).also { it.setBounds(0, 0, dp(17), dp(17)) }, null, null, null)
             minWidth = dp(34)
@@ -364,11 +278,14 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
 
         expandPanelBtn = makeRailButton("▼").apply {
             setOnClickListener {
-                if (!isExpandedPanelOpen) {
+                val panelVisible = isExpandedPanelOpen && !(expandedTab == ExpandedTab.EMOJI && isEmojiSearchActive)
+                if (!panelVisible) {
                     expandedTab = ExpandedTab.CANDIDATES
                     isExpandedPanelOpen = true
+                    isEmojiSearchActive = false
+                    emojiSearchQuery.setLength(0)
                 } else {
-                    isExpandedPanelOpen = false
+                    closeExpandedPanel()
                 }
                 syncExpandedPanelState(session.snapshot)
             }
@@ -391,15 +308,91 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             setOnClickListener { onOpenSettings() }
         }
 
+        // In-place clause sub-mode views inside topBar
+        clauseScroll = HorizontalScrollView(this).apply {
+            visibility = View.GONE
+            isHorizontalScrollBarEnabled = false
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f)
+        }
+        clausePillRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        clauseScroll.addView(clausePillRow)
+
+        partialCommitBtn = makeRailButton("確定✓").apply {
+            visibility = View.GONE
+            setOnClickListener {
+                glidePreviewSeq.incrementAndGet()
+                commitFocusedPrefixAndRender("partial")
+            }
+        }
+        langSwitchBtn = makeRailButton("日/英").apply {
+            visibility = View.GONE
+            setOnClickListener { onToggleSegmentLanguage() }
+        }
+        backToCandidatesBtn = makeRailButton("候補").apply {
+            visibility = View.GONE
+            setOnClickListener {
+                isClauseSubMode = false
+                val dark = isDarkTheme()
+                renderTopBar(session.snapshot, dark, accentColor(dark))
+            }
+        }
+
+        // In-place emoji search views inside topBar
+        emojiSearchQueryPill = makeRailButton("🔍").apply {
+            visibility = View.GONE
+            isSingleLine = true
+            ellipsize = TextUtils.TruncateAt.END
+            maxWidth = dp(116)
+            setOnClickListener {
+                if (emojiSearchQuery.isNotEmpty()) {
+                    emojiSearchQuery.setLength(0)
+                    val dark = isDarkTheme()
+                    renderTopBar(session.snapshot, dark, accentColor(dark))
+                }
+            }
+        }
+        emojiSearchResultScroll = HorizontalScrollView(this).apply {
+            visibility = View.GONE
+            isHorizontalScrollBarEnabled = false
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f)
+        }
+        emojiSearchResultRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        emojiSearchResultScroll.addView(emojiSearchResultRow)
+        emojiSearchCloseBtn = makeRailButton("✕").apply {
+            visibility = View.GONE
+            setOnClickListener {
+                isEmojiSearchActive = false
+                emojiSearchQuery.setLength(0)
+                syncExpandedPanelState(session.snapshot)
+            }
+        }
+
         topBar.addView(traceBadge)
         topBar.addView(candidateScroll)
+        topBar.addView(clauseModeBtn)
         topBar.addView(emojiBarBtn)
         topBar.addView(expandPanelBtn)
         topBar.addView(oneHandBtn)
         topBar.addView(settingsBtn)
+        topBar.addView(clauseScroll)
+        topBar.addView(partialCommitBtn)
+        topBar.addView(langSwitchBtn)
+        topBar.addView(backToCandidatesBtn)
+        topBar.addView(emojiSearchQueryPill)
+        topBar.addView(emojiSearchResultScroll)
+        topBar.addView(emojiSearchCloseBtn)
 
         dividerView = View(this).apply {
-            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(1))
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                dp(ImeHeightSpec.DIVIDER_HEIGHT_DP)
+            )
         }
 
         keyboardView = QwertyKeyboardView(this).apply {
@@ -410,13 +403,13 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             )
         }
 
-        // Expandable overlay panel replacing keyboardView bounds for candidates, wide emoji grid, kaomoji & tools
+        // Expandable overlay panel replacing keyboardView bounds at identical height
         expandedPanel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             visibility = View.GONE
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
-                dp(250)
+                dp(ImeHeightSpec.bodyHeightDp(showNumberRow = true, heightScale = 1.0f))
             )
         }
         expandedHeader = LinearLayout(this).apply {
@@ -456,7 +449,6 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         expandedPanel.addView(expandedBodyFrame)
         expandedPanel.addView(expandedFooter)
 
-        rootContainer.addView(clauseBar)
         rootContainer.addView(topBar)
         rootContainer.addView(dividerView)
         rootContainer.addView(expandedPanel)
@@ -540,13 +532,18 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         if (discard) discardCompositionWithoutCommit()
     }
 
+    private fun closeExpandedPanel() {
+        isExpandedPanelOpen = false
+        isEmojiSearchActive = false
+        emojiSearchQuery.setLength(0)
+    }
+
     override fun onStartInputView(info: EditorInfo?, restarting: Boolean) {
         super.onStartInputView(info, restarting)
         isPasswordField = isPasswordInputType(info)
         isIncognitoField = isIncognito(info)
-        isExpandedPanelOpen = false
-        isEmojiSearchActive = false
-        emojiSearchQuery.setLength(0)
+        isClauseSubMode = false
+        closeExpandedPanel()
         expandedTab = ExpandedTab.CANDIDATES
         captureClipboard()
         applySettingsToViews()
@@ -976,7 +973,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             pasteOfferImage = null
             clearUndoCommit()
             if (isExpandedPanelOpen) {
-                isExpandedPanelOpen = false
+                closeExpandedPanel()
             }
             if (shouldLogEval()) evalLogger.logEvent("paste_image", chosenMime, "${entry.width}x${entry.height}")
             renderSnapshot(session.snapshot)
@@ -1039,7 +1036,8 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
     override fun onFinishInputView(finishingInput: Boolean) {
         glidePreviewSeq.incrementAndGet()
         super.onFinishInputView(finishingInput)
-        isExpandedPanelOpen = false
+        isClauseSubMode = false
+        closeExpandedPanel()
         if (!session.isEmpty) {
             val raw = session.snapshot.rawInput
             val committed = session.commitAndLearn(getSurroundingTextBefore())
@@ -1072,6 +1070,9 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         }
     }
 
+    private fun accentColor(dark: Boolean): Int =
+        if (dark) Color.parseColor("#5C8AC4") else Color.parseColor("#4A6F9E")
+
     private fun applySettingsToViews() {
         if (!::keyboardView.isInitialized) return
         keyboardView.glideEnabled = settings.glideEnabled
@@ -1101,18 +1102,17 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         if (::rootContainer.isInitialized) {
             rootContainer.setBackgroundColor(trayBg)
         }
-        clauseBar.setBackgroundColor(barBg)
         topBar.setBackgroundColor(barBg)
         expandedPanel.setBackgroundColor(trayBg)
         dividerView.setBackgroundColor(if (dark) Color.parseColor("#2E333C") else Color.parseColor("#DFE2E6"))
         syncImeWindowBar(dark, trayBg)
         styleRailButton(traceBadge, dark, subtle = true)
-        styleRailButton(prevClauseBtn, dark, subtle = false)
-        styleRailButton(nextClauseBtn, dark, subtle = false)
-        styleRailButton(shrinkClauseBtn, dark, subtle = false)
-        styleRailButton(extendClauseBtn, dark, subtle = false)
+        styleRailButton(clauseModeBtn, dark, subtle = false)
         styleRailButton(partialCommitBtn, dark, subtle = false)
         styleRailButton(langSwitchBtn, dark, subtle = false)
+        styleRailButton(backToCandidatesBtn, dark, subtle = false)
+        styleRailButton(emojiSearchQueryPill, dark, subtle = true)
+        styleRailButton(emojiSearchCloseBtn, dark, subtle = false)
         styleRailButton(emojiBarBtn, dark, subtle = false)
         (emojiBarBtn.compoundDrawables[0] as? SmileyDrawable)?.color = emojiBarBtn.currentTextColor
         styleRailButton(expandPanelBtn, dark, subtle = false)
@@ -1251,11 +1251,12 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         if (isExpandedPanelOpen && expandedTab == ExpandedTab.EMOJI && isEmojiSearchActive) {
             if (ch == ' ') return
             emojiSearchQuery.append(ch.lowercaseChar())
-            populateExpandedPanel(session.snapshot)
+            val dark = isDarkTheme()
+            renderTopBar(session.snapshot, dark, accentColor(dark))
             return
         }
         if (isExpandedPanelOpen) {
-            isExpandedPanelOpen = false
+            closeExpandedPanel()
         }
         if (isPasswordField) {
             currentInputConnection?.commitText(ch.toString(), 1)
@@ -1378,7 +1379,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
 
     override fun onPunctuation(isPeriod: Boolean) {
         glidePreviewSeq.incrementAndGet()
-        if (isExpandedPanelOpen) isExpandedPanelOpen = false
+        if (isExpandedPanelOpen) closeExpandedPanel()
         if (isPasswordField) {
             currentInputConnection?.commitText(if (isPeriod) "." else ",", 1)
             return
@@ -1460,14 +1461,15 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         if (isExpandedPanelOpen && expandedTab == ExpandedTab.EMOJI && isEmojiSearchActive) {
             if (emojiSearchQuery.isNotEmpty()) {
                 emojiSearchQuery.deleteCharAt(emojiSearchQuery.length - 1)
-                populateExpandedPanel(session.snapshot)
+                val dark = isDarkTheme()
+                renderTopBar(session.snapshot, dark, accentColor(dark))
             } else {
                 isEmojiSearchActive = false
                 syncExpandedPanelState(session.snapshot)
             }
             return
         }
-        if (isExpandedPanelOpen) isExpandedPanelOpen = false
+        if (isExpandedPanelOpen) closeExpandedPanel()
         if (!session.isEmpty) {
             val snapBefore = session.snapshot
             val snap = session.backspace(getSurroundingTextBefore())
@@ -1734,9 +1736,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
 
     override fun onToggleEmojiPanel() {
         if (isExpandedPanelOpen && expandedTab == ExpandedTab.EMOJI) {
-            isExpandedPanelOpen = false
-            isEmojiSearchActive = false
-            emojiSearchQuery.setLength(0)
+            closeExpandedPanel()
         } else {
             expandedTab = ExpandedTab.EMOJI
             isExpandedPanelOpen = true
@@ -1784,7 +1784,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
 
     override fun onGlideCommit(points: List<TouchPoint>, letterBounds: RectF) {
         glidePreviewSeq.incrementAndGet()
-        if (isExpandedPanelOpen) isExpandedPanelOpen = false
+        if (isExpandedPanelOpen) closeExpandedPanel()
         if (isPasswordField) return
         clearUndoCommit()
         val decoder = glideDecoder ?: AppEngineHolder.getGlideDecoder(applicationContext).also { glideDecoder = it }
@@ -1853,7 +1853,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             currentInputConnection?.commitText(text, 1)
             recordUndoCommit(rawBefore, text)
             if (settings.learningEnabled && !isPasswordField && !isIncognitoField) settings.recordCommittedPhrase(readingBefore, text)
-            isExpandedPanelOpen = false
+            closeExpandedPanel()
             renderSnapshot(session.snapshot)
             return
         }
@@ -1862,7 +1862,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             noteFix("pick[correction]:${focusedClause?.reading.orEmpty()}→${item.text}", conversionFix = false)
             session.applyCorrectionAndFocus(item, getSurroundingTextBefore())
             commitFocusedPrefixAndRender("correction")
-            if (closeExpanded || session.isEmpty) isExpandedPanelOpen = false
+            if (closeExpanded || session.isEmpty) closeExpandedPanel()
             renderSnapshot(session.snapshot)
             return
         }
@@ -1883,7 +1883,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             }
             commitFocusedPrefixAndRender("candidate")
             if (closeExpanded || session.isEmpty) {
-                isExpandedPanelOpen = false
+                closeExpandedPanel()
                 renderSnapshot(session.snapshot)
             }
             return
@@ -1894,7 +1894,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             advanceFocus = true
         )
         if (closeExpanded) {
-            isExpandedPanelOpen = false
+            closeExpandedPanel()
         }
         renderSnapshot(nextSnap)
         if (shouldLogEval()) {
@@ -1952,6 +1952,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
 
     private fun showTransientTrace(text: String) {
         if (!::traceBadge.isInitialized) return
+        if (isClauseSubMode || (isExpandedPanelOpen && expandedTab == ExpandedTab.EMOJI && isEmojiSearchActive)) return
         updateTraceBadgeMaxWidth(isEditing = false, isTransient = true)
         traceBadge.ellipsize = TextUtils.TruncateAt.END
         traceBadge.visibility = View.VISIBLE
@@ -1979,16 +1980,19 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             lastClausesForLog = snap.clauses.joinToString("|") {
                 (if (it.isEnglish) "E:" else "") + it.reading + (if (it.text != it.reading) "→" + it.text else "")
             }
-        } else if (fixActions.isNotEmpty() && session.isEmpty) {
-            // Composition dropped without a commit (cleared); start fresh.
-            fixAutoPreview = null
-            fixActions.clear()
+        } else {
+            isClauseSubMode = false
+            if (fixActions.isNotEmpty() && session.isEmpty) {
+                // Composition dropped without a commit (cleared); start fresh.
+                fixAutoPreview = null
+                fixActions.clear()
+            }
         }
         if (::keyboardView.isInitialized) {
             keyboardView.arrowResizeMode = snap.isComposing && !snap.isEditing
         }
         val dark = isDarkTheme()
-        val accent = if (dark) Color.parseColor("#5C8AC4") else Color.parseColor("#4A6F9E")
+        val accent = accentColor(dark)
         val focusBgSpan = if (dark) Color.argb(90, 92, 138, 196) else Color.argb(65, 74, 111, 158)
 
         val ic = currentInputConnection
@@ -2014,52 +2018,145 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
                 offset = end
             }
             if (!snap.isEditing) ic?.setComposingText(spanned, 1)
+        } else {
+            ic?.finishComposingText()
+        }
 
+        renderTopBar(snap, dark, accent)
+        syncExpandedPanelState(snap, refreshTopBar = false)
+    }
+
+    private fun renderTopBar(snap: CompositionSnapshot, dark: Boolean, accent: Int) {
+        val inEmojiSearch = isExpandedPanelOpen && expandedTab == ExpandedTab.EMOJI && isEmojiSearchActive
+        val inClauseSubMode = !inEmojiSearch && snap.isComposing && isClauseSubMode
+
+        if (inEmojiSearch) {
+            traceBadge.visibility = View.GONE
+            candidateScroll.visibility = View.GONE
+            clauseModeBtn.visibility = View.GONE
+            emojiBarBtn.visibility = View.GONE
+            expandPanelBtn.visibility = View.GONE
+            oneHandBtn.visibility = View.GONE
+            settingsBtn.visibility = View.GONE
+            clauseScroll.visibility = View.GONE
+            partialCommitBtn.visibility = View.GONE
+            langSwitchBtn.visibility = View.GONE
+            backToCandidatesBtn.visibility = View.GONE
+
+            emojiSearchQueryPill.visibility = View.VISIBLE
+            emojiSearchResultScroll.visibility = View.VISIBLE
+            emojiSearchCloseBtn.visibility = View.VISIBLE
+            renderEmojiSearchTopBar(dark)
+            return
+        }
+
+        emojiSearchQueryPill.visibility = View.GONE
+        emojiSearchResultScroll.visibility = View.GONE
+        emojiSearchCloseBtn.visibility = View.GONE
+
+        if (inClauseSubMode) {
+            traceBadge.visibility = View.GONE
+            candidateScroll.visibility = View.GONE
+            clauseModeBtn.visibility = View.GONE
+            emojiBarBtn.visibility = View.GONE
+            expandPanelBtn.visibility = View.GONE
+            oneHandBtn.visibility = View.GONE
+            settingsBtn.visibility = View.GONE
+
+            clauseScroll.visibility = View.VISIBLE
+            partialCommitBtn.visibility = View.VISIBLE
+            langSwitchBtn.visibility = View.VISIBLE
+            backToCandidatesBtn.visibility = View.VISIBLE
+
+            val hasClauses = snap.clauses.isNotEmpty()
+            partialCommitBtn.isEnabled = hasClauses
+            partialCommitBtn.alpha = if (hasClauses) 1.0f else 0.32f
+            renderClausePillsInto(clausePillRow, clauseScroll, snap, dark, accent, toggleExpandOnFocusedTap = true)
+            return
+        }
+
+        clauseScroll.visibility = View.GONE
+        partialCommitBtn.visibility = View.GONE
+        langSwitchBtn.visibility = View.GONE
+        backToCandidatesBtn.visibility = View.GONE
+
+        candidateScroll.visibility = View.VISIBLE
+        expandPanelBtn.visibility = View.VISIBLE
+        if (snap.isComposing) {
             val (traceText, trunc) = formatTraceBadge(snap)
             updateTraceBadgeMaxWidth(isEditing = snap.isEditing)
             traceBadge.ellipsize = trunc
             traceBadge.visibility = View.VISIBLE
             traceBadge.text = traceText
+            clauseModeBtn.visibility = View.VISIBLE
+            emojiBarBtn.visibility = View.GONE
             oneHandBtn.visibility = View.GONE
             settingsBtn.visibility = View.GONE
-
-            clauseBar.visibility = View.VISIBLE
-            val hasClauses = snap.clauses.isNotEmpty()
-            val multiClause = snap.clauses.size > 1
-            val canPrev = multiClause && snap.focusedClauseIndex > 0
-            val canNext = multiClause && snap.focusedClauseIndex < snap.clauses.lastIndex
-            prevClauseBtn.visibility = if (multiClause) View.VISIBLE else View.GONE
-            nextClauseBtn.visibility = if (multiClause) View.VISIBLE else View.GONE
-            prevClauseBtn.isEnabled = canPrev
-            prevClauseBtn.alpha = if (canPrev) 1.0f else 0.32f
-            nextClauseBtn.isEnabled = canNext
-            nextClauseBtn.alpha = if (canNext) 1.0f else 0.32f
-            partialCommitBtn.isEnabled = hasClauses
-            partialCommitBtn.alpha = if (hasClauses) 1.0f else 0.32f
-
-            val showBoundaryStrip = snap.focusedAdjustableKana.length >= 2 || snap.canShrinkClause || snap.canExtendClause
-            boundaryBar.visibility = if (showBoundaryStrip) View.VISIBLE else View.GONE
-            shrinkClauseBtn.isEnabled = snap.canShrinkClause
-            shrinkClauseBtn.alpha = if (snap.canShrinkClause) 1.0f else 0.32f
-            extendClauseBtn.isEnabled = snap.canExtendClause
-            extendClauseBtn.alpha = if (snap.canExtendClause) 1.0f else 0.32f
-            renderClausePills(snap, dark, accent)
-            if (showBoundaryStrip) {
-                renderBoundaryKanaRow(boundaryKanaRow, boundaryScroll, snap, dark, accent)
-            } else {
-                boundaryKanaRow.removeAllViews()
-            }
         } else {
-            ic?.finishComposingText()
             traceBadge.visibility = View.GONE
+            clauseModeBtn.visibility = View.GONE
+            emojiBarBtn.visibility = View.VISIBLE
             oneHandBtn.visibility = View.VISIBLE
             settingsBtn.visibility = View.VISIBLE
-            clauseBar.visibility = View.GONE
-            boundaryBar.visibility = View.GONE
+        }
+        renderCandidateRow(snap, dark, accent)
+    }
+
+    private fun renderEmojiSearchTopBar(dark: Boolean) {
+        val rawQ = emojiSearchQuery.toString()
+        val hiraPreview = if (rawQ.isEmpty()) {
+            ""
+        } else {
+            RomajiDetector.analyze(rawQ, strictForDetection = false).finalizedHiragana()
+        }
+        emojiSearchQueryPill.text = when {
+            rawQ.isEmpty() -> "🔍 検索"
+            hiraPreview.isNotEmpty() && hiraPreview != rawQ -> "🔍 $rawQ ($hiraPreview)"
+            else -> "🔍 $rawQ"
         }
 
-        renderCandidateRow(snap, dark, accent)
-        syncExpandedPanelState(snap)
+        emojiSearchResultRow.removeAllViews()
+        emojiSearchResultScroll.scrollTo(0, 0)
+
+        val matches = if (rawQ.isEmpty()) {
+            (settings.getRecentEmojis() + DEFAULT_RECENT_EMOJIS)
+                .distinct()
+                .filter(::canRenderEmoji)
+                .take(24)
+        } else {
+            emojiCatalog.search(rawQ, limit = 60)
+                .map { it.emoji }
+                .filter(::canRenderEmoji)
+                .distinct()
+                .take(28)
+        }
+
+        if (matches.isEmpty()) {
+            val mutedCol = if (dark) Color.parseColor("#8D95A0") else Color.parseColor("#737A84")
+            emojiSearchResultRow.addView(TextView(this).apply {
+                text = "一致なし"
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                setTextColor(mutedCol)
+                setPadding(dp(8), 0, dp(8), 0)
+            })
+            return
+        }
+
+        for (emoji in matches) {
+            val cell = TextView(this).apply {
+                text = emoji
+                gravity = Gravity.CENTER
+                includeFontPadding = false
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 20f)
+                background = borderlessPressedBg(dark)
+                layoutParams = LinearLayout.LayoutParams(dp(36), dp(36))
+                setOnClickListener {
+                    settings.addRecentEmoji(emoji)
+                    commitDirectExtraText(emoji)
+                }
+            }
+            emojiSearchResultRow.addView(cell)
+        }
     }
 
     private fun renderBoundaryKanaRow(
@@ -2136,8 +2233,15 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         }
     }
 
-    private fun renderClausePills(snap: CompositionSnapshot, dark: Boolean, accent: Int) {
-        clausePillRow.removeAllViews()
+    private fun renderClausePillsInto(
+        container: LinearLayout,
+        scrollHost: HorizontalScrollView,
+        snap: CompositionSnapshot,
+        dark: Boolean,
+        accent: Int,
+        toggleExpandOnFocusedTap: Boolean
+    ) {
+        container.removeAllViews()
         val border = if (dark) Color.parseColor("#323741") else Color.parseColor("#D5DAE0")
         val bgNormal = if (dark) Color.parseColor("#23272D") else Color.parseColor("#FFFFFF")
         val bgFocus = if (dark) Color.parseColor("#2A3B52") else Color.parseColor("#E3EDF8")
@@ -2175,7 +2279,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
                         pillSingleTap = null
                         pillTapIdx = -1
                         noteFix("pill_double:$idx", conversionFix = false)
-                        isExpandedPanelOpen = false
+                        closeExpandedPanel()
                         session.focusClause(idx)
                         commitFocusedPrefixAndRender("pill_double")
                         return@setOnClickListener
@@ -2188,9 +2292,14 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
                     val single = Runnable {
                         pillSingleTap = null
                         if (session.isEmpty || idx > session.snapshot.clauses.lastIndex) return@Runnable
-                        if (session.snapshot.focusedClauseIndex == idx && session.snapshot.isConverting) {
+                        if (toggleExpandOnFocusedTap &&
+                            session.snapshot.focusedClauseIndex == idx &&
+                            session.snapshot.isConverting
+                        ) {
                             expandedTab = ExpandedTab.CANDIDATES
                             isExpandedPanelOpen = !isExpandedPanelOpen
+                            isEmojiSearchActive = false
+                            emojiSearchQuery.setLength(0)
                             syncExpandedPanelState(session.snapshot)
                         } else {
                             renderSnapshot(session.focusClause(idx))
@@ -2200,13 +2309,13 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
                     pillHandler.postDelayed(single, PILL_DOUBLE_TAP_MS)
                 }
             }
-            clausePillRow.addView(pill)
+            container.addView(pill)
             if (focused) focusedPill = pill
         }
         focusedPill?.let { target ->
-            clauseScroll.post {
-                val targetX = (target.left - (clauseScroll.width - target.width) / 2).coerceAtLeast(0)
-                clauseScroll.smoothScrollTo(targetX, 0)
+            scrollHost.post {
+                val targetX = (target.left - (scrollHost.width - target.width) / 2).coerceAtLeast(0)
+                scrollHost.smoothScrollTo(targetX, 0)
             }
         }
     }
@@ -2465,19 +2574,10 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
 
     private fun updateExpandedPanelHeight() {
         if (!::keyboardView.isInitialized || !::expandedPanel.isInitialized) return
-        val baseDp = keyboardView.currentBaseHeightDp() * settings.keyboardHeightScale
-        val isEmojiSearchStrip = isExpandedPanelOpen &&
-            expandedTab == ExpandedTab.EMOJI &&
-            isEmojiSearchActive
-        val isWidePicker = isExpandedPanelOpen &&
-            ((expandedTab == ExpandedTab.EMOJI && !isEmojiSearchActive) || expandedTab == ExpandedTab.KAOMOJI)
-        val screenHeightDp = resources.displayMetrics.heightPixels / resources.displayMetrics.density
-        val maxSafeDp = (screenHeightDp * 0.54f).roundToInt().coerceAtLeast(340)
-        val targetDp = when {
-            isEmojiSearchStrip -> 118
-            isWidePicker -> maxOf((baseDp + 132f).roundToInt(), 388).coerceAtMost(maxSafeDp)
-            else -> baseDp.roundToInt().coerceIn(220, 420)
-        }
+        val targetDp = ImeHeightSpec.bodyHeightDp(
+            showNumberRow = settings.showNumberRow,
+            heightScale = settings.keyboardHeightScale
+        )
         val targetPx = dp(targetDp)
         val lp = expandedPanel.layoutParams as LinearLayout.LayoutParams
         if (lp.height != targetPx) {
@@ -2486,25 +2586,28 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         }
     }
 
-    private fun syncExpandedPanelState(snap: CompositionSnapshot) {
-        expandPanelBtn.text = if (isExpandedPanelOpen) "▲" else "▼"
-        if (!isExpandedPanelOpen) {
-            isEmojiSearchActive = false
-            topBar.visibility = View.VISIBLE
-            dividerView.visibility = View.VISIBLE
+    private fun syncExpandedPanelState(snap: CompositionSnapshot, refreshTopBar: Boolean = true) {
+        val inEmojiSearch = isExpandedPanelOpen && expandedTab == ExpandedTab.EMOJI && isEmojiSearchActive
+        val panelVisible = isExpandedPanelOpen && !inEmojiSearch
+        expandPanelBtn.text = if (panelVisible) "▲" else "▼"
+        topBar.visibility = View.VISIBLE
+        dividerView.visibility = View.VISIBLE
+        if (!panelVisible) {
+            if (!isExpandedPanelOpen) {
+                isEmojiSearchActive = false
+            }
             expandedPanel.visibility = View.GONE
             keyboardView.visibility = View.VISIBLE
-            return
+        } else {
+            keyboardView.visibility = View.GONE
+            expandedPanel.visibility = View.VISIBLE
+            updateExpandedPanelHeight()
+            populateExpandedPanel(snap)
         }
-        val inEmojiSearch = expandedTab == ExpandedTab.EMOJI && isEmojiSearchActive
-        val hideIdleTopBar = inEmojiSearch ||
-            (!snap.isComposing && (expandedTab == ExpandedTab.EMOJI || expandedTab == ExpandedTab.KAOMOJI))
-        topBar.visibility = if (hideIdleTopBar) View.GONE else View.VISIBLE
-        dividerView.visibility = if (hideIdleTopBar) View.GONE else View.VISIBLE
-        keyboardView.visibility = if (inEmojiSearch) View.VISIBLE else View.GONE
-        expandedPanel.visibility = View.VISIBLE
-        updateExpandedPanelHeight()
-        populateExpandedPanel(snap)
+        if (refreshTopBar) {
+            val dark = isDarkTheme()
+            renderTopBar(snap, dark, accentColor(dark))
+        }
     }
 
     private fun populateExpandedPanel(snap: CompositionSnapshot) {
@@ -2574,7 +2677,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
 
         if (snap.isComposing) {
             val commitBtn = makePanelButton("確定", accent, Color.WHITE, accent) {
-                isExpandedPanelOpen = false
+                closeExpandedPanel()
                 onEnter()
             }
             commitBtn.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(26)).apply {
@@ -2635,19 +2738,213 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         textCol: Int,
         mutedCol: Int
     ) {
-        val statusText = TextView(this).apply {
-            text = if (snap.isComposing) {
-                val fc = snap.clauses.getOrNull(snap.focusedClauseIndex)
-                "注目文節: ${fc?.text ?: ""} (${fc?.reading ?: ""})"
-            } else {
-                "クイック設定（高さ・数字段）"
+        val dark = isDarkTheme()
+
+        if (snap.isComposing) {
+            // Clause pills + boundary controls right at the top of CANDIDATES tab
+            val clauseRow = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(0, 0, 0, dp(6))
             }
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-            setTypeface(null, Typeface.BOLD)
-            setTextColor(textCol)
-            setPadding(0, 0, 0, dp(4))
+            val cScroll = HorizontalScrollView(this).apply {
+                isHorizontalScrollBarEnabled = false
+                layoutParams = LinearLayout.LayoutParams(0, dp(32), 1f)
+            }
+            val cPills = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+            }
+            cScroll.addView(cPills)
+            clauseRow.addView(cScroll)
+
+            if (snap.clauses.size > 1) {
+                val canPrev = snap.focusedClauseIndex > 0
+                val canNext = snap.focusedClauseIndex < snap.clauses.lastIndex
+                clauseRow.addView(makePanelButton("‹", cardBg, textCol, border) {
+                    renderSnapshot(session.moveFocus(-1))
+                }.apply {
+                    isEnabled = canPrev
+                    alpha = if (canPrev) 1.0f else 0.32f
+                    minWidth = dp(28)
+                    setPadding(dp(6), dp(3), dp(6), dp(3))
+                    layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(30)).apply {
+                        marginStart = dp(4)
+                    }
+                })
+                clauseRow.addView(makePanelButton("›", cardBg, textCol, border) {
+                    renderSnapshot(session.moveFocus(+1))
+                }.apply {
+                    isEnabled = canNext
+                    alpha = if (canNext) 1.0f else 0.32f
+                    minWidth = dp(28)
+                    setPadding(dp(6), dp(3), dp(6), dp(3))
+                    layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(30)).apply {
+                        marginStart = dp(3)
+                    }
+                })
+            }
+            clauseRow.addView(makePanelButton("確定✓", cardBg, textCol, accent) {
+                glidePreviewSeq.incrementAndGet()
+                commitFocusedPrefixAndRender("partial")
+            }.apply {
+                layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(30)).apply {
+                    marginStart = dp(4)
+                }
+            })
+            clauseRow.addView(makePanelButton("日/英", cardBg, textCol, border) {
+                onToggleSegmentLanguage()
+            }.apply {
+                layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(30)).apply {
+                    marginStart = dp(3)
+                }
+            })
+            expandedContent.addView(clauseRow)
+            renderClausePillsInto(cPills, cScroll, snap, dark, accent, toggleExpandOnFocusedTap = false)
+
+            if (snap.focusedAdjustableKana.length >= 2 || snap.canShrinkClause || snap.canExtendClause) {
+                expandedContent.addView(TextView(this).apply {
+                    text = "区切れ位置（文字をタップで直接調整）"
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+                    setTextColor(mutedCol)
+                    setPadding(0, 0, 0, dp(4))
+                })
+                val bRow = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    setPadding(0, 0, 0, dp(8))
+                }
+                val bShrink = makePanelButton("◀ 短", cardBg, textCol, border) {
+                    noteFix("resize"); renderSnapshot(session.resizeFocusedClause(-1, getSurroundingTextBefore()))
+                }.apply {
+                    isEnabled = snap.canShrinkClause
+                    alpha = if (snap.canShrinkClause) 1.0f else 0.32f
+                    layoutParams = LinearLayout.LayoutParams(dp(54), dp(30)).apply { marginEnd = dp(4) }
+                }
+                val bScroll = HorizontalScrollView(this).apply {
+                    isHorizontalScrollBarEnabled = false
+                    layoutParams = LinearLayout.LayoutParams(0, dp(30), 1f)
+                }
+                val bKanaRow = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                }
+                bScroll.addView(bKanaRow)
+                val bExtend = makePanelButton("長 ▶", cardBg, textCol, border) {
+                    noteFix("resize"); renderSnapshot(session.resizeFocusedClause(+1, getSurroundingTextBefore()))
+                }.apply {
+                    isEnabled = snap.canExtendClause
+                    alpha = if (snap.canExtendClause) 1.0f else 0.32f
+                    layoutParams = LinearLayout.LayoutParams(dp(54), dp(30)).apply { marginStart = dp(4) }
+                }
+                bRow.addView(bShrink)
+                bRow.addView(bScroll)
+                bRow.addView(bExtend)
+                expandedContent.addView(bRow)
+                renderBoundaryKanaRow(bKanaRow, bScroll, snap, dark, accent)
+            }
+
+            if (snap.scriptVariants.isNotEmpty()) {
+                expandedContent.addView(TextView(this).apply {
+                    text = "字種一発変換"
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+                    setTextColor(mutedCol)
+                    setPadding(0, dp(2), 0, dp(4))
+                })
+                val svScroll = HorizontalScrollView(this).apply {
+                    isHorizontalScrollBarEnabled = false
+                    setPadding(0, 0, 0, dp(8))
+                }
+                val svRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                for ((tag, value) in snap.scriptVariants) {
+                    val chip = makePanelButton("$tag: $value", cardBg, textCol, accent) {
+                        val wasLast = snap.focusedClauseIndex >= snap.clauses.lastIndex
+                        noteFix("variant:$value")
+                        session.applyFocusedClauseSurface(
+                            value,
+                            getSurroundingTextBefore(),
+                            advanceFocus = false
+                        )
+                        if (wasLast || snap.clauses.size <= 1) {
+                            closeExpandedPanel()
+                        }
+                        // Picking a script variant confirms it like a candidate.
+                        commitFocusedPrefixAndRender("variant")
+                        if (session.isEmpty) {
+                            closeExpandedPanel()
+                            renderSnapshot(session.snapshot)
+                        }
+                    }
+                    chip.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(34)).apply {
+                        marginEnd = dp(5)
+                    }
+                    svRow.addView(chip)
+                }
+                svScroll.addView(svRow)
+                expandedContent.addView(svScroll)
+            }
+
+            val convCands = snap.candidates
+            if (convCands.isNotEmpty()) {
+                expandedContent.addView(TextView(this).apply {
+                    text = "変換候補一覧"
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+                    setTextColor(mutedCol)
+                    setPadding(0, 0, 0, dp(4))
+                })
+                val cols = 4
+                var r = 0
+                while (r < convCands.size) {
+                    val rowLayout = LinearLayout(this).apply {
+                        orientation = LinearLayout.HORIZONTAL
+                        layoutParams = LinearLayout.LayoutParams(
+                            ViewGroup.LayoutParams.MATCH_PARENT,
+                            ViewGroup.LayoutParams.WRAP_CONTENT
+                        ).apply { bottomMargin = dp(5) }
+                    }
+                    for (c in 0 until cols) {
+                        val item = convCands.getOrNull(r + c)
+                        if (item == null) {
+                            rowLayout.addView(View(this).apply {
+                                layoutParams = LinearLayout.LayoutParams(0, dp(38), 1f)
+                            })
+                        } else {
+                            val label = if (item.kind == CandidateKind.GLIDE_ALT && item.subtitle.isNotEmpty()) {
+                                item.subtitle
+                            } else if (item.subtitle.isNotEmpty()) {
+                                "${item.text} (${item.subtitle})"
+                            } else {
+                                item.text
+                            }
+                            val btn = makePanelButton(
+                                label,
+                                cardBg,
+                                textCol,
+                                if (item.kind == CandidateKind.GLIDE_ALT || item.kind == CandidateKind.CORRECTION) accent else border
+                            ) {
+                                val wasLast = snap.focusedClauseIndex >= snap.clauses.lastIndex
+                                val close = item.kind == CandidateKind.GLIDE_ALT || wasLast || snap.clauses.size <= 1
+                                selectCandidateAndLog(snap, item, closeExpanded = close)
+                            }
+                            btn.layoutParams = LinearLayout.LayoutParams(0, dp(38), 1f).apply {
+                                if (c < cols - 1) marginEnd = dp(5)
+                            }
+                            rowLayout.addView(btn)
+                        }
+                    }
+                    expandedContent.addView(rowLayout)
+                    r += cols
+                }
+            }
+        } else {
+            expandedContent.addView(TextView(this).apply {
+                text = "クイック設定（高さ・数字段）"
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                setTypeface(null, Typeface.BOLD)
+                setTextColor(textCol)
+                setPadding(0, 0, 0, dp(4))
+            })
         }
-        expandedContent.addView(statusText)
 
         fun addQuickStepRow(label: String, steps: List<Pair<String, () -> Unit>>) {
             val row = LinearLayout(this).apply {
@@ -2671,7 +2968,6 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             expandedContent.addView(row)
         }
 
-        // Quick height and symbol-sensitivity adjustment strips inside keyboard
         val pct = (settings.keyboardHeightScale * 100f).roundToInt()
         fun adjustHeight(delta: Float?, exact: Float? = null) {
             val next = (exact ?: (settings.keyboardHeightScale + (delta ?: 0f))).coerceIn(0.65f, 1.55f)
@@ -2722,143 +3018,6 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
                 layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(38))
             }
             expandedContent.addView(numRowToggle)
-            return
-        }
-
-        if (snap.focusedAdjustableKana.length >= 2 || snap.canShrinkClause || snap.canExtendClause) {
-            val dark = isDarkTheme()
-            expandedContent.addView(TextView(this).apply {
-                text = "区切れ位置（文字をタップで直接調整）"
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
-                setTextColor(mutedCol)
-                setPadding(0, 0, 0, dp(4))
-            })
-            val bRow = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-                setPadding(0, 0, 0, dp(8))
-            }
-            val bShrink = makePanelButton("◀ 短", cardBg, textCol, border) {
-                noteFix("resize"); renderSnapshot(session.resizeFocusedClause(-1, getSurroundingTextBefore()))
-            }.apply {
-                isEnabled = snap.canShrinkClause
-                alpha = if (snap.canShrinkClause) 1.0f else 0.32f
-                layoutParams = LinearLayout.LayoutParams(dp(54), dp(30)).apply { marginEnd = dp(4) }
-            }
-            val bScroll = HorizontalScrollView(this).apply {
-                isHorizontalScrollBarEnabled = false
-                layoutParams = LinearLayout.LayoutParams(0, dp(30), 1f)
-            }
-            val bKanaRow = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-            }
-            bScroll.addView(bKanaRow)
-            val bExtend = makePanelButton("長 ▶", cardBg, textCol, border) {
-                noteFix("resize"); renderSnapshot(session.resizeFocusedClause(+1, getSurroundingTextBefore()))
-            }.apply {
-                isEnabled = snap.canExtendClause
-                alpha = if (snap.canExtendClause) 1.0f else 0.32f
-                layoutParams = LinearLayout.LayoutParams(dp(54), dp(30)).apply { marginStart = dp(4) }
-            }
-            bRow.addView(bShrink)
-            bRow.addView(bScroll)
-            bRow.addView(bExtend)
-            expandedContent.addView(bRow)
-            renderBoundaryKanaRow(bKanaRow, bScroll, snap, dark, accent)
-        }
-
-        if (snap.scriptVariants.isNotEmpty()) {
-            expandedContent.addView(TextView(this).apply {
-                text = "字種一発変換"
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
-                setTextColor(mutedCol)
-                setPadding(0, dp(2), 0, dp(4))
-            })
-            val svScroll = HorizontalScrollView(this).apply {
-                isHorizontalScrollBarEnabled = false
-                setPadding(0, 0, 0, dp(8))
-            }
-            val svRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-            for ((tag, value) in snap.scriptVariants) {
-                val chip = makePanelButton("$tag: $value", cardBg, textCol, accent) {
-                    val wasLast = snap.focusedClauseIndex >= snap.clauses.lastIndex
-                    noteFix("variant:$value")
-                    session.applyFocusedClauseSurface(
-                        value,
-                        getSurroundingTextBefore(),
-                        advanceFocus = false
-                    )
-                    if (wasLast || snap.clauses.size <= 1) {
-                        isExpandedPanelOpen = false
-                    }
-                    // Picking a script variant confirms it like a candidate.
-                    commitFocusedPrefixAndRender("variant")
-                    if (session.isEmpty) {
-                        isExpandedPanelOpen = false
-                        renderSnapshot(session.snapshot)
-                    }
-                }
-                chip.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(34)).apply {
-                    marginEnd = dp(5)
-                }
-                svRow.addView(chip)
-            }
-            svScroll.addView(svRow)
-            expandedContent.addView(svScroll)
-        }
-
-        val convCands = snap.candidates
-        if (convCands.isNotEmpty()) {
-            expandedContent.addView(TextView(this).apply {
-                text = "変換候補一覧"
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
-                setTextColor(mutedCol)
-                setPadding(0, 0, 0, dp(4))
-            })
-            val cols = 4
-            var r = 0
-            while (r < convCands.size) {
-                val rowLayout = LinearLayout(this).apply {
-                    orientation = LinearLayout.HORIZONTAL
-                    layoutParams = LinearLayout.LayoutParams(
-                        ViewGroup.LayoutParams.MATCH_PARENT,
-                        ViewGroup.LayoutParams.WRAP_CONTENT
-                    ).apply { bottomMargin = dp(5) }
-                }
-                for (c in 0 until cols) {
-                    val item = convCands.getOrNull(r + c)
-                    if (item == null) {
-                        rowLayout.addView(View(this).apply {
-                            layoutParams = LinearLayout.LayoutParams(0, dp(38), 1f)
-                        })
-                    } else {
-                        val label = if (item.kind == CandidateKind.GLIDE_ALT && item.subtitle.isNotEmpty()) {
-                            item.subtitle
-                        } else if (item.subtitle.isNotEmpty()) {
-                            "${item.text} (${item.subtitle})"
-                        } else {
-                            item.text
-                        }
-                        val btn = makePanelButton(
-                            label,
-                            cardBg,
-                            textCol,
-                            if (item.kind == CandidateKind.GLIDE_ALT || item.kind == CandidateKind.CORRECTION) accent else border
-                        ) {
-                            val wasLast = snap.focusedClauseIndex >= snap.clauses.lastIndex
-                            val close = item.kind == CandidateKind.GLIDE_ALT || wasLast || snap.clauses.size <= 1
-                            selectCandidateAndLog(snap, item, closeExpanded = close)
-                        }
-                        btn.layoutParams = LinearLayout.LayoutParams(0, dp(38), 1f).apply {
-                            if (c < cols - 1) marginEnd = dp(5)
-                        }
-                        rowLayout.addView(btn)
-                    }
-                }
-                expandedContent.addView(rowLayout)
-                r += cols
-            }
         }
     }
 
@@ -2898,11 +3057,6 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         textCol: Int,
         mutedCol: Int
     ) {
-        if (isEmojiSearchActive) {
-            populateEmojiSearchStrip(dark, accent, cardBg, border, textCol, mutedCol)
-            return
-        }
-
         val availDp = resources.displayMetrics.widthPixels / resources.displayMetrics.density - 8f
         val cols = (availDp / 42f).toInt().coerceIn(8, 10)
 
@@ -3076,123 +3230,6 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             labelView?.setTextColor(if (active) textCol else mutedCol)
             lineView?.setBackgroundColor(if (active) accent else Color.TRANSPARENT)
         }
-    }
-
-    private fun populateEmojiSearchStrip(
-        dark: Boolean,
-        accent: Int,
-        cardBg: Int,
-        border: Int,
-        textCol: Int,
-        mutedCol: Int
-    ) {
-        val rawQ = emojiSearchQuery.toString()
-        val hiraPreview = if (rawQ.isEmpty()) {
-            ""
-        } else {
-            RomajiDetector.analyze(rawQ, strictForDetection = false).finalizedHiragana()
-        }
-
-        val searchBar = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(8), dp(4), dp(8), dp(4))
-        }
-        val queryBox = TextView(this).apply {
-            text = when {
-                rawQ.isEmpty() -> "🔍 下のキーボードで絵文字を検索 (例: egao, neko, ai)"
-                hiraPreview.isNotEmpty() && hiraPreview != rawQ -> "🔍 $rawQ ($hiraPreview)"
-                else -> "🔍 $rawQ"
-            }
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
-            setTextColor(if (rawQ.isEmpty()) mutedCol else textCol)
-            maxLines = 1
-            ellipsize = TextUtils.TruncateAt.END
-            setPadding(dp(8), dp(5), dp(8), dp(5))
-            background = GradientDrawable().apply {
-                setColor(cardBg)
-                cornerRadius = dp(6).toFloat()
-                setStroke(dp(1), accent)
-            }
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-        }
-        searchBar.addView(queryBox)
-
-        if (rawQ.isNotEmpty()) {
-            val clearBtn = makePanelButton("クリア", cardBg, textCol, border) {
-                emojiSearchQuery.setLength(0)
-                populateExpandedPanel(session.snapshot)
-            }.apply {
-                layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(30)).apply {
-                    marginStart = dp(4)
-                }
-            }
-            searchBar.addView(clearBtn)
-        }
-        val backBtn = makePanelButton("一覧", cardBg, accent, accent) {
-            isEmojiSearchActive = false
-            emojiSearchQuery.setLength(0)
-            syncExpandedPanelState(session.snapshot)
-        }.apply {
-            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(30)).apply {
-                marginStart = dp(4)
-            }
-        }
-        searchBar.addView(backBtn)
-        expandedHeader.addView(searchBar)
-
-        val matches = if (rawQ.isEmpty()) {
-            (settings.getRecentEmojis() + DEFAULT_RECENT_EMOJIS)
-                .distinct()
-                .filter(::canRenderEmoji)
-                .take(24)
-        } else {
-            emojiCatalog.search(rawQ, limit = 60)
-                .map { it.emoji }
-                .filter(::canRenderEmoji)
-                .distinct()
-                .take(28)
-        }
-
-        if (matches.isEmpty()) {
-            expandedContent.addView(TextView(this).apply {
-                text = "一致する絵文字が見つかりません"
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-                setTextColor(mutedCol)
-                setPadding(dp(8), dp(12), dp(8), dp(8))
-            })
-            return
-        }
-
-        val hScroll = HorizontalScrollView(this).apply {
-            isHorizontalScrollBarEnabled = false
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            )
-        }
-        val strip = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(2), dp(2), dp(2), dp(2))
-        }
-        for (emoji in matches) {
-            val cell = TextView(this).apply {
-                text = emoji
-                gravity = Gravity.CENTER
-                includeFontPadding = false
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 23f)
-                background = borderlessPressedBg(dark)
-                layoutParams = LinearLayout.LayoutParams(dp(42), dp(42))
-                setOnClickListener {
-                    settings.addRecentEmoji(emoji)
-                    commitDirectExtraText(emoji)
-                }
-            }
-            strip.addView(cell)
-        }
-        hScroll.addView(strip)
-        expandedContent.addView(hScroll)
     }
 
     private inner class EmojiGridAdapter(
@@ -3702,7 +3739,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             }
         }
         val backKb = footerCell("⌨ キーボードへ", accent, bold = true) {
-            isExpandedPanelOpen = false
+            closeExpandedPanel()
             syncExpandedPanelState(session.snapshot)
         }
         val spaceBtn = footerCell("空白", mutedCol) {
