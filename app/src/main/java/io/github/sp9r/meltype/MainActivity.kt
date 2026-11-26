@@ -1252,6 +1252,10 @@ class MainActivity : AppCompatActivity() {
             settings.autoCommitOnPunctuation = it
         }
         switchCard.addView(hairline())
+        addSwitchRow(switchCard, "クリップボード履歴", "コピーしたテキストを最大30件、端末内だけに保存（パスワード欄と機密指定のコピーは保存しない）。キーボードの「履歴」タブから貼り付け", settings.clipboardHistoryEnabled) {
+            settings.clipboardHistoryEnabled = it
+        }
+        switchCard.addView(hairline())
         addSwitchRow(switchCard, "改善用の入力ログ", "確定・候補の選び直し・日/英の切替を端末内に記録（パスワード欄とシークレット入力は除外、外部送信なし）", settings.usageLoggingEnabled) {
             settings.usageLoggingEnabled = it
         }

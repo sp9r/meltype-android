@@ -1,6 +1,8 @@
 package io.github.sp9r.meltype
 
 import android.content.Context
+import io.github.sp9r.meltype.core.ClipTextEntry
+import io.github.sp9r.meltype.core.ClipboardHistory
 import android.content.SharedPreferences
 import org.json.JSONArray
 import org.json.JSONObject
@@ -209,12 +211,34 @@ class MeltypeSettings(context: Context) {
         saveStringList(KEY_RECENT_EMOJIS, next)
     }
 
-    fun getClipboardHistory(): List<String> = readStringList(KEY_CLIPBOARD_HISTORY)
+    /** Clipboard history (text) on/off. Stored only in app-private storage. */
+    var clipboardHistoryEnabled: Boolean
+        get() = prefs.getBoolean(KEY_CLIPBOARD_HISTORY_ENABLED, true)
+        set(value) = prefs.edit().putBoolean(KEY_CLIPBOARD_HISTORY_ENABLED, value).apply()
+
+    fun getClipboardEntries(): List<ClipTextEntry> {
+        val raw = prefs.getString(KEY_CLIPBOARD_ENTRIES, null)
+        if (raw == null) return readStringList(KEY_CLIPBOARD_HISTORY).map { ClipTextEntry(it, false) }
+        return runCatching {
+            val arr = JSONArray(raw)
+            buildList {
+                for (i in 0 until arr.length()) {
+                    val o = arr.optJSONObject(i) ?: continue
+                    val t = o.optString("t")
+                    if (t.isNotEmpty()) add(ClipTextEntry(t, o.optBoolean("p", false)))
+                }
+            }
+        }.getOrDefault(emptyList())
+    }
+
+    fun saveClipboardEntries(entries: List<ClipTextEntry>) {
+        val arr = JSONArray()
+        for (e in entries) arr.put(org.json.JSONObject().put("t", e.text).put("p", e.pinned))
+        prefs.edit().putString(KEY_CLIPBOARD_ENTRIES, arr.toString()).apply()
+    }
 
     fun addClipboardItem(text: String) {
-        if (text.isBlank() || text.length > 500) return
-        val next = (listOf(text) + getClipboardHistory().filterNot { it == text }).take(12)
-        saveStringList(KEY_CLIPBOARD_HISTORY, next)
+        saveClipboardEntries(ClipboardHistory.add(getClipboardEntries(), text))
     }
 
     private fun readStringList(key: String): List<String> {
@@ -386,6 +410,8 @@ class MeltypeSettings(context: Context) {
         private const val KEY_ACTIVE_PROMPT_INDEX = "glide_eval_prompt_index"
         private const val KEY_RECENT_EMOJIS = "recent_emojis"
         private const val KEY_CLIPBOARD_HISTORY = "clipboard_history"
+        private const val KEY_CLIPBOARD_ENTRIES = "clipboard_entries_v2"
+        private const val KEY_CLIPBOARD_HISTORY_ENABLED = "clipboard_history_enabled"
         private const val KEY_USER_DICT = "user_dictionary"
     }
 }

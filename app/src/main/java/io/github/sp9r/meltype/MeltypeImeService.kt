@@ -51,6 +51,7 @@ import io.github.sp9r.meltype.core.AndroidMozcConverter
 import io.github.sp9r.meltype.core.AppEngineHolder
 import io.github.sp9r.meltype.core.CandidateItem
 import io.github.sp9r.meltype.core.CandidateKind
+import io.github.sp9r.meltype.core.ClipboardHistory
 import io.github.sp9r.meltype.core.ClipboardImageEntry
 import io.github.sp9r.meltype.core.ClipboardImageStore
 import io.github.sp9r.meltype.core.CompositionSession
@@ -89,7 +90,8 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         CANDIDATES("候補・設定"),
         EMOJI("絵文字"),
         KAOMOJI("顔文字"),
-        TEMPLATES("定型/履歴"),
+        TEMPLATES("定型"),
+        CLIPBOARD("履歴"),
         EDIT("編集")
     }
 
@@ -570,8 +572,8 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
                 return
             }
             val txt = item?.coerceToText(this)?.toString()?.trim()
-            if (!txt.isNullOrEmpty() && txt.length <= 500 && !sensitive) {
-                settings.addClipboardItem(txt)
+            if (ClipboardHistory.shouldStore(txt, sensitive, isPasswordField, settings.clipboardHistoryEnabled)) {
+                settings.addClipboardItem(txt!!)
             }
             if (!txt.isNullOrEmpty()) {
                 pasteOfferImage = null
@@ -632,7 +634,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
                 if (::candidateRow.isInitialized && session.isEmpty) {
                     renderSnapshot(session.snapshot)
                 }
-                if (isExpandedPanelOpen && expandedTab == ExpandedTab.TEMPLATES) {
+                if (isExpandedPanelOpen && (expandedTab == ExpandedTab.TEMPLATES || expandedTab == ExpandedTab.CLIPBOARD)) {
                     populateExpandedPanel(session.snapshot)
                 }
             }
@@ -2604,6 +2606,7 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             ExpandedTab.EMOJI -> populateEmojiTab(dark, accent, cardBg, border, textCol, mutedCol)
             ExpandedTab.KAOMOJI -> populateKaomojiTab(dark, border, textCol)
             ExpandedTab.TEMPLATES -> populateTemplatesTab(accent, cardBg, border, textCol, mutedCol)
+            ExpandedTab.CLIPBOARD -> populateClipboardTab(accent, cardBg, border, textCol, mutedCol)
             ExpandedTab.EDIT -> populateEditTab(accent, cardBg, border, textCol, mutedCol)
         }
 
@@ -3386,7 +3389,16 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             expandedContent.addView(rowLayout)
             r += pCols
         }
+    }
 
+    private fun populateClipboardTab(
+        accent: Int,
+        cardBg: Int,
+        border: Int,
+        textCol: Int,
+        mutedCol: Int
+    ) {
+        captureClipboard()
         expandedContent.addView(TextView(this).apply {
             text = "クリップボード履歴（画像）"
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
@@ -3457,13 +3469,35 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             expandedContent.addView(imgScroll)
         }
 
-        expandedContent.addView(TextView(this).apply {
+        val clipHeader = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(6), 0, dp(4))
+        }
+        clipHeader.addView(TextView(this).apply {
             text = "クリップボード履歴（テキスト）"
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
             setTextColor(mutedCol)
-            setPadding(0, dp(6), 0, dp(4))
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         })
-        val clips = settings.getClipboardHistory()
+        clipHeader.addView(makePanelButton("🗑 固定以外を消去", cardBg, textCol, border) {
+            settings.saveClipboardEntries(ClipboardHistory.clear(settings.getClipboardEntries(), keepPinned = true))
+            populateExpandedPanel(session.snapshot)
+        }.apply { layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(30)).apply { marginEnd = dp(4) } })
+        clipHeader.addView(makePanelButton("🗑 すべて消去", cardBg, textCol, border) {
+            settings.saveClipboardEntries(emptyList())
+            populateExpandedPanel(session.snapshot)
+        }.apply { layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(30)) })
+        expandedContent.addView(clipHeader)
+        if (!settings.clipboardHistoryEnabled) {
+            expandedContent.addView(TextView(this).apply {
+                text = "履歴の保存はオフです（設定画面でオンにできます）"
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                setTextColor(mutedCol)
+                setPadding(0, dp(2), 0, dp(6))
+            })
+        }
+        val clips = ClipboardHistory.display(settings.getClipboardEntries())
         if (clips.isEmpty()) {
             expandedContent.addView(TextView(this).apply {
                 text = "コピーされたテキストはまだありません"
@@ -3473,25 +3507,50 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             })
         } else {
             for (clip in clips) {
-                val btn = TextView(this).apply {
-                    text = clip.replace('\n', ' ')
-                    maxLines = 2
-                    ellipsize = TextUtils.TruncateAt.END
-                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
-                    setTextColor(textCol)
-                    setPadding(dp(10), dp(7), dp(10), dp(7))
+                val row = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
                     background = GradientDrawable().apply {
                         setColor(cardBg)
                         cornerRadius = dp(5).toFloat()
-                        setStroke(dp(1), border)
+                        setStroke(dp(1), if (clip.pinned) accent else border)
                     }
                     layoutParams = LinearLayout.LayoutParams(
                         ViewGroup.LayoutParams.MATCH_PARENT,
                         ViewGroup.LayoutParams.WRAP_CONTENT
                     ).apply { bottomMargin = dp(4) }
-                    setOnClickListener { commitDirectExtraText(clip) }
                 }
-                expandedContent.addView(btn)
+                row.addView(TextView(this).apply {
+                    text = clip.text.replace('\n', ' ')
+                    maxLines = 2
+                    ellipsize = TextUtils.TruncateAt.END
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
+                    setTextColor(textCol)
+                    setPadding(dp(10), dp(7), dp(6), dp(7))
+                    layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                    setOnClickListener { commitDirectExtraText(clip.text) }
+                })
+                row.addView(TextView(this).apply {
+                    text = if (clip.pinned) "📌 固定中" else "📌 固定"
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+                    setTextColor(if (clip.pinned) accent else mutedCol)
+                    setPadding(dp(6), dp(8), dp(6), dp(8))
+                    setOnClickListener {
+                        settings.saveClipboardEntries(ClipboardHistory.togglePin(settings.getClipboardEntries(), clip.text))
+                        populateExpandedPanel(session.snapshot)
+                    }
+                })
+                row.addView(TextView(this).apply {
+                    text = "✕ 削除"
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+                    setTextColor(mutedCol)
+                    setPadding(dp(6), dp(8), dp(10), dp(8))
+                    setOnClickListener {
+                        settings.saveClipboardEntries(ClipboardHistory.remove(settings.getClipboardEntries(), clip.text))
+                        populateExpandedPanel(session.snapshot)
+                    }
+                })
+                expandedContent.addView(row)
             }
         }
     }
