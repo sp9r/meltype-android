@@ -495,6 +495,10 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
         super.onStartInput(attribute, restarting)
         isPasswordField = isPasswordInputType(attribute)
         isIncognitoField = isIncognito(attribute)
+        if (!restarting) {
+            inlineGen++
+            inlineViews = emptyList()
+        }
         if (::session.isInitialized) {
             // Also on restarting: the app re-created its input connection (e.g. after replacing the
             // composing text with a search suggestion), so the old composition no longer exists there.
@@ -776,8 +780,8 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
                 .build()
             val styles = androidx.autofill.inline.UiVersions.newStylesBuilder().addStyle(style).build()
             val spec = android.widget.inline.InlinePresentationSpec.Builder(
-                android.util.Size(dp(80), dp(33)),
-                android.util.Size(dp(300), dp(33))
+                android.util.Size(dp(32), dp(28)),
+                android.util.Size(dp(320), dp(40))
             ).setStyle(styles).build()
             android.view.inputmethod.InlineSuggestionsRequest.Builder(listOf(spec))
                 .setMaxSuggestionCount(6)
@@ -802,18 +806,25 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             try {
                 sug.inflate(
                     this,
-                    android.util.Size(ViewGroup.LayoutParams.WRAP_CONTENT, dp(33)),
+                    android.util.Size(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT),
                     mainExecutor
                 ) { v ->
+                    if (gen != inlineGen) return@inflate
                     views[i] = v
                     remaining--
-                    if (remaining == 0 && gen == inlineGen) {
-                        inlineViews = views.filterNotNull()
+                    val inflated = views.filterNotNull()
+                    if (inflated.isNotEmpty() || remaining <= 0) {
+                        inlineViews = inflated
                         if (::candidateRow.isInitialized) renderSnapshot(session.snapshot)
                     }
                 }
-            } catch (_: Throwable) {
+            } catch (t: Throwable) {
+                android.util.Log.w("MeltypeAutofill", "inline inflate failed at $i", t)
                 remaining--
+                if (remaining <= 0 && gen == inlineGen) {
+                    inlineViews = views.filterNotNull()
+                    if (::candidateRow.isInitialized) renderSnapshot(session.snapshot)
+                }
             }
         }
         return true
@@ -2213,9 +2224,10 @@ class MeltypeImeService : InputMethodService(), KeyboardActionListener {
             // Password-manager suggestions first, then the fallback button in password fields.
             for (v in inlineViews) {
                 (v.parent as? ViewGroup)?.removeView(v)
+                v.minimumHeight = dp(33)
                 v.layoutParams = LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.WRAP_CONTENT,
-                    dp(33)
+                    ViewGroup.LayoutParams.WRAP_CONTENT
                 ).apply { marginEnd = dp(5) }
                 candidateRow.addView(v)
             }
