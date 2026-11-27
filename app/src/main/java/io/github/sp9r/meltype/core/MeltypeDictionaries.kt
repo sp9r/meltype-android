@@ -63,6 +63,24 @@ data class PhraseEntry(
     val clauses: List<ConversionClause>
 )
 
+data class SupplementalSpan(
+    val start: Int,
+    val end: Int,
+    val reading: String,
+    val primary: String,
+    val candidates: List<String>,
+    val headOnly: Boolean = false,
+    val isHighPriorityBrand: Boolean = false
+)
+
+private data class SupplementalIndexEntry(
+    val reading: String,
+    val primary: String,
+    val candidates: List<String>,
+    val headOnly: Boolean,
+    val isHighPriorityBrand: Boolean
+)
+
 class MeltypeDictionaries(source: DictionarySource) {
     val englishFocusedWords: SortedWordList
     val englishAllWords: SortedWordList
@@ -79,6 +97,7 @@ class MeltypeDictionaries(source: DictionarySource) {
     val japaneseNameReadings: Set<String>
     val properNounCanonical: Map<String, String>
     val kanaToBrandsAndLoanwords: Map<String, List<String>>
+    val priorityBrandCandidates: Map<String, List<String>>
     val phraseEntries: Map<String, PhraseEntry>
     val readingToPhrases: Map<String, String>
     val extraCandidates: Map<String, List<String>>
@@ -92,6 +111,7 @@ class MeltypeDictionaries(source: DictionarySource) {
     val readingWithTags: List<Pair<String, List<String>>>
     val commonLatinWordsForGlide: List<String>
     val loadedFileCount: Int
+    private val supplementalByPrefix2: Map<String, List<SupplementalIndexEntry>>
 
     init {
         var count = 0
@@ -138,10 +158,21 @@ class MeltypeDictionaries(source: DictionarySource) {
         englishCommonWords = engCommon
         englishTechAndAcronymWords = engTechOrAcronym
 
-        // 2. propernouns.txt (case-preserved)
+        // 2. propernouns.txt (case-preserved; tab-delimited lines allow multi-word canonicals)
         val properMap = LinkedHashMap<String, String>()
         for (rawLine in readLines("propernouns.txt")) {
             val line = stripHashComment(rawLine)
+            if (line.isEmpty()) continue
+            if ('\t' in line) {
+                val parts = line.split('\t').map { it.trim() }.filter { it.isNotEmpty() }
+                if (parts.size >= 2) {
+                    val lower = parts[0].lowercase()
+                    val canon = parts[1]
+                    properMap.putIfAbsent(lower, canon)
+                    engFocused.add(lower)
+                }
+                continue
+            }
             for (tok in line.splitWhitespace()) {
                 val lower = tok.lowercase()
                 if (lower.isNotEmpty()) {
@@ -219,19 +250,28 @@ class MeltypeDictionaries(source: DictionarySource) {
         japaneseCanonicalWords = jpCanon
         japaneseWords = SortedWordList(jpVariants)
 
-        // 6. brands.txt + loanwords.txt (reading cand1 cand2 ...)
+        // 6. brands.txt + loanwords.txt (reading cand1 cand2 ..., tab-delimited when multi-word)
         val latinCandMap = LinkedHashMap<String, MutableList<String>>()
+        val brandOnlyMap = LinkedHashMap<String, MutableList<String>>()
         val glideBrands = LinkedHashSet<String>()
         for (file in listOf("brands.txt", "loanwords.txt")) {
+            val isBrandsFile = (file == "brands.txt")
             for (rawLine in readLines(file)) {
                 val line = stripHashComment(rawLine)
-                val parts = line.splitWhitespace()
+                if (line.isEmpty()) continue
+                val parts = if ('\t' in line) {
+                    line.split('\t').map { it.trim() }.filter { it.isNotEmpty() }
+                } else {
+                    line.splitWhitespace()
+                }
                 if (parts.size >= 2) {
                     val reading = parts[0]
                     val list = latinCandMap.getOrPut(reading) { ArrayList() }
+                    val brandList = if (isBrandsFile) brandOnlyMap.getOrPut(reading) { ArrayList() } else null
                     for (idx in 1 until parts.size) {
                         val w = parts[idx]
                         if (w !in list) list.add(w)
+                        if (brandList != null && w !in brandList) brandList.add(w)
                         val cleanAlpha = w.lowercase().filterNot { it in "-.'/" }
                         if (cleanAlpha.all { it in 'a'..'z' } && cleanAlpha.length >= 2) {
                             glideBrands.add(cleanAlpha)
@@ -241,6 +281,7 @@ class MeltypeDictionaries(source: DictionarySource) {
             }
         }
         kanaToBrandsAndLoanwords = latinCandMap
+        priorityBrandCandidates = brandOnlyMap
 
         // 7. phrases.txt ([^]reading1|reading2\tsurface1|surface2)
         val phraseEntryMap = LinkedHashMap<String, PhraseEntry>()
@@ -277,11 +318,16 @@ class MeltypeDictionaries(source: DictionarySource) {
         phraseEntries = phraseEntryMap
         readingToPhrases = phraseMap
 
-        // 8. candidates.txt (reading cand1 cand2 ...)
+        // 8. candidates.txt (reading cand1 cand2 ..., tab-delimited when multi-word)
         val candMap = LinkedHashMap<String, MutableList<String>>()
         for (rawLine in readLines("candidates.txt")) {
             val line = stripHashComment(rawLine)
-            val parts = line.splitWhitespace()
+            if (line.isEmpty()) continue
+            val parts = if ('\t' in line) {
+                line.split('\t').map { it.trim() }.filter { it.isNotEmpty() }
+            } else {
+                line.splitWhitespace()
+            }
             if (parts.size >= 2) {
                 val r = parts[0]
                 val list = candMap.getOrPut(r) { ArrayList() }
@@ -491,6 +537,95 @@ class MeltypeDictionaries(source: DictionarySource) {
         }
         commonLatinWordsForGlide = glideEng.toList()
         loadedFileCount = count
+
+        // 13. Build fast 2-char reading prefix index for supplemental spans
+        val spanMerged = LinkedHashMap<String, SupplementalIndexEntry>()
+        val collidingBrands = setOf("すいか", "しずく", "いめ", "あい", "ご")
+        for ((r, entry) in phraseEntryMap) {
+            if (r.length >= 3 && entry.clauses.size == 1 && r.all { it in '\u3041'..'\u309F' || it == 'ー' }) {
+                val brandCands = brandOnlyMap[r].orEmpty()
+                val extraCands = candMap[r].orEmpty()
+                val all = (listOf(entry.surface) + brandCands + extraCands).distinct()
+                val hasAsciiOrKata = entry.surface.any { it in 'A'..'Z' || it in 'a'..'z' }
+                spanMerged[r] = SupplementalIndexEntry(
+                    reading = r,
+                    primary = entry.surface,
+                    candidates = all,
+                    headOnly = entry.headOnly,
+                    isHighPriorityBrand = hasAsciiOrKata || r in brandOnlyMap
+                )
+            }
+        }
+        for ((r, brandList) in brandOnlyMap) {
+            if (r.length < 3 || r in collidingBrands || brandList.isEmpty()) continue
+            if (!r.all { it in '\u3041'..'\u309F' || it == 'ー' }) continue
+            val existing = spanMerged[r]
+            if (existing == null) {
+                val all = (brandList + candMap[r].orEmpty()).distinct()
+                spanMerged[r] = SupplementalIndexEntry(
+                    reading = r,
+                    primary = all.first(),
+                    candidates = all,
+                    headOnly = false,
+                    isHighPriorityBrand = true
+                )
+            }
+        }
+        for ((r, cList) in candMap) {
+            if (r.length < 4 || cList.isEmpty()) continue
+            if (!r.all { it in '\u3041'..'\u309F' || it == 'ー' }) continue
+            if (spanMerged.containsKey(r)) continue
+            val primary = cList.first()
+            if (primary == r) continue
+            spanMerged[r] = SupplementalIndexEntry(
+                reading = r,
+                primary = primary,
+                candidates = cList.distinct(),
+                headOnly = false,
+                isHighPriorityBrand = false
+            )
+        }
+        val prefixBuckets = HashMap<String, MutableList<SupplementalIndexEntry>>(spanMerged.size)
+        for (e in spanMerged.values) {
+            val p2 = e.reading.substring(0, 2)
+            prefixBuckets.getOrPut(p2) { ArrayList(2) }.add(e)
+        }
+        for (bucket in prefixBuckets.values) {
+            bucket.sortWith(
+                compareByDescending<SupplementalIndexEntry> { it.isHighPriorityBrand }
+                    .thenByDescending { it.reading.length }
+            )
+        }
+        supplementalByPrefix2 = prefixBuckets
+    }
+
+    /**
+     * Finds matching supplemental brand/proper-noun/technical-term spans in [hiragana],
+     * ordered by start offset ascending, priority/length descending.
+     */
+    fun findSupplementalSpans(hiragana: String): List<SupplementalSpan> {
+        if (hiragana.length < 3 || supplementalByPrefix2.isEmpty()) return emptyList()
+        val out = ArrayList<SupplementalSpan>()
+        for (i in 0 until hiragana.length - 1) {
+            val bucket = supplementalByPrefix2[hiragana.substring(i, i + 2)] ?: continue
+            for (e in bucket) {
+                if (i + e.reading.length > hiragana.length) continue
+                if (!hiragana.startsWith(e.reading, i)) continue
+                if (e.headOnly && i > 0 && hiragana[i - 1] == 'っ') continue
+                out.add(
+                    SupplementalSpan(
+                        start = i,
+                        end = i + e.reading.length,
+                        reading = e.reading,
+                        primary = e.primary,
+                        candidates = e.candidates,
+                        headOnly = e.headOnly,
+                        isHighPriorityBrand = e.isHighPriorityBrand
+                    )
+                )
+            }
+        }
+        return out
     }
 
     /**

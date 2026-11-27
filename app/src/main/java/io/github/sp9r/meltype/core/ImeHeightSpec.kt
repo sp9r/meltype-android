@@ -7,10 +7,12 @@ import kotlin.math.roundToInt
  * layers, composing states, expanded tabs, and emoji search.
  */
 object ImeHeightSpec {
-    const val TOP_BAR_HEIGHT_DP = 44
+    const val UPPER_BAR_HEIGHT_DP = 32
+    const val CANDIDATE_BAR_HEIGHT_DP = 42
+    const val TOP_BAR_HEIGHT_DP = UPPER_BAR_HEIGHT_DP + CANDIDATE_BAR_HEIGHT_DP
     const val DIVIDER_HEIGHT_DP = 1
-    const val BASE_HEIGHT_WITH_NUMBER_ROW_DP = 264f
-    const val BASE_HEIGHT_WITHOUT_NUMBER_ROW_DP = 224f
+    const val BASE_HEIGHT_WITH_NUMBER_ROW_DP = 248f
+    const val BASE_HEIGHT_WITHOUT_NUMBER_ROW_DP = 210f
     const val MIN_HEIGHT_SCALE = 0.65f
     const val MAX_HEIGHT_SCALE = 1.55f
 
@@ -18,6 +20,7 @@ object ImeHeightSpec {
         IDLE,
         COMPOSING,
         CONVERTING,
+        EDITING,
         CLAUSE_SUBMODE,
         EMOJI_SEARCH,
         CLIPBOARD_CHIP,

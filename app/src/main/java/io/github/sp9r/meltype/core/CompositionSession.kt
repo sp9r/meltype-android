@@ -114,6 +114,7 @@ class CompositionSession(
     private var caretRaw: Int? = null
     /** Backspace during conversion returned the composition to its unconverted kana form. */
     private var kanaRevert = false
+    private var explicitEditing = false
     private var converting = false
 
     /** True when the caret sits inside the composition, so new input is inserted there. */
@@ -142,6 +143,7 @@ class CompositionSession(
             return recompute(surroundingContext)
         }
         kanaRevert = false
+        explicitEditing = false
         buffer.append(ch)
         bufferSpatialHints.add(spatialHints)
         if (englishChar) markWordEnglishAround(buffer.length - 1)
@@ -315,6 +317,17 @@ class CompositionSession(
     private fun leaveEditing() {
         caretRaw = null
         kanaRevert = false
+        explicitEditing = false
+    }
+
+    /** Enters 1-character cursor editing mode at the end of the composition. */
+    fun enterEditing(surroundingContext: String? = null): CompositionSnapshot {
+        if (buffer.isEmpty()) return cachedSnapshot
+        clearLastGlideHint()
+        converting = false
+        kanaRevert = false
+        explicitEditing = true
+        return recompute(surroundingContext, keepFocus = true)
     }
 
     /**
@@ -325,6 +338,7 @@ class CompositionSession(
         if (buffer.isEmpty() || delta == 0) return cachedSnapshot
         clearLastGlideHint()
         converting = false
+        explicitEditing = false
         val units = editUnits()
         var p = caretRaw ?: buffer.length
         repeat(kotlin.math.abs(delta)) {
@@ -420,6 +434,7 @@ class CompositionSession(
             return recompute(surroundingContext)
         }
         kanaRevert = false
+        explicitEditing = false
         buffer.append(text)
         repeat(text.length) { bufferSpatialHints.add(emptyMap()) }
         return recompute(surroundingContext)
@@ -449,6 +464,7 @@ class CompositionSession(
             return recompute(surroundingContext)
         }
         kanaRevert = false
+        explicitEditing = false
         var addedSpace = false
         if (buffer.isNotEmpty() && !buffer.last().isWhitespace()) {
             val lastSeg = cachedSnapshot.clauses.lastOrNull()
@@ -508,7 +524,7 @@ class CompositionSession(
             return recompute(surroundingContext)
         }
         val caret = caretRaw
-        if (caret != null || kanaRevert) {
+        if (caret != null || kanaRevert || explicitEditing) {
             // Kana view: delete one display unit (kana or character) before the caret.
             clearLastGlideHint()
             val p = caret ?: buffer.length
@@ -550,6 +566,7 @@ class CompositionSession(
         focusedClauseIdx = 0
         caretRaw = null
         kanaRevert = false
+        explicitEditing = false
         converting = false
         return recompute(null)
     }
@@ -565,6 +582,7 @@ class CompositionSession(
         focusedClauseIdx = 0
         caretRaw = null
         kanaRevert = false
+        explicitEditing = false
         converting = false
         if (rawInput.isNotEmpty()) {
             buffer.append(rawInput)
@@ -1638,6 +1656,46 @@ class CompositionSession(
         }
 
         val scriptVariants = buildScriptVariants(focused, displayClauses.count { it.segmentIndex == focused?.segmentIndex })
+        for ((tag, value) in scriptVariants) {
+            if (barCandidates.none { it.text == value }) {
+                val subLabel = when (tag) {
+                    "あ" -> "ひらがな"
+                    "ア" -> "カタカナ"
+                    "ｱ" -> "半角カナ"
+                    else -> "英字"
+                }
+                barCandidates.add(
+                    CandidateItem(
+                        text = value,
+                        subtitle = subLabel,
+                        kind = CandidateKind.CONVERSION,
+                        targetClauseIndex = focusedClauseIdx
+                    )
+                )
+            }
+        }
+
+        // Mozc native predictive suggestions in the latter half of the candidate bar while typing Japanese
+        if (!converting && !kanaRevert && caretRaw == null && raw.isNotEmpty() &&
+            segments.size == 1 && segments[0].kind == SegmentKind.JAPANESE
+        ) {
+            val fullReading = displayClauses.joinToString("") { it.reading }
+            if (fullReading.length >= 2) {
+                val previewNow = displayClauses.joinToString("") { it.text }
+                val mozcSuggests = converter.suggest(fullReading, surroundingContext, limit = 6)
+                for (s in mozcSuggests) {
+                    if (s.isNotEmpty() && s != previewNow && barCandidates.none { it.text == s }) {
+                        barCandidates.add(
+                            CandidateItem(
+                                text = s,
+                                subtitle = "予測",
+                                kind = CandidateKind.PHRASE
+                            )
+                        )
+                    }
+                }
+            }
+        }
         val nextClause = displayClauses.getOrNull(focusedClauseIdx + 1)
         val focusedSeg = focused?.let { segments.getOrNull(it.segmentIndex) }
         val segAfterFocused = focused?.let { segments.getOrNull(it.segmentIndex + 1) }
@@ -1709,7 +1767,7 @@ class CompositionSession(
             }
         }
 
-        val editing = caretRaw != null || kanaRevert
+        val editing = caretRaw != null || kanaRevert || explicitEditing
         var preview = displayClauses.joinToString("") { it.text }
         var caretOffset = -1
         var editKana = ""

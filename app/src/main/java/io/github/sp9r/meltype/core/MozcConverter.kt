@@ -16,6 +16,7 @@ interface KanjiConverter {
     fun convertClauses(hiragana: String, context: String? = null): List<ConversionClause>?
     fun candidates(reading: String): List<String>
     fun learn(context: String?, clauses: List<ConversionClause>): Boolean
+    fun suggest(hiragana: String, context: String? = null, limit: Int = 8): List<String> = emptyList()
 }
 
 object MozcRuntime {
@@ -101,6 +102,7 @@ class AndroidMozcConverter(
     private val gate = Any()
     private val cachedCandidates = LinkedHashMap<String, List<String>>()
     private val cachedResults = LinkedHashMap<Triple<String, String?, Boolean>, SavedConversion>()
+    private val cachedSuggests = LinkedHashMap<Pair<String, String?>, List<String>>()
     private var lastLearningMode: Boolean? = null
 
     private data class SavedConversion(
@@ -134,17 +136,123 @@ class AndroidMozcConverter(
         }
         val exactPhrase = dictionaries?.phraseEntries?.get(hiragana)
         if (exactPhrase != null) {
+            synchronized(gate) {
+                for (c in exactPhrase.clauses) {
+                    val extras = collectExtraCandidates(c.reading)
+                    cachedCandidates[c.reading] = mergeCandidates(c.reading, listOf(c.text), extras)
+                }
+            }
             return exactPhrase.clauses
         }
 
         if (transport == null && !MozcRuntime.initialized) {
-            return fallbackConvert(hiragana)
+            val fb = fallbackConvert(hiragana)
+            return applySupplementalSpans(hiragana, fb, context, depth = 0)
         }
 
         synchronized(gate) {
-            return convertCore(hiragana, context, System.currentTimeMillis(), singleClause = false)
+            val base = convertCore(hiragana, context, System.currentTimeMillis(), singleClause = false)
                 ?: fallbackConvert(hiragana)
+            return applySupplementalSpans(hiragana, base, context, depth = 0)
         }
+    }
+
+    override fun suggest(hiragana: String, context: String?, limit: Int): List<String> {
+        if (hiragana.isEmpty() || hiragana.length > 60 || hiragana.any { it.isISOControl() }) return emptyList()
+        if (limit <= 0) return emptyList()
+
+        if (transport == null && !MozcRuntime.initialized) {
+            return fallbackSuggest(hiragana, limit)
+        }
+
+        synchronized(gate) {
+            checkLearningMode()
+            val key = hiragana to context
+            cachedSuggests[key]?.let { return it.take(limit) }
+
+            var session = 0L
+            val startMs = System.currentTimeMillis()
+            fun call(kind: Int, payload: ByteArray = ByteArray(0)): Proto {
+                if (kind != 2 && System.currentTimeMillis() - startMs > 1200L) {
+                    throw IllegalStateException("Mozc suggest timeout")
+                }
+                val req = Proto.concat(
+                    Proto.number(1, kind.toLong()),
+                    if (session == 0L) ByteArray(0) else Proto.number(2, session),
+                    payload
+                )
+                val output = Proto.parse(evalTransport(req))
+                if (output.int(11) != 0L || output.has(4)) {
+                    throw IllegalStateException("Mozc returned error=${output.int(11)}")
+                }
+                return output
+            }
+
+            return try {
+                session = call(1, Proto.blob(7, ByteArray(0))).int(1)
+                if (session == 0L) return emptyList()
+                val incognitoVal = if (canLearn()) 0L else 1L
+                call(17, Proto.blob(9, Proto.number(23, incognitoVal)))
+                call(5, Proto.blob(4, Proto.concat(Proto.number(1, 22L), Proto.number(3, 1L))))
+                val surrounding = if (context.isNullOrEmpty()) ByteArray(0) else Proto.blob(6, Proto.string(1, context))
+                val update = Proto.concat(
+                    Proto.number(1, 26L),
+                    Proto.blob(11, Proto.string(1, hiragana))
+                )
+                val output = call(5, Proto.concat(Proto.blob(4, update), surrounding))
+                val suggestions = extractCandidateWords(output)
+                    .filter { it.isNotEmpty() && it != hiragana }
+                    .distinct()
+                if (cachedSuggests.size >= 48) cachedSuggests.clear()
+                cachedSuggests[key] = suggestions
+                suggestions.take(limit)
+            } catch (_: Throwable) {
+                emptyList()
+            } finally {
+                if (session != 0L) runCatching { call(2) }
+            }
+        }
+    }
+
+    private fun extractCandidateWords(output: Proto): List<String> {
+        var words = output.message(14).messages(2)
+            .map { it.text(4) }
+            .filter { it.isNotEmpty() }
+        if (words.isEmpty()) {
+            words = output.message(6).groups(3)
+                .map { it.text(5) }
+                .filter { it.isNotEmpty() }
+        }
+        return words
+    }
+
+    private fun fallbackSuggest(hiragana: String, limit: Int): List<String> {
+        val dict = dictionaries ?: return emptyList()
+        if (hiragana.length < 2) return emptyList()
+        val out = LinkedHashSet<String>()
+        for ((r, surface) in dict.readingToPhrases) {
+            if (r.startsWith(hiragana) && r.length > hiragana.length) {
+                out.add(surface)
+                if (out.size >= limit) break
+            }
+        }
+        if (out.size < limit) {
+            for ((r, list) in dict.priorityBrandCandidates) {
+                if (r.startsWith(hiragana) && r.length > hiragana.length) {
+                    list.firstOrNull()?.let { out.add(it) }
+                    if (out.size >= limit) break
+                }
+            }
+        }
+        if (out.size < limit) {
+            for ((r, list) in dict.extraCandidates) {
+                if (r.startsWith(hiragana) && r.length > hiragana.length) {
+                    list.firstOrNull()?.let { out.add(it) }
+                    if (out.size >= limit) break
+                }
+            }
+        }
+        return out.toList().take(limit)
     }
 
     override fun candidates(reading: String): List<String> {
@@ -152,7 +260,7 @@ class AndroidMozcConverter(
         val extras = collectExtraCandidates(reading)
 
         if (transport == null && !MozcRuntime.initialized) {
-            return (extras + listOf(reading, RomajiDetector.toKatakana(reading))).distinct()
+            return mergeCandidates(reading, emptyList(), extras)
         }
 
         synchronized(gate) {
@@ -174,7 +282,14 @@ class AndroidMozcConverter(
     private fun mergeCandidates(reading: String, mozc: List<String>, extras: List<String>): List<String> {
         val out = LinkedHashSet<String>()
         out.addAll(collectPriorityExtras(reading))
-        out.addAll(mozc)
+        if (mozc.isNotEmpty()) {
+            out.add(mozc.first())
+        }
+        val extraCands = dictionaries?.extraCandidates?.get(reading).orEmpty()
+        if (extraCands.isNotEmpty()) {
+            out.addAll(extraCands.take(4))
+        }
+        out.addAll(mozc.drop(1))
         out.addAll(extras)
         out.add(reading)
         out.add(RomajiDetector.toKatakana(reading))
@@ -186,6 +301,9 @@ class AndroidMozcConverter(
         val out = LinkedHashSet<String>()
         userDictProvider()[reading]?.let { out.add(it) }
         dictionaries?.readingToPhrases?.get(reading)?.let { out.add(it) }
+        if (reading.length >= 3) {
+            dictionaries?.priorityBrandCandidates?.get(reading)?.let { out.addAll(it) }
+        }
         return out.toList()
     }
 
@@ -202,6 +320,7 @@ class AndroidMozcConverter(
             lastLearningMode = mode
             cachedResults.clear()
             cachedCandidates.clear()
+            cachedSuggests.clear()
         }
     }
 
@@ -214,13 +333,14 @@ class AndroidMozcConverter(
         checkLearningMode()
         val key = Triple(hiragana, context, singleClause)
         cachedResults[key]?.let { saved ->
-            cachedCandidates.clear()
+            if (cachedCandidates.size >= 128) cachedCandidates.clear()
             cachedCandidates.putAll(saved.candidates)
             return saved.clauses
         }
 
         var session = 0L
-        cachedCandidates.clear()
+        if (cachedCandidates.size >= 128) cachedCandidates.clear()
+        val localCandidates = LinkedHashMap<String, List<String>>()
 
         fun call(kind: Int, payload: ByteArray = ByteArray(0)): Proto {
             if (kind != 2 && System.currentTimeMillis() - startMs > 2000L) {
@@ -259,7 +379,14 @@ class AndroidMozcConverter(
                 Proto.number(1, 26L),
                 Proto.blob(11, Proto.string(1, hiragana))
             )
-            call(5, Proto.concat(Proto.blob(4, update), surrounding))
+            val updateOutput = call(5, Proto.concat(Proto.blob(4, update), surrounding))
+            val preSuggests = extractCandidateWords(updateOutput)
+                .filter { it.isNotEmpty() && it != hiragana }
+                .distinct()
+            if (preSuggests.isNotEmpty()) {
+                if (cachedSuggests.size >= 48) cachedSuggests.clear()
+                cachedSuggests[hiragana to context] = preSuggests
+            }
             var output = call(3, Proto.concat(Proto.blob(3, Proto.number(3, 4L)), surrounding)) // SPACE
 
             var clauses = readClauses(output)
@@ -286,24 +413,18 @@ class AndroidMozcConverter(
                 if (index > 0) {
                     output = call(3, Proto.blob(3, Proto.number(3, 7L))) // RIGHT: focus next clause
                 }
-                var words = output.message(14).messages(2)
-                    .map { it.text(4) }
-                    .filter { it.isNotEmpty() }
-                if (words.isEmpty()) {
-                    words = output.message(6).groups(3)
-                        .map { it.text(5) }
-                        .filter { it.isNotEmpty() }
-                }
+                val words = extractCandidateWords(output)
                 val r = finalClauses[index].reading
-                val cands = (listOf(finalClauses[index].text) + words.map { restoreSymbolWidth(it, r) }).distinct()
-                cachedCandidates[r] = cands
+                val mozcCands = (listOf(finalClauses[index].text) + words.map { restoreSymbolWidth(it, r) }).distinct()
+                val mergedCands = mergeCandidates(r, mozcCands, collectExtraCandidates(r))
+                cachedCandidates[r] = mergedCands
+                localCandidates[r] = mergedCands
             }
 
             if (cachedResults.size >= 32) cachedResults.clear()
-            cachedResults[key] = SavedConversion(finalClauses.toList(), LinkedHashMap(cachedCandidates))
+            cachedResults[key] = SavedConversion(finalClauses.toList(), LinkedHashMap(localCandidates))
             finalClauses
         } catch (_: Throwable) {
-            cachedCandidates.clear()
             null
         } finally {
             if (session != 0L) {
@@ -322,6 +443,7 @@ class AndroidMozcConverter(
         synchronized(gate) {
             cachedResults.clear()
             cachedCandidates.clear()
+            cachedSuggests.clear()
             var session = 0L
             val startMs = System.currentTimeMillis()
 
@@ -385,12 +507,152 @@ class AndroidMozcConverter(
         }
     }
 
+    private fun applySupplementalSpans(
+        hiragana: String,
+        baseClauses: List<ConversionClause>,
+        context: String?,
+        depth: Int
+    ): List<ConversionClause> {
+        val dict = dictionaries ?: return baseClauses
+        if (depth >= 4 || hiragana.length < 3 || baseClauses.isEmpty()) return baseClauses
+        val spans = dict.findSupplementalSpans(hiragana)
+        if (spans.isEmpty()) return baseClauses
+
+        val clauseStarts = IntArray(baseClauses.size)
+        val clauseEnds = IntArray(baseClauses.size)
+        var cursor = 0
+        for (i in baseClauses.indices) {
+            clauseStarts[i] = cursor
+            cursor += baseClauses[i].reading.length
+            clauseEnds[i] = cursor
+        }
+        val boundarySet = HashSet<Int>(baseClauses.size + 1)
+        boundarySet.add(0)
+        for (e in clauseEnds) boundarySet.add(e)
+
+        fun hasKanjiOrAscii(text: String): Boolean = text.any {
+            it in '\u4E00'..'\u9FFF' || it in 'a'..'z' || it in 'A'..'Z'
+        }
+
+        for (span in spans) {
+            val overlappingIndices = ArrayList<Int>(4)
+            for (i in baseClauses.indices) {
+                if (clauseEnds[i] > span.start && clauseStarts[i] < span.end) {
+                    overlappingIndices.add(i)
+                }
+            }
+            if (overlappingIndices.isEmpty()) continue
+
+            val firstIdx = overlappingIndices.first()
+            val lastIdx = overlappingIndices.last()
+            val alreadyExactSingle = overlappingIndices.size == 1 &&
+                clauseStarts[firstIdx] == span.start &&
+                clauseEnds[firstIdx] == span.end &&
+                baseClauses[firstIdx].text in span.candidates
+            if (alreadyExactSingle) {
+                synchronized(gate) {
+                    val existing = cachedCandidates[span.reading].orEmpty()
+                    cachedCandidates[span.reading] = (span.candidates + existing + listOf(span.reading, RomajiDetector.toKatakana(span.reading))).distinct()
+                }
+                continue
+            }
+
+            val alignedStart = span.start in boundarySet ||
+                (span.isHighPriorityBrand && span.reading.length >= 4 && !hasKanjiOrAscii(baseClauses[firstIdx].text))
+            if (!alignedStart) continue
+
+            val coveredText = overlappingIndices.joinToString("") { baseClauses[it].text }
+            val isFragmented = overlappingIndices.size >= 2
+            val isKanaOnly = !hasKanjiOrAscii(coveredText)
+            val isPlainEcho = coveredText == span.reading || coveredText == RomajiDetector.toKatakana(span.reading)
+
+            val shouldInject = if (span.isHighPriorityBrand) {
+                isFragmented || isKanaOnly || isPlainEcho || coveredText != span.primary
+            } else {
+                isFragmented || ((isKanaOnly || isPlainEcho) && span.primary != coveredText)
+            }
+            if (!shouldInject) continue
+
+            val out = ArrayList<ConversionClause>(baseClauses.size + 2)
+            val prefixCtx = StringBuilder(context ?: "")
+            if (span.start > 0) {
+                if (span.start in boundarySet) {
+                    for (i in 0 until firstIdx) {
+                        out.add(baseClauses[i])
+                        prefixCtx.append(baseClauses[i].text)
+                    }
+                } else {
+                    val prefixReading = hiragana.substring(0, span.start)
+                    val prefixClauses = convertSpanSegment(prefixReading, context)
+                    out.addAll(prefixClauses)
+                    for (pc in prefixClauses) prefixCtx.append(pc.text)
+                }
+            }
+
+            out.add(ConversionClause(span.reading, span.primary))
+            synchronized(gate) {
+                val existing = cachedCandidates[span.reading].orEmpty()
+                cachedCandidates[span.reading] = (
+                    span.candidates + existing + listOf(span.reading, RomajiDetector.toKatakana(span.reading))
+                    ).distinct()
+            }
+            prefixCtx.append(span.primary)
+
+            val suffix = hiragana.substring(span.end)
+            if (suffix.isNotEmpty()) {
+                val tailBase = if (span.end in boundarySet) {
+                    baseClauses.subList(lastIdx + 1, baseClauses.size)
+                } else {
+                    convertSpanSegment(suffix, prefixCtx.toString().ifEmpty { null })
+                }
+                out.addAll(applySupplementalSpans(suffix, tailBase, prefixCtx.toString().ifEmpty { null }, depth + 1))
+            }
+            return out
+        }
+
+        // Even when no whole-span replacement occurred, merge supplemental candidates for each clause reading
+        synchronized(gate) {
+            for (c in baseClauses) {
+                val extras = collectExtraCandidates(c.reading)
+                if (extras.isNotEmpty() || collectPriorityExtras(c.reading).isNotEmpty()) {
+                    val existing = cachedCandidates[c.reading] ?: listOf(c.text)
+                    cachedCandidates[c.reading] = mergeCandidates(c.reading, existing, extras)
+                }
+            }
+        }
+        return baseClauses
+    }
+
+    private fun convertSpanSegment(reading: String, context: String?): List<ConversionClause> {
+        if (reading.isEmpty()) return emptyList()
+        if (transport == null && !MozcRuntime.initialized) {
+            return fallbackConvert(reading)
+        }
+        return convertCore(reading, context, System.currentTimeMillis(), singleClause = false)
+            ?: fallbackConvert(reading)
+    }
+
     private fun fallbackConvert(hiragana: String): List<ConversionClause> {
         dictionaries?.phraseEntries?.get(hiragana)?.let {
             return it.clauses
         }
         val builtIn = BUILTIN_FALLBACK[hiragana]
         if (builtIn != null) return listOf(ConversionClause(hiragana, builtIn))
+        val spans = dictionaries?.findSupplementalSpans(hiragana).orEmpty()
+        val headSpan = spans.firstOrNull { it.start == 0 }
+        if (headSpan != null && headSpan.end < hiragana.length) {
+            val rest = fallbackConvert(hiragana.substring(headSpan.end))
+            return listOf(ConversionClause(headSpan.reading, headSpan.primary)) + rest
+        }
+        for ((k, v) in BUILTIN_FALLBACK) {
+            if (hiragana.endsWith(k) && hiragana.length > k.length) {
+                val head = hiragana.substring(0, hiragana.length - k.length)
+                return fallbackConvert(head) + listOf(ConversionClause(k, v))
+            }
+        }
+        val extraFirst = dictionaries?.priorityBrandCandidates?.get(hiragana)?.firstOrNull()
+            ?: dictionaries?.extraCandidates?.get(hiragana)?.firstOrNull()
+        if (extraFirst != null) return listOf(ConversionClause(hiragana, extraFirst))
         return listOf(ConversionClause(hiragana, hiragana))
     }
 

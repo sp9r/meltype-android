@@ -13,6 +13,7 @@ import io.github.sp9r.meltype.core.KanjiConverter
 import io.github.sp9r.meltype.core.LearnedPhrase
 import io.github.sp9r.meltype.core.MeltypeDictionaries
 import io.github.sp9r.meltype.core.PhraseSuggester
+import io.github.sp9r.meltype.core.Proto
 import io.github.sp9r.meltype.core.UserPhrase
 import io.github.sp9r.meltype.core.RomajiDetector
 import io.github.sp9r.meltype.core.RomajiTypoEngine
@@ -1763,5 +1764,163 @@ class MeltypeEngineTest {
         for (c in "kyou") session.appendChar(c)
         assertEquals("kyou", session.snapshot.rawInput)
         assertFalse(session.snapshot.rawInput.contains("kensaku"))
+    }
+
+    @Test
+    fun supplementalSpansAndDictionaryEnhancementsWorkCleanly() {
+        // 1. Fast prefix index detects brand, entertainment, and technical spans
+        val spansVivaldi = dictionaries.findSupplementalSpans("びばるでぃでけんさく")
+        assertTrue(spansVivaldi.any { it.reading == "びばるでぃ" && it.primary == "Vivaldi" })
+
+        val spansLesserafim = dictionaries.findSupplementalSpans("るせらふぃむのきょく")
+        assertTrue(spansLesserafim.any { it.reading == "るせらふぃむ" && it.primary == "LE SSERAFIM" })
+
+        val spansLaplace = dictionaries.findSupplementalSpans("らぷらすへんかん")
+        assertTrue(spansLaplace.any { it.reading == "らぷらすへんかん" && it.primary == "ラプラス変換" })
+
+        // 2. Real-log English/brand words (lesserafim, oppo, aga, mini) stay English standalone
+        //    while legitimate Japanese runs containing them stay Japanese
+        val converter = AndroidMozcConverter(dictionaries)
+        fun previewFor(raw: String): String {
+            val s = CompositionSession(dictionaries, scoreEngine, converter)
+            for (ch in raw) s.appendChar(ch)
+            return s.snapshot.previewText
+        }
+        assertEquals("LE SSERAFIM", previewFor("lesserafim"))
+        assertEquals("OPPO", previewFor("oppo"))
+        assertEquals("AGA", previewFor("aga"))
+        assertEquals("iPad mini", previewFor("iPad mini"))
+        val miniSess = CompositionSession(dictionaries, scoreEngine, converter)
+        for (ch in "mini") miniSess.appendChar(ch)
+        assertTrue(
+            "Expected mini and ミニ in candidates for 'mini', got ${miniSess.snapshot.candidates.map { it.text }}",
+            miniSess.snapshot.candidates.any { it.text == "mini" } && miniSess.snapshot.candidates.any { it.text == "ミニ" }
+        )
+        assertEquals("PayPay", previewFor("paypay"))
+        assertEquals("Obsidian", previewFor("obsidian"))
+        assertEquals("Vivaldi", previewFor("vivaldi"))
+        assertEquals("Antigravity", previewFor("antigravity"))
+        assertEquals("ILLIT", previewFor("illit"))
+        assertEquals("aespa", previewFor("aespa"))
+
+        assertTrue(scoreEngine.segment("agaru").all { it.kind == SegmentKind.JAPANESE })
+        assertTrue(scoreEngine.segment("agatta").all { it.kind == SegmentKind.JAPANESE })
+        assertTrue(scoreEngine.segment("miniiku").all { it.kind == SegmentKind.JAPANESE })
+        assertTrue(scoreEngine.segment("minikuru").all { it.kind == SegmentKind.JAPANESE })
+        assertEquals("LE SSERAFIMで検索", previewFor("lesserafimdekensaku"))
+        val leSegs = scoreEngine.segment("lesserafimnokyoku")
+        assertEquals(listOf(SegmentKind.ENGLISH to "lesserafim", SegmentKind.JAPANESE to "nokyoku"), leSegs.map { it.kind to it.raw })
+
+        // 3. Mock Mozc transport simulating fragmented/kana Mozc output for unknown terms
+        fun protoGroup(field: Int, inner: ByteArray): ByteArray {
+            val startTag = byteArrayOf(((field shl 3) or 3).toByte())
+            val endTag = byteArrayOf(((field shl 3) or 4).toByte())
+            return Proto.concat(startTag, inner, endTag)
+        }
+        fun preeditSegmentGroup(reading: String, surface: String): ByteArray =
+            protoGroup(2, Proto.concat(Proto.string(6, reading), Proto.string(4, surface)))
+        fun candidateMsg(id: Long, value: String): ByteArray =
+            Proto.concat(Proto.number(1, id), Proto.string(4, value))
+        fun mozcOutput(
+            sessionId: Long = 1L,
+            clauses: List<Pair<String, String>> = emptyList(),
+            cands: List<String> = emptyList()
+        ): ByteArray {
+            val preedit = if (clauses.isEmpty()) ByteArray(0) else {
+                Proto.blob(5, Proto.concat(*clauses.map { preeditSegmentGroup(it.first, it.second) }.toTypedArray()))
+            }
+            val candList = if (cands.isEmpty()) ByteArray(0) else {
+                Proto.blob(14, Proto.concat(*cands.mapIndexed { idx, w -> Proto.blob(2, candidateMsg(idx.toLong(), w)) }.toTypedArray()))
+            }
+            return Proto.concat(Proto.number(1, sessionId), preedit, candList)
+        }
+
+        var lastUpdateReading = ""
+        val mockConverter = AndroidMozcConverter(dictionaries) { req ->
+            val p = Proto.parse(req)
+            val kind = p.int(1).toInt()
+            when (kind) {
+                1 -> mozcOutput(sessionId = 42L)
+                3 -> {
+                    // SPACE or RIGHT
+                    val clauses = when (lastUpdateReading) {
+                        "びばるでぃでけんさく" -> listOf("びば" to "びば", "るでぃ" to "るでぃ", "で" to "で", "けんさく" to "検索")
+                        "でけんさく" -> listOf("で" to "で", "けんさく" to "検索")
+                        "るせらふぃむのきょく" -> listOf("るせ" to "るせ", "らふぃむ" to "らふぃむ", "の" to "の", "きょく" to "曲")
+                        "のきょく" -> listOf("の" to "の", "きょく" to "曲")
+                        "らぷらすへんかん" -> listOf("らぷらす" to "ラプラス", "へんかん" to "変換")
+                        "じゅうそうをつかう" -> listOf("じゅうそう" to "重曹", "を" to "を", "つかう" to "使う")
+                        else -> listOf(lastUpdateReading to lastUpdateReading)
+                    }
+                    mozcOutput(sessionId = 42L, clauses = clauses, cands = listOf(clauses.first().second))
+                }
+                5 -> {
+                    val cmd = p.message(4)
+                    if (cmd.int(1) == 26L) {
+                        lastUpdateReading = cmd.message(11).text(1)
+                        val suggests = when (lastUpdateReading) {
+                            "よろしくお" -> listOf("よろしくお願いします", "よろしくお願いいたします")
+                            else -> emptyList()
+                        }
+                        mozcOutput(sessionId = 42L, cands = suggests)
+                    } else {
+                        mozcOutput(sessionId = 42L)
+                    }
+                }
+                else -> mozcOutput(sessionId = 42L)
+            }
+        }
+
+        val vivClauses = mockConverter.convertClauses("びばるでぃでけんさく")!!
+        assertEquals(listOf("Vivaldi", "で", "検索"), vivClauses.map { it.text })
+        assertTrue(mockConverter.candidates("びばるでぃ").containsAll(listOf("Vivaldi", "ヴィヴァルディ")))
+
+        val leClauses = mockConverter.convertClauses("るせらふぃむのきょく")!!
+        assertEquals(listOf("LE SSERAFIM", "の", "曲"), leClauses.map { it.text })
+
+        val lapClauses = mockConverter.convertClauses("らぷらすへんかん")!!
+        assertEquals(listOf("ConversionClause(reading=らぷらすへんかん, text=ラプラス変換)"), lapClauses.map { it.toString() })
+
+        // "じゅうそうをつかう" must NOT replace "重曹" with "十三" when Mozc already produced kanji
+        val juusouClauses = mockConverter.convertClauses("じゅうそうをつかう")!!
+        assertEquals(listOf("重曹", "を", "使う"), juusouClauses.map { it.text })
+        assertTrue(mockConverter.candidates("じゅうそう").containsAll(listOf("重曹", "十三")))
+
+        // 4. Mozc suggest integrates into latter half of candidate bar as PHRASE
+        val suggests = mockConverter.suggest("よろしくお")
+        assertEquals(listOf("よろしくお願いします", "よろしくお願いいたします"), suggests)
+
+        val sugSess = CompositionSession(dictionaries, scoreEngine, mockConverter)
+        for (c in "yoroshikuo") sugSess.appendChar(c)
+        val cands = sugSess.snapshot.candidates
+        val phraseIdx = cands.indexOfFirst { it.kind == CandidateKind.PHRASE && it.text == "よろしくお願いします" }
+        assertTrue("Expected Mozc suggest PHRASE in candidate bar: $cands", phraseIdx > 0)
+        // Direct script variants (katakana, hiragana, half-width katakana, romaji case) are in candidate bar
+        assertTrue(cands.any { it.text == "ヨロシクオ" })
+        assertTrue(cands.any { it.text == "ﾖﾛｼｸｵ" })
+        assertTrue(cands.any { it.text == "yoroshikuo" })
+        assertTrue(cands.any { it.text == "Yoroshikuo" })
+        assertTrue(cands.any { it.text == "YOROSHIKUO" })
+    }
+
+    @Test
+    fun enterEditingAndReconvertFlowWorksCleanly() {
+        val converter = AndroidMozcConverter(dictionaries)
+        val sess = CompositionSession(dictionaries, scoreEngine, converter)
+        for (c in "kyouha") sess.appendChar(c)
+        assertFalse(sess.snapshot.isEditing)
+
+        val editing = sess.enterEditing()
+        assertTrue(editing.isEditing)
+        assertEquals("きょうは", editing.editKana)
+        assertEquals(4, editing.editKanaCaret)
+
+        val movedLeft = sess.moveCaret(-1)
+        assertTrue(movedLeft.isEditing)
+        assertEquals(3, movedLeft.editKanaCaret)
+
+        val reconverted = sess.startConversion()
+        assertFalse(reconverted.isEditing)
+        assertTrue(reconverted.isConverting)
     }
 }

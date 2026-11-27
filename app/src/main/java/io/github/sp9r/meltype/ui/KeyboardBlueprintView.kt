@@ -114,8 +114,8 @@ class KeyboardBlueprintView @JvmOverloads constructor(
         // Bottom-aligned proportional keyboard tray
         val topHeader = 22f * d
         val maxKbH = height - topHeader - 4f * d
-        // Map 1.55x + numRow (~391dp) proportionally to ~94% of preview space
-        val kbH = (maxKbH * (approxDp / 395f)).coerceIn(58f * d, maxKbH)
+        // Map 1.55x + numRow (~384dp) proportionally to preview space
+        val kbH = (maxKbH * (approxDp / 385f)).coerceIn(58f * d, maxKbH)
         val kbTop = height - kbH - 2f * d
         val trayLeft = 6f * d
         val trayRight = width - 6f * d
@@ -138,7 +138,15 @@ class KeyboardBlueprintView @JvmOverloads constructor(
         val kbRight = rawKbLeft + kbW - 4f * d - marginPx
         val innerW = kbRight - kbLeft
 
-        // Top mini rail + key rows
+        // Two-tier fixed header (upper toolbar/clause rail + lower candidate rail) + key rows
+        val upperRailH = 6f * d
+        val candRailH = 8f * d
+        val railH = upperRailH + candRailH + 1f * d
+        paintFill.color = fnBg
+        canvas.drawRect(kbLeft, kbTop + 2f * d, kbRight, kbTop + 2f * d + upperRailH, paintFill)
+        paintFill.color = keyBg
+        canvas.drawRect(kbLeft, kbTop + 3f * d + upperRailH, kbRight, kbTop + 2f * d + railH, paintFill)
+
         val rows = buildList {
             if (showNumberRow) add("1234567890")
             add("qwertyuiop")
@@ -146,10 +154,6 @@ class KeyboardBlueprintView @JvmOverloads constructor(
             add("zxcvbnm")
             add("BOTTOM")
         }
-        val railH = 9f * d
-        paintFill.color = fnBg
-        canvas.drawRect(kbLeft, kbTop + 2f * d, kbRight, kbTop + 2f * d + railH, paintFill)
-
         val keysAreaTop = kbTop + railH + 4f * d
         val keysAreaH = (height - 4f * d - keysAreaTop).coerceAtLeast(36f * d)
         val sepGap = if (showNumberRow) 4.5f * d else 0f

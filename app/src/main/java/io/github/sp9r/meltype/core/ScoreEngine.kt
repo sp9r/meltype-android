@@ -380,7 +380,6 @@ class ScoreEngine(
                 }
             }
         }
-
         // Fallback if DP failed
         if (dp[n] == null) {
             val a = RomajiDetector.analyze(lowerRun, strictForDetection = false)
@@ -792,15 +791,30 @@ class ScoreEngine(
             return 0.5
         }
 
-        // Very short 2-3 char non-focused lowercase words at boundaries inside runs should not chop words
-        if (len <= 2 && !isProper && !hasUppercase && !isFocused && (prevIdx > 0 || nextPos < totalLen)) {
-            return -5.5
+        // Very short 2-char lowercase words inside runs should not carve up English/Japanese words
+        // unless cleanly flanked by Japanese particles (or explicitly marked proper/uppercase).
+        if (len <= 2 && !isProper && !hasUppercase && (prevIdx > 0 || nextPos < totalLen)) {
+            if (!isFocused) return -5.5
+            if (prevIdx > 0 && nextPos < totalLen) {
+                val prevPrefix = fullRun.substring(0, prevIdx)
+                val nextSuffix = fullRun.substring(nextPos)
+                val flankedByParticles = PARTICLES.any { prevPrefix.endsWith(it) } &&
+                    PARTICLES.any { nextSuffix.startsWith(it) }
+                if (!flankedByParticles) return -5.5
+            }
         }
         // Very short 2-3 char romaji-valid lowercase English words ("to", "ha", "be", "pa", "on", "go", "he", "ma", ...)
         // should NOT split Japanese strings unless typed with uppercase or as an isolated single word.
         if (len <= 3 && isRomajiLike && !hasUppercase) {
             if (len == 3 && !isCompleteRomaji && prevIdx == 0 && nextPos == totalLen) {
                 return len * 1.45 + (if (isFocused) 4.0 else 2.0)
+            }
+            if (len == 3 && isProper && prevIdx == 0 && nextPos == totalLen &&
+                sub !in SHORT_AMBIGUOUS_STOPWORDS &&
+                !dictionaries.japaneseWords.contains(sub) &&
+                !dictionaries.readingsSet.contains(analysisStrict.finalizedHiragana())
+            ) {
+                return len * 1.45 + 7.0
             }
             val midRunWithoutParticles = prevIdx > 0 && nextPos < totalLen &&
                 !PARTICLES.any { fullRun.substring(0, prevIdx).endsWith(it) } &&

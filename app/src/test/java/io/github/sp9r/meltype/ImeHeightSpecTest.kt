@@ -11,8 +11,10 @@ class ImeHeightSpecTest {
 
     @Test
     fun headerHeightIsConstantAcrossAllStates() {
+        assertEquals(32, ImeHeightSpec.UPPER_BAR_HEIGHT_DP)
+        assertEquals(42, ImeHeightSpec.CANDIDATE_BAR_HEIGHT_DP)
         val expected = ImeHeightSpec.TOP_BAR_HEIGHT_DP
-        assertEquals(44, expected)
+        assertEquals(74, expected)
         for (state in HeaderState.entries) {
             assertEquals(
                 "Header height must stay ${expected}dp in $state",
@@ -25,7 +27,7 @@ class ImeHeightSpecTest {
     @Test
     fun keyboardBaseAndBodyHeightAreConstantAcrossAllLayers() {
         for (showNumberRow in listOf(true, false)) {
-            val expectedBase = if (showNumberRow) 264f else 224f
+            val expectedBase = if (showNumberRow) 248f else 210f
             for (layer in LayerSpec.entries) {
                 assertEquals(
                     "Base height must match across $layer (showNumberRow=$showNumberRow)",
@@ -43,7 +45,7 @@ class ImeHeightSpecTest {
         for (showNumberRow in listOf(true, false)) {
             for (scale in scales) {
                 val expectedBody = ImeHeightSpec.bodyHeightDp(showNumberRow, scale, LayerSpec.QWERTY, BodyState.KEYBOARD)
-                val expectedTotal = 44 + 1 + expectedBody
+                val expectedTotal = 74 + 1 + expectedBody
 
                 for (layer in LayerSpec.entries) {
                     for (headerState in HeaderState.entries) {
